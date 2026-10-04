@@ -70,7 +70,9 @@ def _http_url(value) -> str | None:
 
 def parse_feed(content: bytes) -> list[FeedItem]:
     parsed = feedparser.parse(content)
-    if parsed.bozo and not parsed.entries:
+    # feedparser leaves `version` empty for anything that is not RSS/Atom, including well-formed HTML
+    # that it does not flag as bozo. A genuinely empty feed still reports e.g. "rss20".
+    if not parsed.entries and (parsed.bozo or not parsed.version):
         raise FeedError("Response is not a valid RSS/Atom feed")
     items: list[FeedItem] = []
     for entry in parsed.entries:

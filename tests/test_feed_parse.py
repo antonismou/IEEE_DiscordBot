@@ -55,6 +55,19 @@ def test_html_error_page_is_an_error_not_an_empty_feed():
         parse_feed(b"<html><head><title>I'm a teapot</title></head><body><h1>418</title></body></html>")
 
 
+@pytest.mark.parametrize("body", [
+    b"<html><body>418</body></html>",       # well-formed HTML: feedparser does not flag it as bozo
+    b'{"error": "nope"}',
+])
+def test_other_non_feed_responses_are_errors(body):
+    with pytest.raises(FeedError):
+        parse_feed(body)
+
+
+def test_valid_empty_atom_feed_is_an_empty_list():
+    assert parse_feed(b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>t</title></feed>') == []
+
+
 def test_plain_text_is_an_error():
     with pytest.raises(FeedError):
         parse_feed(b"I'm a Teapot")
