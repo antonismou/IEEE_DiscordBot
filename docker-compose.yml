@@ -12,4 +12,7 @@ services:
       BOT_CONFIG: /app/config.toml
     volumes:
       - ./config.toml:/app/config.toml:ro
-      - ./data:/app/data
+      - bot-data:/app/data   # a Docker-managed volume: no folder or owner to set up
+
+volumes:
+  bot-data:

@@ -66,7 +66,7 @@ def test_unwritable_data_directory_gives_a_clear_error(tmp_path):
     folder.mkdir()
     folder.chmod(0o500)
     try:
-        with pytest.raises(DataDirError, match="chown"):
+        with pytest.raises(DataDirError, match="must be writable by the user the bot runs as"):
             connect(folder / "bot.sqlite3")
     finally:
         folder.chmod(0o700)

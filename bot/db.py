@@ -86,8 +86,8 @@ def connect(path: Path | str) -> sqlite3.Connection:
         os.chmod(path, 0o600)  # also tightens a database file that already existed
     except PermissionError as exc:
         raise DataDirError(
-            f"Cannot write to {path.parent}: {exc.strerror}. If the bot runs in Docker, the folder must be owned by "
-            f"uid 1000: sudo chown -R 1000:1000 {path.parent}"
+            f"Cannot write to {path.parent}: {exc.strerror}. The folder must be writable by the user the bot runs as "
+            "(in the Docker image that is uid 1000; a Docker volume gets this right automatically)."
         ) from exc
     if parent_existed and stat.S_IMODE(path.parent.stat().st_mode) & 0o077:
         log.warning(

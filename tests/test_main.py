@@ -32,4 +32,4 @@ def test_unwritable_data_directory_exits_with_a_readable_message(tmp_path, monke
             main()
     finally:
         locked.chmod(0o700)
-    assert "chown" in str(exit_info.value)
+    assert "must be writable by the user the bot runs as" in str(exit_info.value)

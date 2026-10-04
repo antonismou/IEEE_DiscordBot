@@ -13,10 +13,10 @@ and IEEE Xplore RSS items.
 3. **Secrets:** `cp .env.example .env` and fill `DISCORD_TOKEN`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`.
 4. **Config:** `cp config.example.toml config.toml` and fill the server ID and the two role IDs
    (enable Developer Mode in Discord, then right-click -> Copy ID). Channels are set later, from Discord.
-5. **Run:** `mkdir -m 700 data && docker compose up -d --build`, then watch `docker compose logs -f`.
-   The container runs as uid 1000, so `data` must belong to that user (`sudo chown -R 1000:1000 data` if your
-   server account has a different uid). `config.toml` must exist **before** the first `up`; otherwise Docker
-   creates an empty folder with that name (the bot tells you so and how to fix it).
+5. **Run:** `docker compose up -d --build`, then watch `docker compose logs -f`.
+   `config.toml` must exist **before** the first `up`; otherwise Docker creates an empty folder with that name
+   (the bot tells you so and how to fix it). The database lives in a Docker volume, so there is no data folder
+   to create and no file owner to set.
 6. **Check the feeds from the server's own network:**
    `docker compose run --rm bot python -m scripts.check_feeds /app/config.toml` (all lines should say `OK`;
    IEEE may block some addresses, which is why this runs on the server).
@@ -40,8 +40,8 @@ and IEEE Xplore RSS items.
 
 ## Data
 
-Emails and names are personal data (GDPR). They are stored in `data/bot.sqlite3` (mode 0600), backed up nightly to
-`data/backups/` (last 7 kept). Only officers can read or export them. `/forget-me` and `/member delete` remove a
+Emails and names are personal data (GDPR). They are stored in the Docker volume `bot-data` (`bot.sqlite3`, mode 0600), backed up nightly inside it to
+`backups/` (last 7 kept). Only officers can read or export them. `/forget-me` and `/member delete` remove a
 person from the database immediately and from the backups within 7 days. Rate-limit records keep a hash of the
 recipient address for at most 24 hours.
 
@@ -51,3 +51,11 @@ recipient address for at most 24 hours.
 python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest
 ```
+
+## Data and backups
+
+The data lives in the Docker volume `bot-data`, not in the project folder. Copy the backups out with
+`docker compose cp bot:/app/data/backups ./backups-copy`.
+
+`docker compose down` and updates keep the data. **`docker compose down -v` deletes the volume, and with it all
+stored members**, so never add `-v` unless you mean it.
