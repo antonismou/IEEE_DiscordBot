@@ -4,7 +4,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.channels import OFFICER_LOG
+from bot.channels import OFFICER_LOG, topics_for
 from bot.checks import officer_only
 
 
@@ -19,9 +19,7 @@ class ChannelsCog(commands.Cog):
     channel_group = app_commands.Group(name="channel", description="Choose where the bot posts", guild_only=True)
 
     def topics(self) -> list[str]:
-        names = {feed.topic for feed in self.app.settings.feeds if feed.topic}
-        names.add(OFFICER_LOG)
-        return sorted(names)
+        return topics_for(self.app.settings.feeds)
 
     async def _topic_choices(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         return [

@@ -24,7 +24,7 @@ def test_unwritable_data_directory_exits_with_a_readable_message(tmp_path, monke
     locked.chmod(0o500)
     config = tmp_path / "config.toml"
     config.write_text(
-        f'guild_id = 1\nverified_role_id = 2\nofficer_role_id = 3\ndb_path = "{locked}/bot.sqlite3"\n'
+        f'db_path = "{locked}/bot.sqlite3"\n'
     )
     set_env(monkeypatch, config)
     try:

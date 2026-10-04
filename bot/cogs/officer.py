@@ -52,7 +52,7 @@ class OfficerCog(commands.Cog):
             note=reason, verified_at=utcnow(),
         )
         ok = await set_verified_role(
-            interaction.guild, user, self.app.settings.verified_role_id,
+            interaction.guild, user, self.app.server.verified_role_id,
             add=True, reason=f"Manual verification by {interaction.user}",
         )
         suffix = "" if ok else " (but I couldn't assign the role: check my permissions)"
@@ -66,7 +66,7 @@ class OfficerCog(commands.Cog):
     @officer_only()
     async def unverify(self, interaction: discord.Interaction, user: discord.Member) -> None:
         ok = await set_verified_role(
-            interaction.guild, user, self.app.settings.verified_role_id,
+            interaction.guild, user, self.app.server.verified_role_id,
             add=False, reason=f"Unverified by {interaction.user}",
         )
         text = "Role removed." if ok else "I couldn't remove the role: check my permissions."
@@ -116,7 +116,7 @@ class OfficerCog(commands.Cog):
         role_failed = False
         if member is not None:
             role_failed = not await set_verified_role(
-                interaction.guild, member, self.app.settings.verified_role_id,
+                interaction.guild, member, self.app.server.verified_role_id,
                 add=False, reason="Data deleted",
             )
         text = "Stored data deleted." if deleted else "There was no stored data."

@@ -29,9 +29,6 @@ class Settings:
     discord_token: str
     gmail_address: str
     gmail_app_password: str
-    guild_id: int
-    verified_role_id: int
-    officer_role_id: int
     db_path: Path
     backup_dir: Path
     poll_interval_minutes: int
@@ -76,9 +73,6 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             discord_token=env["DISCORD_TOKEN"],
             gmail_address=env["GMAIL_ADDRESS"],
             gmail_app_password=env["GMAIL_APP_PASSWORD"],
-            guild_id=int(raw["guild_id"]),
-            verified_role_id=int(raw["verified_role_id"]),
-            officer_role_id=int(raw["officer_role_id"]),
             db_path=Path(raw.get("db_path", "data/bot.sqlite3")),
             backup_dir=Path(raw.get("backup_dir", "data/backups")),
             poll_interval_minutes=int(raw.get("poll_interval_minutes", 30)),

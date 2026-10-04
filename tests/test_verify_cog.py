@@ -20,7 +20,7 @@ def make_app(conn, *, log_channel=OFFICER_CHANNEL):
     if log_channel is not None:
         channels.set(OFFICER_LOG, log_channel)
     return SimpleNamespace(
-        settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE),
+        server=SimpleNamespace(verified_role_id=VERIFIED_ROLE, guild_id=111),
         members=MemberRepo(conn),
         channels=channels,
     )
@@ -110,7 +110,7 @@ def test_mail_failure_log_does_not_contain_the_recipient_address(conn, caplog):
     async def scenario():
         members = MemberRepo(conn)
         app = SimpleNamespace(
-            settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE),
+            server=SimpleNamespace(verified_role_id=VERIFIED_ROLE),
             channels=ChannelRepo(conn),
             verification=VerificationService(conn, members),
             send_code=failing_send,
@@ -140,3 +140,38 @@ def test_setup_verify_explains_missing_channel_permissions():
     interaction = asyncio.run(scenario())
     text = interaction.response.send_message.await_args.args[0]
     assert "Send Messages" in text and "View Channel" in text
+
+
+def test_verify_buttons_say_so_when_the_server_is_not_set_up_yet(conn):
+    from bot.serversettings import ServerSettings
+
+    async def scenario():
+        app = make_app(conn)
+        app.server = ServerSettings(conn)                 # nothing configured
+        interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+        interaction.guild_id = 111
+        view = VerifyView(app)
+        await view.start.callback(interaction)
+        await view.enter_code.callback(interaction)
+        return interaction
+
+    interaction = asyncio.run(scenario())
+    texts = [call.args[0] for call in interaction.response.send_message.await_args_list]
+    assert len(texts) == 2 and all("isn't set up yet" in t for t in texts)
+    interaction.response.send_modal.assert_not_awaited()
+
+
+def test_verify_buttons_refuse_other_servers(conn):
+    from bot.serversettings import ServerSettings
+
+    async def scenario():
+        app = make_app(conn)
+        app.server = ServerSettings(conn)
+        app.server.configure(guild_id=111, verified_role_id=VERIFIED_ROLE, officer_role_id=9)
+        interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+        interaction.guild_id = 999
+        await VerifyView(app).start.callback(interaction)
+        return interaction
+
+    interaction = asyncio.run(scenario())
+    assert "different server" in interaction.response.send_message.await_args.args[0]

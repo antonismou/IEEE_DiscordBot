@@ -11,8 +11,8 @@ and IEEE Xplore RSS items.
 2. **Gmail:** use a dedicated branch Gmail account. Turn on 2-Step Verification, then create an *App password*
    (Google Account -> Security -> App passwords).
 3. **Secrets:** `cp .env.example .env` and fill `DISCORD_TOKEN`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`.
-4. **Config:** `cp config.example.toml config.toml` and fill the server ID and the two role IDs
-   (enable Developer Mode in Discord, then right-click -> Copy ID). Channels are set later, from Discord.
+4. **Config:** `cp config.example.toml config.toml`. Nothing in it needs editing: the server, the roles and the
+   channels are all set from Discord (steps 7-9).
 5. **Run:** `docker compose up -d --build`, then watch `docker compose logs -f`.
    `config.toml` must exist **before** the first `up`; otherwise Docker creates an empty folder with that name
    (the bot tells you so and how to fix it). The database lives in a Docker volume, so there is no data folder
@@ -20,16 +20,22 @@ and IEEE Xplore RSS items.
 6. **Check the feeds from the server's own network:**
    `docker compose run --rm bot python -m scripts.check_feeds /app/config.toml` (all lines should say `OK`;
    IEEE may block some addresses, which is why this runs on the server).
-7. In `#verify` run `/setup-verify` once to post the panel.
-8. Choose where each feed topic posts: `/channel set topic:ai-ml channel:#ai-ml`, and the same for `power-energy`,
+7. As the server owner or an administrator, run `/setup roles verified:@Role officer:@Role`. Pick any two
+   different roles. This also ties the bot to that server. If the bot's role is not above the Verified role (or
+   lacks Manage Roles), the reply warns you. `/setup status` shows what is still missing.
+8. In `#verify` run `/setup-verify` once to post the panel.
+9. Choose where each feed topic posts: `/channel set topic:ai-ml channel:#ai-ml`, and the same for `power-energy`,
    `robotics` and `ieee-spectrum`. Also set `officer-log` to a private officers-only channel: the bot tells you
    there when it cannot assign the Verified role. `/channel list` shows what is set. Feeds whose topic has no
    channel yet stay paused (the log says so).
+
+Administrators can always use the officer commands, even before the officer role exists.
 
 ## Commands
 
 | Command | Who | What |
 |---|---|---|
+| `/setup roles / status` | administrators | choose the Verified and Officer roles; see what is missing |
 | `/setup-verify` | officers | post the verification panel |
 | `/verify-manual user name note` | officers | verify someone without a TUC email |
 | `/unverify user` | officers | remove the Verified role (data kept) |

@@ -1,8 +1,5 @@
-# Channels are NOT set here: after the bot starts, use /channel set in Discord.
-# Each feed's `channel` below is a topic name; /channel set topic:<name> channel:<#channel> points it somewhere.
-guild_id = 0
-verified_role_id = 0
-officer_role_id = 0
+# Nothing here needs editing to get started. The server, the Verified/Officer roles and the feed channels
+# are all chosen from Discord with /setup roles and /channel set. Each feed's `channel` below is a topic name.
 db_path = "data/bot.sqlite3"
 backup_dir = "data/backups"
 poll_interval_minutes = 30

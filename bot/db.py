@@ -51,6 +51,10 @@ CREATE TABLE IF NOT EXISTS feed_state (
     feed_id        TEXT PRIMARY KEY,
     initialized_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS server_settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS channel_bindings (
     topic      TEXT PRIMARY KEY,
     channel_id INTEGER NOT NULL

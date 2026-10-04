@@ -7,10 +7,6 @@ from bot.config import ConfigError, load_settings
 ENV = {"DISCORD_TOKEN": "t", "GMAIL_ADDRESS": "a@gmail.com", "GMAIL_APP_PASSWORD": "p"}
 
 GOOD = """
-guild_id = 1
-verified_role_id = 2
-officer_role_id = 3
-
 [[feeds]]
 id = "tpami"
 title = "Pattern Analysis and Machine Intelligence"
@@ -27,7 +23,6 @@ def write(tmp_path: Path, text: str) -> Path:
 
 def test_loads_values_and_defaults(tmp_path):
     s = load_settings(write(tmp_path, GOOD), ENV)
-    assert (s.guild_id, s.verified_role_id, s.officer_role_id) == (1, 2, 3)
     assert s.discord_token == "t" and s.gmail_address == "a@gmail.com"
     assert s.poll_interval_minutes == 30 and s.max_items_per_poll == 10
     assert s.db_path == Path("data/bot.sqlite3")
@@ -50,8 +45,8 @@ def test_duplicate_feed_id(tmp_path):
 def test_missing_file_and_missing_key(tmp_path):
     with pytest.raises(ConfigError, match="not found"):
         load_settings(tmp_path / "nope.toml", ENV)
-    with pytest.raises(ConfigError, match="guild_id"):
-        load_settings(write(tmp_path, GOOD.replace("guild_id = 1", "")), ENV)
+    with pytest.raises(ConfigError, match="Invalid config"):
+        load_settings(write(tmp_path, "this is = not [valid toml"), ENV)
 
 
 def test_config_path_that_is_a_directory_explains_the_docker_pitfall(tmp_path):
@@ -68,3 +63,8 @@ def test_feed_must_name_a_topic(tmp_path):
 def test_officer_log_is_a_reserved_topic(tmp_path):
     with pytest.raises(ConfigError, match="reserved"):
         load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "officer-log"')), ENV)
+
+
+def test_old_id_keys_are_ignored_not_errors(tmp_path):
+    old = "guild_id = 1\nverified_role_id = 2\nofficer_role_id = 3\n" + GOOD
+    assert load_settings(write(tmp_path, old), ENV).feeds[0].id == "tpami"

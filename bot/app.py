@@ -10,6 +10,7 @@ from bot.db import connect
 from bot.feeds.store import CustomFeedRepo, SeenStore
 from bot.mailer import make_gmail_sender
 from bot.members import MemberRepo
+from bot.serversettings import ServerSettings
 from bot.verification import VerificationService
 
 
@@ -23,6 +24,7 @@ class AppContext:
     seen: SeenStore
     custom_feeds: CustomFeedRepo
     channels: ChannelRepo
+    server: ServerSettings
 
 
 def build_app(settings: Settings) -> AppContext:
@@ -37,4 +39,5 @@ def build_app(settings: Settings) -> AppContext:
         seen=SeenStore(conn),
         custom_feeds=CustomFeedRepo(conn),
         channels=ChannelRepo(conn),
+        server=ServerSettings(conn),
     )

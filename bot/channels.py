@@ -31,3 +31,10 @@ class ChannelRepo:
     def all(self) -> dict[str, int]:
         rows = self._c.execute("SELECT topic, channel_id FROM channel_bindings").fetchall()
         return {row["topic"]: row["channel_id"] for row in rows}
+
+
+def topics_for(feeds) -> list[str]:
+    """Every topic a channel can be chosen for: the feeds' topics plus the officer log."""
+    names = {feed.topic for feed in feeds if feed.topic}
+    names.add(OFFICER_LOG)
+    return sorted(names)

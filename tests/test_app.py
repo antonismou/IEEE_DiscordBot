@@ -7,7 +7,6 @@ from bot.config import Settings
 def test_build_app_wires_services(tmp_path):
     settings = Settings(
         discord_token="t", gmail_address="a@gmail.com", gmail_app_password="p",
-        guild_id=1, verified_role_id=2, officer_role_id=3,
         db_path=tmp_path / "bot.sqlite3", backup_dir=tmp_path / "backups",
         poll_interval_minutes=30, max_items_per_poll=10, feeds=(),
     )

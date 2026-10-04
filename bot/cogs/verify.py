@@ -9,6 +9,7 @@ from discord.ext import commands
 
 from bot.channels import OFFICER_LOG
 from bot.checks import officer_only
+from bot.gate import gate_message
 from bot.mailer import MailError
 from bot.roles import notify_officers, set_verified_role
 from bot.verification import VerificationError
@@ -32,7 +33,7 @@ CONSENT_TEXT = (
 async def grant_role_and_reply(app, interaction: discord.Interaction, *, restored: bool = False) -> None:
     """Give the Verified role to a member whose verification is stored, and tell them (and officers) the result."""
     ok = await set_verified_role(
-        interaction.guild, interaction.user, app.settings.verified_role_id,
+        interaction.guild, interaction.user, app.server.verified_role_id,
         add=True, reason="TUC email verified",
     )
     if ok:
@@ -122,8 +123,12 @@ class VerifyView(discord.ui.View):
 
     @discord.ui.button(label="Verify", style=discord.ButtonStyle.success, custom_id="verify:start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        refusal = gate_message(self.app.server, interaction.guild_id, None)
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
         if self.app.members.get(interaction.user.id):
-            role_id = self.app.settings.verified_role_id
+            role_id = self.app.server.verified_role_id
             await interaction.response.defer(ephemeral=True, thinking=True)
             if any(role.id == role_id for role in interaction.user.roles):
                 await interaction.followup.send("You are already verified.", ephemeral=True)
@@ -134,6 +139,10 @@ class VerifyView(discord.ui.View):
 
     @discord.ui.button(label="Enter code", style=discord.ButtonStyle.primary, custom_id="verify:code")
     async def enter_code(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        refusal = gate_message(self.app.server, interaction.guild_id, None)
+        if refusal:
+            await interaction.response.send_message(refusal, ephemeral=True)
+            return
         await interaction.response.send_modal(CodeModal(self.app))
 
 
