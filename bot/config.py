@@ -34,6 +34,7 @@ class Settings:
     poll_interval_minutes: int
     max_items_per_poll: int
     feeds: tuple[FeedConfig, ...]
+    officer_log_channel_id: int | None = None
 
 
 def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Settings:
@@ -76,6 +77,7 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             poll_interval_minutes=int(raw.get("poll_interval_minutes", 30)),
             max_items_per_poll=int(raw.get("max_items_per_poll", 10)),
             feeds=tuple(feeds),
+            officer_log_channel_id=int(raw.get("officer_log_channel_id", 0)) or None,
         )
     except KeyError as exc:
         raise ConfigError(f"Missing config key: {exc}") from None

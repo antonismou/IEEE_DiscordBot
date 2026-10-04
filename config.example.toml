@@ -1,6 +1,7 @@
 guild_id = 0
 verified_role_id = 0
 officer_role_id = 0
+officer_log_channel_id = 0   # optional: private channel where the bot reports problems (0 = off)
 db_path = "data/bot.sqlite3"
 backup_dir = "data/backups"
 poll_interval_minutes = 30

@@ -9,7 +9,7 @@ from discord.ext import commands
 from bot.checks import officer_only
 from bot.db import utcnow
 from bot.members import members_to_csv
-from bot.roles import set_verified_role
+from bot.roles import resolve_member, set_verified_role
 from bot.validation import clean_text
 
 NO_MENTIONS = discord.AllowedMentions.none()
@@ -29,14 +29,23 @@ class OfficerCog(commands.Cog):
     @app_commands.guild_only()
     @officer_only()
     async def verify_manual(self, interaction: discord.Interaction, user: discord.Member, name: str, note: str) -> None:
+        await interaction.response.defer(ephemeral=True)  # the role call below can outlast Discord's 3 s limit
         if user.bot:
-            await interaction.response.send_message("Bots cannot be verified.", ephemeral=True)
+            await interaction.followup.send("Bots cannot be verified.", ephemeral=True)
             return
         try:
             full_name = clean_text(name, min_len=2, max_len=100, label="Name")
             reason = clean_text(note, min_len=3, max_len=200, label="Note")
         except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
+        existing = self.app.members.get(user.id)
+        if existing is not None and existing.method == "email":
+            await interaction.followup.send(
+                f"{user.mention} is already verified by email ({existing.email}); manual verification would erase "
+                "that record. If they are missing the role, ask them to press **Verify** again in the panel.",
+                ephemeral=True, allowed_mentions=NO_MENTIONS,
+            )
             return
         self.app.members.add_manual_member(
             discord_id=user.id, full_name=full_name, verified_by=interaction.user.id,
@@ -47,7 +56,7 @@ class OfficerCog(commands.Cog):
             add=True, reason=f"Manual verification by {interaction.user}",
         )
         suffix = "" if ok else " (but I couldn't assign the role: check my permissions)"
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"{user.mention} verified manually as **{full_name}**{suffix}.",
             ephemeral=True, allowed_mentions=NO_MENTIONS,
         )
@@ -92,25 +101,28 @@ class OfficerCog(commands.Cog):
     @member_group.command(name="delete", description="Delete a user's stored data and remove the role")
     @officer_only()
     async def delete(self, interaction: discord.Interaction, user: discord.User) -> None:
-        await self._forget(interaction, user.id)
+        await self._forget(interaction, user)
 
     @app_commands.command(name="forget-me", description="Delete your stored data and remove your Verified role")
     @app_commands.guild_only()
     async def forget_me(self, interaction: discord.Interaction) -> None:
-        await self._forget(interaction, interaction.user.id)
+        await self._forget(interaction, interaction.user)
 
-    async def _forget(self, interaction: discord.Interaction, discord_id: int) -> None:
-        deleted = self.app.members.delete(discord_id)
-        self.app.verification.abort(discord_id)
-        member = interaction.guild.get_member(discord_id)
+    async def _forget(self, interaction: discord.Interaction, user) -> None:
+        await interaction.response.defer(ephemeral=True)  # the member lookup and role call can be slow
+        deleted = self.app.members.delete(user.id)
+        self.app.verification.abort(user.id)
+        member = await resolve_member(interaction.guild, user)
+        role_failed = False
         if member is not None:
-            await set_verified_role(
+            role_failed = not await set_verified_role(
                 interaction.guild, member, self.app.settings.verified_role_id,
                 add=False, reason="Data deleted",
             )
-        await interaction.response.send_message(
-            "Stored data deleted." if deleted else "There was no stored data.", ephemeral=True
-        )
+        text = "Stored data deleted." if deleted else "There was no stored data."
+        if role_failed:
+            text += " I couldn't remove the Verified role; an officer must remove it by hand."
+        await interaction.followup.send(text, ephemeral=True)
 
 
 async def setup(bot) -> None:

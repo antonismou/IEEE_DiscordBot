@@ -9,7 +9,7 @@ from discord.ext import commands
 
 from bot.checks import officer_only
 from bot.mailer import MailError
-from bot.roles import set_verified_role
+from bot.roles import notify_officers, set_verified_role
 from bot.verification import VerificationError
 
 log = logging.getLogger(__name__)
@@ -23,8 +23,31 @@ PANEL_TEXT = (
 CONSENT_TEXT = (
     "To verify you, the IEEE Student Branch of TUC will store your **full name**, your **@tuc.gr email** "
     "and your **Discord ID**. They are used only to confirm membership and are visible only to branch "
-    "officers. You can delete your data at any time with `/forget-me`.\n\nPress **I agree** to continue."
+    "officers. You can delete your data at any time with `/forget-me`; copies in the nightly backups are "
+    "deleted within 7 days.\n\nPress **I agree** to continue."
 )
+
+
+async def grant_role_and_reply(app, interaction: discord.Interaction, *, restored: bool = False) -> None:
+    """Give the Verified role to a member whose verification is stored, and tell them (and officers) the result."""
+    ok = await set_verified_role(
+        interaction.guild, interaction.user, app.settings.verified_role_id,
+        add=True, reason="TUC email verified",
+    )
+    if ok:
+        text = "Your Verified role was restored." if restored else "You are verified. Welcome!"
+    else:
+        await notify_officers(
+            interaction.client, app.settings.officer_log_channel_id,
+            f"I could not assign the Verified role to <@{interaction.user.id}> although their verification is stored. "
+            "Check that my role is above Verified and that I have Manage Roles; the member can press **Verify** "
+            "again once it is fixed.",
+        )
+        text = (
+            "Your email is verified, but I couldn't assign the role. Officers were notified; "
+            "press **Verify** again later to retry."
+        )
+    await interaction.followup.send(text, ephemeral=True)
 
 
 class StartModal(discord.ui.Modal, title="TUC verification"):
@@ -46,7 +69,7 @@ class StartModal(discord.ui.Modal, title="TUC verification"):
             await asyncio.to_thread(self.app.send_code, pending.email, pending.code, pending.ttl_minutes)
         except MailError:
             log.exception("Could not send verification email")
-            self.app.verification.abort(interaction.user.id)
+            self.app.verification.send_failed(interaction.user.id)
             await interaction.followup.send(
                 "I couldn't send the email right now. Please try again later or ask an officer.", ephemeral=True
             )
@@ -72,16 +95,7 @@ class CodeModal(discord.ui.Modal, title="Enter your code"):
         except VerificationError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
-        ok = await set_verified_role(
-            interaction.guild, interaction.user, self.app.settings.verified_role_id,
-            add=True, reason="TUC email verified",
-        )
-        if ok:
-            await interaction.followup.send("You are verified. Welcome!", ephemeral=True)
-        else:
-            await interaction.followup.send(
-                "Your email is verified, but I couldn't assign the role. An officer will fix it.", ephemeral=True
-            )
+        await grant_role_and_reply(self.app, interaction)
 
 
 class ConsentView(discord.ui.View):
@@ -102,7 +116,12 @@ class VerifyView(discord.ui.View):
     @discord.ui.button(label="Verify", style=discord.ButtonStyle.success, custom_id="verify:start")
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if self.app.members.get(interaction.user.id):
-            await interaction.response.send_message("You are already verified.", ephemeral=True)
+            role_id = self.app.settings.verified_role_id
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            if any(role.id == role_id for role in interaction.user.roles):
+                await interaction.followup.send("You are already verified.", ephemeral=True)
+            else:  # stored but the role never arrived (e.g. the bot lacked permissions at the time)
+                await grant_role_and_reply(self.app, interaction, restored=True)
             return
         await interaction.response.send_message(CONSENT_TEXT, view=ConsentView(self.app), ephemeral=True)
 

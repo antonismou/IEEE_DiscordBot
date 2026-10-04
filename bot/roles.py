@@ -21,3 +21,29 @@ async def set_verified_role(guild, member, role_id: int, *, add: bool, reason: s
         log.exception("Could not %s role %s for member %s", "add" if add else "remove", role_id, member)
         return False
     return True
+
+
+async def resolve_member(guild, user):
+    """A guild Member for `user`, or None if they left.
+
+    The bot runs without the members intent, so guild.get_member() is usually empty: fall back to the API.
+    """
+    if isinstance(user, discord.Member):
+        return user
+    member = guild.get_member(user.id)
+    if member is not None:
+        return member
+    try:
+        return await guild.fetch_member(user.id)
+    except discord.NotFound:
+        return None
+
+
+async def notify_officers(client, channel_id: int | None, text: str) -> None:
+    if channel_id is None:
+        return
+    try:
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+        await channel.send(text, allowed_mentions=discord.AllowedMentions.none())
+    except (discord.Forbidden, discord.HTTPException):
+        log.exception("Could not notify officers in channel %s", channel_id)

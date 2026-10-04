@@ -26,8 +26,12 @@ CREATE TABLE IF NOT EXISTS pending_codes (
     created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS send_log (
-    sent_at TEXT NOT NULL
+    discord_id INTEGER NOT NULL,
+    email_hash TEXT NOT NULL,
+    sent_at    TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS send_log_user ON send_log (discord_id, sent_at);
+CREATE INDEX IF NOT EXISTS send_log_email ON send_log (email_hash, sent_at);
 CREATE TABLE IF NOT EXISTS seen_items (
     feed_id   TEXT NOT NULL,
     item_id   TEXT NOT NULL,
@@ -67,5 +71,6 @@ def connect(path: Path | str) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA secure_delete=ON")  # deleted personal data must not linger in free pages
     conn.executescript(SCHEMA)
     return conn

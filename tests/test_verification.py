@@ -88,10 +88,80 @@ def test_hourly_cap(conn, members, clock):
     service.begin(10, "Alice Smith", "user10@tuc.gr")
 
 
-def test_abort_removes_pending_so_user_can_retry_immediately(service):
+def test_failed_email_send_lets_the_user_retry_immediately(service):
+    begin(service)
+    service.send_failed(1)
+    begin(service)
+
+
+def test_abort_does_not_reset_the_cooldown(service):
+    """/forget-me calls abort(); it must not become a way around the resend limits."""
     begin(service)
     service.abort(1)
+    with pytest.raises(VerificationError, match="seconds"):
+        begin(service)
+
+
+def test_wrong_codes_do_not_reset_the_cooldown(service):
     begin(service)
+    for _ in range(5):
+        with pytest.raises(VerificationError):
+            service.confirm(1, "000000")
+    with pytest.raises(VerificationError, match="seconds"):
+        begin(service)
+
+
+def test_expiry_does_not_reset_the_cooldown(service, clock):
+    begin(service)
+    clock.advance(30)
+    with pytest.raises(VerificationError):
+        service.confirm(1, "000000")
+    clock.advance(600)                      # past expiry, but this is a new minute for the cooldown
+    begin(service)                          # allowed: more than 60 s since the last send
+
+
+def test_per_user_hourly_cap(conn, members, clock):
+    svc = VerificationService(
+        conn, members, clock=clock, code_factory=lambda: "123456",
+        per_user_hourly_cap=3, per_email_hourly_cap=99,
+    )
+    for i in range(3):
+        svc.begin(1, "Alice Smith", f"u{i}@tuc.gr")
+        clock.advance(61)
+    with pytest.raises(VerificationError, match="You have requested"):
+        svc.begin(1, "Alice Smith", "u9@tuc.gr")
+    clock.advance(3600)
+    svc.begin(1, "Alice Smith", "u9@tuc.gr")
+
+
+def test_per_recipient_cap_stops_inbox_spam_from_many_accounts(conn, members, clock):
+    svc = VerificationService(
+        conn, members, clock=clock, code_factory=lambda: "123456",
+        per_user_hourly_cap=99, per_email_hourly_cap=2,
+    )
+    svc.begin(1, "Alice Smith", "victim@tuc.gr")
+    svc.begin(2, "Bob Jones", "victim@tuc.gr")
+    with pytest.raises(VerificationError, match="That address"):
+        svc.begin(3, "Eve Mallory", "Victim@TUC.gr")      # same address, different case and account
+
+
+def test_one_account_looping_cannot_take_verification_offline(service, clock):
+    """Reviewer probe: begin, 5 wrong codes, repeat, as fast as the clock lets it."""
+    sent = 0
+    for _ in range(600):
+        try:
+            begin(service, discord_id=1, email="prof.victim@tuc.gr")
+            sent += 1
+        except VerificationError:
+            pass
+        for _ in range(5):
+            try:
+                service.confirm(1, "000000")
+            except VerificationError:
+                pass
+        clock.advance(1)
+    assert sent <= 5                                          # per-user hourly cap (default)
+    begin(service, discord_id=2, email="honest@tuc.gr")       # a real student can still verify
 
 
 def test_confirm_success_creates_member_with_consent_time(service, members, clock):

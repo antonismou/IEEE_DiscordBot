@@ -8,7 +8,7 @@ from bot.db import connect, from_iso, to_iso, utcnow
 def test_database_and_wal_files_are_private(tmp_path):
     path = tmp_path / "data" / "bot.sqlite3"
     conn = connect(path)
-    conn.execute("INSERT INTO send_log (sent_at) VALUES ('x')")
+    conn.execute("INSERT INTO send_log (discord_id, email_hash, sent_at) VALUES (1, 'h', 'x')")
     conn.commit()
     for suffix in ("", "-wal"):
         file = path.parent / (path.name + suffix)
@@ -16,6 +16,24 @@ def test_database_and_wal_files_are_private(tmp_path):
             assert stat.S_IMODE(os.stat(file).st_mode) == 0o600, file
     assert stat.S_IMODE(os.stat(path.parent).st_mode) == 0o700
     conn.close()
+
+
+def test_deleted_personal_data_does_not_linger_in_the_database_file(tmp_path):
+    path = tmp_path / "bot.sqlite3"
+    conn = connect(path)
+    for i in range(20):  # a realistic table: deleting one row must not leave its bytes on a shared page
+        marker = i == 10
+        conn.execute(
+            "INSERT INTO members (discord_id, email, full_name, method, verified_at) VALUES (?, ?, ?, 'email', 'x')",
+            (i, "zzuniquemarker@tuc.gr" if marker else f"s{i}@tuc.gr", "ZZUNIQUEMARKERNAME" if marker else f"Student {i}"),
+        )
+    conn.commit()
+    conn.execute("DELETE FROM members WHERE discord_id = 10")
+    conn.commit()
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.close()
+    raw = path.read_bytes()
+    assert b"ZZUNIQUEMARKERNAME" not in raw and b"zzuniquemarker@tuc.gr" not in raw
 
 
 def test_schema_is_idempotent(tmp_path):

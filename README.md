@@ -12,7 +12,8 @@ and IEEE Xplore RSS items.
    (Google Account -> Security -> App passwords).
 3. **Secrets:** `cp .env.example .env` and fill `DISCORD_TOKEN`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`.
 4. **Config:** `cp config.example.toml config.toml` and fill the guild, role and channel IDs
-   (enable Developer Mode in Discord, then right-click -> Copy ID).
+   (enable Developer Mode in Discord, then right-click -> Copy ID). Set `officer_log_channel_id` to a private
+   officers-only channel so the bot can tell you when it cannot assign the Verified role.
 5. **Check the feeds from the server:** `python -m scripts.check_feeds` (all lines should say `OK`).
 6. **Run:** `mkdir -p data && docker compose up -d --build`, then watch `docker compose logs -f`.
 7. In `#verify` run `/setup-verify` once to post the panel.
@@ -31,7 +32,9 @@ and IEEE Xplore RSS items.
 ## Data
 
 Emails and names are personal data (GDPR). They are stored in `data/bot.sqlite3` (mode 0600), backed up nightly to
-`data/backups/` (last 7 kept). Only officers can read or export them.
+`data/backups/` (last 7 kept). Only officers can read or export them. `/forget-me` and `/member delete` remove a
+person from the database immediately and from the backups within 7 days. Rate-limit records keep a hash of the
+recipient address for at most 24 hours.
 
 ## Development
 

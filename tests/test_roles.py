@@ -48,3 +48,63 @@ def test_missing_role_returns_false():
 def test_forbidden_returns_false():
     forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "missing permissions")
     assert run(set_verified_role(guild_with(object()), FakeMember(forbidden), 5, add=True, reason="r")) is False
+
+
+# --- resolve_member / notify_officers -------------------------------------------------------------
+
+from unittest.mock import AsyncMock, MagicMock  # noqa: E402
+
+from bot.roles import notify_officers, resolve_member  # noqa: E402
+from tests.fakes import fake_guild, fake_member  # noqa: E402
+
+
+def test_resolve_member_returns_a_member_unchanged_without_any_lookup():
+    member = fake_member(7)
+    guild = fake_guild()
+    assert run(resolve_member(guild, member)) is member
+    guild.fetch_member.assert_not_awaited()
+
+
+def test_resolve_member_uses_the_cache_before_the_api():
+    cached = fake_member(7)
+    guild = fake_guild(cached=cached)
+    assert run(resolve_member(guild, SimpleNamespace(id=7))) is cached
+    guild.fetch_member.assert_not_awaited()
+
+
+def test_resolve_member_falls_back_to_the_api_when_the_cache_is_empty():
+    fetched = fake_member(7)
+    guild = fake_guild(fetched=fetched)
+    assert run(resolve_member(guild, SimpleNamespace(id=7))) is fetched
+    guild.fetch_member.assert_awaited_once_with(7)
+
+
+def test_resolve_member_returns_none_for_someone_who_left():
+    gone = discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "unknown member")
+    guild = fake_guild(fetch_error=gone)
+    assert run(resolve_member(guild, SimpleNamespace(id=7))) is None
+
+
+def test_notify_officers_sends_without_pinging():
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    client = MagicMock()
+    client.get_channel.return_value = channel
+    run(notify_officers(client, 55, "role problem"))
+    args, kwargs = channel.send.await_args
+    assert args == ("role problem",) and kwargs["allowed_mentions"].everyone is False
+
+
+def test_notify_officers_without_a_channel_does_nothing():
+    client = MagicMock()
+    run(notify_officers(client, None, "role problem"))
+    client.get_channel.assert_not_called()
+
+
+def test_notify_officers_swallows_discord_errors():
+    forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "no access")
+    channel = MagicMock()
+    channel.send = AsyncMock(side_effect=forbidden)
+    client = MagicMock()
+    client.get_channel.return_value = channel
+    run(notify_officers(client, 55, "role problem"))   # must not raise

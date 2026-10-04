@@ -39,6 +39,14 @@ def test_loads_values_and_defaults(tmp_path):
     assert (feed.id, feed.channel_id) == ("tpami", 10)
 
 
+def test_officer_log_channel_is_optional(tmp_path):
+    assert load_settings(write(tmp_path, GOOD), ENV).officer_log_channel_id is None
+    with_channel = GOOD.replace("officer_role_id = 3", "officer_role_id = 3\nofficer_log_channel_id = 55")
+    assert load_settings(write(tmp_path, with_channel), ENV).officer_log_channel_id == 55
+    zero = GOOD.replace("officer_role_id = 3", "officer_role_id = 3\nofficer_log_channel_id = 0")
+    assert load_settings(write(tmp_path, zero), ENV).officer_log_channel_id is None
+
+
 def test_missing_env_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="GMAIL_APP_PASSWORD"):
         load_settings(write(tmp_path, GOOD), {"DISCORD_TOKEN": "t", "GMAIL_ADDRESS": "a"})

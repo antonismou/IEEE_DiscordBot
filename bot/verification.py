@@ -29,6 +29,11 @@ def _default_code() -> str:
     return f"{secrets.randbelow(10**6):06d}"
 
 
+def _email_key(email: str) -> str:
+    """Rate-limit key for a recipient; stored instead of the address itself."""
+    return hashlib.sha256(email.encode()).hexdigest()
+
+
 def _hash(discord_id: int, code: str) -> str:
     return hashlib.sha256(f"{discord_id}:{code}".encode()).hexdigest()
 
@@ -45,6 +50,8 @@ class VerificationService:
         max_attempts: int = 5,
         resend_cooldown_seconds: int = 60,
         hourly_send_cap: int = 40,
+        per_user_hourly_cap: int = 5,
+        per_email_hourly_cap: int = 3,
     ):
         self._c = conn
         self._members = members
@@ -54,6 +61,18 @@ class VerificationService:
         self._max_attempts = max_attempts
         self._cooldown = resend_cooldown_seconds
         self._hourly_cap = hourly_send_cap
+        self._per_user_cap = per_user_hourly_cap
+        self._per_email_cap = per_email_hourly_cap
+
+    def _count_sends(self, since: datetime, *, discord_id: int | None = None, email_hash: str | None = None) -> int:
+        query, args = "SELECT COUNT(*) FROM send_log WHERE sent_at >= ?", [to_iso(since)]
+        if discord_id is not None:
+            query += " AND discord_id = ?"
+            args.append(discord_id)
+        if email_hash is not None:
+            query += " AND email_hash = ?"
+            args.append(email_hash)
+        return self._c.execute(query, args).fetchone()[0]
 
     def begin(self, discord_id: int, raw_name: str, raw_email: str) -> PendingVerification:
         try:
@@ -70,17 +89,22 @@ class VerificationService:
         if self._members.get_by_email(email):
             raise VerificationError("That email is already linked to another Discord account. Ask an officer for help.")
 
+        # All limits read send_log, which abort(), expiry and wrong codes never touch: deleting the pending
+        # row (e.g. via /forget-me) must not reset them.
         now = self._clock()
-        row = self._c.execute("SELECT created_at FROM pending_codes WHERE discord_id = ?", (discord_id,)).fetchone()
-        if row:
-            elapsed = (now - from_iso(row["created_at"])).total_seconds()
+        hour_ago = now - timedelta(hours=1)
+        email_hash = _email_key(email)
+        last = self._c.execute("SELECT MAX(sent_at) FROM send_log WHERE discord_id = ?", (discord_id,)).fetchone()[0]
+        if last:
+            elapsed = (now - from_iso(last)).total_seconds()
             if elapsed < self._cooldown:
                 wait = math.ceil(self._cooldown - elapsed)
                 raise VerificationError(f"Please wait {wait} seconds before requesting another code.")
-        sent = self._c.execute(
-            "SELECT COUNT(*) FROM send_log WHERE sent_at >= ?", (to_iso(now - timedelta(hours=1)),)
-        ).fetchone()[0]
-        if sent >= self._hourly_cap:
+        if self._count_sends(hour_ago, discord_id=discord_id) >= self._per_user_cap:
+            raise VerificationError("You have requested too many codes. Please try again in an hour.")
+        if self._count_sends(hour_ago, email_hash=email_hash) >= self._per_email_cap:
+            raise VerificationError("That address has received too many codes recently. Please try again later.")
+        if self._count_sends(hour_ago) >= self._hourly_cap:
             raise VerificationError("Too many verification emails were sent recently. Please try again later.")
 
         code = self._code_factory()
@@ -92,12 +116,26 @@ class VerificationService:
                 (discord_id, email, name, _hash(discord_id, code),
                  to_iso(now + timedelta(seconds=self._ttl)), to_iso(now)),
             )
-            self._c.execute("INSERT INTO send_log (sent_at) VALUES (?)", (to_iso(now),))
+            self._c.execute(
+                "INSERT INTO send_log (discord_id, email_hash, sent_at) VALUES (?, ?, ?)",
+                (discord_id, email_hash, to_iso(now)),
+            )
             self._c.execute("DELETE FROM send_log WHERE sent_at < ?", (to_iso(now - timedelta(hours=24)),))
         return PendingVerification(email=email, code=code, ttl_minutes=self._ttl // 60)
 
     def abort(self, discord_id: int) -> None:
+        """Drop the pending code. The send still counts towards the rate limits."""
         self._delete_pending(discord_id)
+
+    def send_failed(self, discord_id: int) -> None:
+        """The email never left: drop the pending code and give the send back so the user can retry now."""
+        with self._c:
+            self._c.execute("DELETE FROM pending_codes WHERE discord_id = ?", (discord_id,))
+            self._c.execute(
+                "DELETE FROM send_log WHERE rowid = (SELECT rowid FROM send_log WHERE discord_id = ? "
+                "ORDER BY sent_at DESC, rowid DESC LIMIT 1)",
+                (discord_id,),
+            )
 
     def confirm(self, discord_id: int, raw_code: str) -> Member:
         row = self._c.execute("SELECT * FROM pending_codes WHERE discord_id = ?", (discord_id,)).fetchone()

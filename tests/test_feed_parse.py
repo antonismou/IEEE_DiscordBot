@@ -64,6 +64,12 @@ def test_other_non_feed_responses_are_errors(body):
         parse_feed(body)
 
 
+@pytest.mark.parametrize("body", [b"", b"   \n"])
+def test_empty_response_body_is_a_feed_error(body):
+    with pytest.raises(FeedError):
+        parse_feed(body)
+
+
 def test_valid_empty_atom_feed_is_an_empty_list():
     assert parse_feed(b'<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom"><title>t</title></feed>') == []
 
