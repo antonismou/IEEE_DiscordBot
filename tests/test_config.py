@@ -68,3 +68,9 @@ def test_missing_file_and_missing_key(tmp_path):
         load_settings(tmp_path / "nope.toml", ENV)
     with pytest.raises(ConfigError, match="guild_id"):
         load_settings(write(tmp_path, GOOD.replace("guild_id = 1", "")), ENV)
+
+
+def test_config_path_that_is_a_directory_explains_the_docker_pitfall(tmp_path):
+    (tmp_path / "config.toml").mkdir()
+    with pytest.raises(ConfigError, match="directory"):
+        load_settings(tmp_path / "config.toml", ENV)

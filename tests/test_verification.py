@@ -226,3 +226,8 @@ def test_email_taken_between_begin_and_confirm(service, members, clock):
     with pytest.raises(VerificationError, match="already linked"):
         service.confirm(2, "123456")
     assert members.get(2) is None
+
+
+def test_kelvin_sign_look_alike_is_rejected_in_the_real_flow(service):
+    with pytest.raises(VerificationError, match="tuc.gr"):
+        begin(service, email="\u212aostas@tuc.gr")        # lowercases to ASCII "kostas" if normalised first

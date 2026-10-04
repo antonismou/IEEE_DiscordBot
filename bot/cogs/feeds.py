@@ -121,6 +121,8 @@ class FeedsCog(commands.Cog):
             await interaction.response.send_message("That feed is in config.toml; remove it there.", ephemeral=True)
             return
         removed = self.app.custom_feeds.remove(id)
+        if removed:
+            self.app.seen.forget(id)  # re-adding the same id later must start fresh, not burst
         await interaction.response.send_message("Removed." if removed else "No such feed.", ephemeral=True)
 
 

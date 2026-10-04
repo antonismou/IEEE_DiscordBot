@@ -34,6 +34,11 @@ class SeenStore:
         with self._c:
             self._insert_seen(feed_id, item_ids, now)
 
+    def forget(self, feed_id: str) -> None:
+        with self._c:
+            self._c.execute("DELETE FROM seen_items WHERE feed_id = ?", (feed_id,))
+            self._c.execute("DELETE FROM feed_state WHERE feed_id = ?", (feed_id,))
+
     def _insert_seen(self, feed_id: str, item_ids: list[str], now: datetime) -> None:
         self._c.executemany(
             "INSERT OR IGNORE INTO seen_items (feed_id, item_id, posted_at) VALUES (?, ?, ?)",

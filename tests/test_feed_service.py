@@ -135,3 +135,14 @@ def test_partial_failure_marks_only_posted_batches(conn):
     h.fail_on_call = None
     assert h.run(max_items=14) == 4                             # only the 4 that failed
     assert len(set(titles(h))) == 14                            # nothing posted twice
+
+
+def test_valid_but_empty_feed_does_not_count_as_the_first_run(conn):
+    empty = b'<?xml version="1.0"?><rss version="2.0"><channel><title>t</title></channel></rss>'
+    h = Harness(conn, empty)
+    assert h.run() == 0
+    assert h.store.is_initialized(FEED.id) is False
+    h.content = feed_xml(["p-1", "p-2"])
+    assert h.run() == 0 and h.sent == []          # the first response with items is the first run
+    h.content = feed_xml(["p-1", "p-2", "p-3"])
+    assert h.run() == 1

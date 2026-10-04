@@ -79,11 +79,11 @@ class VerificationService:
             name = clean_text(raw_name, min_len=2, max_len=100, label="Name")
         except ValueError as exc:
             raise VerificationError(str(exc)) from None
-        email = normalize_email(raw_email)
-        if not is_tuc_email(email):
+        if not is_tuc_email(raw_email):  # raw first: normalising (lower()) can turn U+212A into ASCII 'k'
             raise VerificationError(
                 "Only @tuc.gr addresses (or a tuc.gr subdomain such as @isc.tuc.gr) are accepted."
             )
+        email = normalize_email(raw_email)
         if self._members.get(discord_id):
             raise VerificationError("You are already verified.")
         if self._members.get_by_email(email):

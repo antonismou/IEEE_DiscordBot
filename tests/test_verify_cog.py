@@ -95,3 +95,45 @@ def test_pressing_verify_when_already_holding_the_role_just_says_so(conn):
 
 def test_consent_text_discloses_backup_retention():
     assert "backup" in CONSENT_TEXT.lower() and "7 days" in CONSENT_TEXT
+
+
+def test_mail_failure_log_does_not_contain_the_recipient_address(conn, caplog):
+    from bot.cogs.verify import start_verification
+    from bot.mailer import MailError
+    from bot.verification import VerificationService
+
+    def failing_send(to, code, ttl):
+        raise MailError("550 recipient victim@tuc.gr refused")
+
+    async def scenario():
+        members = MemberRepo(conn)
+        app = SimpleNamespace(
+            settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE, officer_log_channel_id=None),
+            verification=VerificationService(conn, members),
+            send_code=failing_send,
+        )
+        interaction = fake_interaction(fake_member(7), fake_guild())
+        await start_verification(app, interaction, "Real Student", "victim@tuc.gr")
+        app.verification.begin(7, "Real Student", "victim@tuc.gr")   # allowed at once: the send was given back
+        return interaction
+
+    interaction = asyncio.run(scenario())
+    assert caplog.records and "victim@tuc.gr" not in caplog.text
+    assert "couldn't send the email" in followup_text(interaction)
+
+
+def test_setup_verify_explains_missing_channel_permissions():
+    from bot.cogs.verify import VerifyCog
+
+    async def scenario():
+        cog = VerifyCog(SimpleNamespace(app=SimpleNamespace()))
+        interaction = fake_interaction(fake_member(1), fake_guild())
+        interaction.channel.send = AsyncMock(
+            side_effect=discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "Missing Access")
+        )
+        await cog.setup_verify.callback(cog, interaction)
+        return interaction
+
+    interaction = asyncio.run(scenario())
+    text = interaction.response.send_message.await_args.args[0]
+    assert "Send Messages" in text and "View Channel" in text

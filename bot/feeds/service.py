@@ -28,7 +28,8 @@ def select_new(store: SeenStore, feed_id: str, items: list[FeedItem], max_items:
     for item in items:
         unique.setdefault(item.item_id, item)
     if not store.is_initialized(feed_id):
-        store.initialize(feed_id, list(unique), now)
+        if unique:  # a temporarily empty feed must not use up the first run
+            store.initialize(feed_id, list(unique), now)
         return Selection([], [], first_run=True)
     seen = store.seen_ids(feed_id)
     new = [item for item in unique.values() if item.item_id not in seen]

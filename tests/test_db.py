@@ -47,3 +47,35 @@ def test_time_helpers_round_trip():
     assert now.tzinfo is not None
     assert from_iso(to_iso(now)) == now.replace(microsecond=0)
     assert to_iso(datetime(2026, 1, 1, tzinfo=timezone.utc)) == "2026-01-01T00:00:00+00:00"
+
+
+def test_existing_database_file_is_tightened_to_0600(tmp_path):
+    path = tmp_path / "bot.sqlite3"
+    connect(path).close()
+    os.chmod(path, 0o644)
+    connect(path).close()
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+
+
+def test_unwritable_data_directory_gives_a_clear_error(tmp_path):
+    import pytest
+
+    from bot.db import DataDirError
+
+    folder = tmp_path / "ro"
+    folder.mkdir()
+    folder.chmod(0o500)
+    try:
+        with pytest.raises(DataDirError, match="chown"):
+            connect(folder / "bot.sqlite3")
+    finally:
+        folder.chmod(0o700)
+
+
+def test_pre_existing_open_directory_is_warned_about_not_chmodded(tmp_path, caplog):
+    folder = tmp_path / "open"
+    folder.mkdir()
+    folder.chmod(0o755)
+    connect(folder / "bot.sqlite3").close()
+    assert "accessible by other users" in caplog.text
+    assert stat.S_IMODE(os.stat(folder).st_mode) == 0o755   # a possibly shared directory is left alone

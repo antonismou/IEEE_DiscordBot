@@ -33,3 +33,11 @@ def test_backing_up_twice_in_a_day_overwrites(conn, tmp_path):
     backup_database(conn, folder, now=NOW)
     backup_database(conn, folder, now=NOW)
     assert len(list(folder.glob("bot-*.sqlite3"))) == 1
+
+
+def test_existing_backup_directory_is_tightened_to_0700(conn, tmp_path):
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    folder.chmod(0o755)
+    backup_database(conn, folder, now=NOW)
+    assert stat.S_IMODE(os.stat(folder).st_mode) == 0o700

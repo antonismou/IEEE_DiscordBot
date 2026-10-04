@@ -46,6 +46,12 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
         raw = tomllib.loads(Path(config_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
         raise ConfigError(f"Config file not found: {config_path}") from None
+    except IsADirectoryError:
+        raise ConfigError(
+            f"{config_path} is a directory, not a file. With Docker this happens when config.toml did not exist "
+            "before `docker compose up`: remove the empty folder, run `cp config.example.toml config.toml`, "
+            "fill it in, and start again."
+        ) from None
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid config file: {exc}") from None
 

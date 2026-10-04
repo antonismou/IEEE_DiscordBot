@@ -14,8 +14,13 @@ and IEEE Xplore RSS items.
 4. **Config:** `cp config.example.toml config.toml` and fill the guild, role and channel IDs
    (enable Developer Mode in Discord, then right-click -> Copy ID). Set `officer_log_channel_id` to a private
    officers-only channel so the bot can tell you when it cannot assign the Verified role.
-5. **Check the feeds from the server:** `python -m scripts.check_feeds` (all lines should say `OK`).
-6. **Run:** `mkdir -p data && docker compose up -d --build`, then watch `docker compose logs -f`.
+5. **Run:** `mkdir -m 700 data && docker compose up -d --build`, then watch `docker compose logs -f`.
+   The container runs as uid 1000, so `data` must belong to that user (`sudo chown -R 1000:1000 data` if your
+   server account has a different uid). `config.toml` must exist **before** the first `up`; otherwise Docker
+   creates an empty folder with that name (the bot tells you so and how to fix it).
+6. **Check the feeds from the server's own network:**
+   `docker compose run --rm bot python -m scripts.check_feeds /app/config.toml` (all lines should say `OK`;
+   IEEE may block some addresses, which is why this runs on the server).
 7. In `#verify` run `/setup-verify` once to post the panel.
 
 ## Commands

@@ -17,8 +17,11 @@ async def set_verified_role(guild, member, role_id: int, *, add: bool, reason: s
             await member.add_roles(role, reason=reason)
         else:
             await member.remove_roles(role, reason=reason)
-    except (discord.Forbidden, discord.HTTPException):
-        log.exception("Could not %s role %s for member %s", "add" if add else "remove", role_id, member)
+    except (discord.Forbidden, discord.HTTPException) as exc:
+        log.warning(
+            "Could not %s role %s for member id %s: %s",
+            "add" if add else "remove", role_id, getattr(member, "id", "?"), exc,
+        )
         return False
     return True
 

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
+
+log = logging.getLogger(__name__)
+
+
+class DataDirError(Exception):
+    """The data directory or database file cannot be written."""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS members (
@@ -65,9 +74,22 @@ def from_iso(value: str) -> datetime:
 
 def connect(path: Path | str) -> sqlite3.Connection:
     path = Path(path)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # Create the file as 0600 first so the -wal/-shm files SQLite derives from it are private too.
-    os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+    parent_existed = path.parent.exists()
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Create the file as 0600 first so the -wal/-shm files SQLite derives from it are private too.
+        os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+        os.chmod(path, 0o600)  # also tightens a database file that already existed
+    except PermissionError as exc:
+        raise DataDirError(
+            f"Cannot write to {path.parent}: {exc.strerror}. If the bot runs in Docker, the folder must be owned by "
+            f"uid 1000: sudo chown -R 1000:1000 {path.parent}"
+        ) from exc
+    if parent_existed and stat.S_IMODE(path.parent.stat().st_mode) & 0o077:
+        log.warning(
+            "%s is accessible by other users; consider `chmod 700 %s` (the database file itself is 0600)",
+            path.parent, path.parent,
+        )
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")

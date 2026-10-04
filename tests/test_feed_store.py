@@ -34,3 +34,12 @@ def test_custom_feeds_add_list_remove(conn):
     assert repo.remove("my-feed") is True
     assert repo.remove("my-feed") is False
     assert repo.all() == []
+
+
+def test_forget_clears_one_feed_so_a_re_added_feed_starts_fresh(conn):
+    store = SeenStore(conn)
+    store.initialize("f", ["a", "b"], NOW)
+    store.initialize("g", ["c"], NOW)
+    store.forget("f")
+    assert store.is_initialized("f") is False and store.seen_ids("f") == set()
+    assert store.is_initialized("g") is True and store.seen_ids("g") == {"c"}

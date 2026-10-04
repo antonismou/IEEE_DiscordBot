@@ -50,6 +50,30 @@ async def grant_role_and_reply(app, interaction: discord.Interaction, *, restore
     await interaction.followup.send(text, ephemeral=True)
 
 
+async def start_verification(app, interaction: discord.Interaction, raw_name: str, raw_email: str) -> None:
+    """Validate, email a code and tell the member. Never logs the address."""
+    try:
+        pending = app.verification.begin(interaction.user.id, raw_name, raw_email)
+    except VerificationError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    try:
+        await asyncio.to_thread(app.send_code, pending.email, pending.code, pending.ttl_minutes)
+    except MailError as exc:
+        # the exception text can contain the recipient address (e.g. "recipient refused"): log the class only
+        log.error("Could not send verification email (%s)", type(exc.__cause__ or exc).__name__)
+        app.verification.send_failed(interaction.user.id)
+        await interaction.followup.send(
+            "I couldn't send the email right now. Please try again later or ask an officer.", ephemeral=True
+        )
+        return
+    await interaction.followup.send(
+        f"A code was sent to **{pending.email}** (check spam too). "
+        f"Press **Enter code** within {pending.ttl_minutes} minutes.",
+        ephemeral=True,
+    )
+
+
 class StartModal(discord.ui.Modal, title="TUC verification"):
     full_name = discord.ui.TextInput(label="Full name", min_length=2, max_length=100)
     email = discord.ui.TextInput(label="Academic email (@tuc.gr)", placeholder="name@tuc.gr", max_length=100)
@@ -60,25 +84,7 @@ class StartModal(discord.ui.Modal, title="TUC verification"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            pending = self.app.verification.begin(interaction.user.id, str(self.full_name), str(self.email))
-        except VerificationError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-        try:
-            await asyncio.to_thread(self.app.send_code, pending.email, pending.code, pending.ttl_minutes)
-        except MailError:
-            log.exception("Could not send verification email")
-            self.app.verification.send_failed(interaction.user.id)
-            await interaction.followup.send(
-                "I couldn't send the email right now. Please try again later or ask an officer.", ephemeral=True
-            )
-            return
-        await interaction.followup.send(
-            f"A code was sent to **{pending.email}** (check spam too). "
-            f"Press **Enter code** within {pending.ttl_minutes} minutes.",
-            ephemeral=True,
-        )
+        await start_verification(self.app, interaction, str(self.full_name), str(self.email))
 
 
 class CodeModal(discord.ui.Modal, title="Enter your code"):
@@ -141,7 +147,15 @@ class VerifyCog(commands.Cog):
     @app_commands.guild_only()
     @officer_only()
     async def setup_verify(self, interaction: discord.Interaction) -> None:
-        await interaction.channel.send(PANEL_TEXT, view=VerifyView(self.bot.app))
+        try:
+            await interaction.channel.send(PANEL_TEXT, view=VerifyView(self.bot.app))
+        except discord.Forbidden:
+            await interaction.response.send_message(
+                "I can't post in this channel. Give my role **View Channel** and **Send Messages** here, "
+                "then run the command again.",
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message("Panel posted.", ephemeral=True)
 
 

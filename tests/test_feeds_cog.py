@@ -33,3 +33,25 @@ def test_feed_id_pattern():
     assert FEED_ID_RE.fullmatch("ai-ml-2")
     assert not FEED_ID_RE.fullmatch("Has Space")
     assert not FEED_ID_RE.fullmatch("x" * 41)
+
+
+def test_removing_a_feed_forgets_what_was_seen_so_re_adding_does_not_burst(conn):
+    from datetime import datetime, timezone
+    from unittest.mock import MagicMock
+
+    from bot.cogs.feeds import FeedsCog
+    from bot.feeds.store import SeenStore
+    from tests.fakes import fake_interaction
+
+    app = make_app(conn, [])
+    app.seen = SeenStore(conn)
+    app.custom_feeds.add(FeedConfig("foo", "Foo", "https://x/foo", 3))
+    app.seen.initialize("foo", ["a"], datetime(2026, 10, 4, tzinfo=timezone.utc))
+
+    async def scenario():
+        cog = FeedsCog(SimpleNamespace(app=app))
+        await cog.remove_feed.callback(cog, fake_interaction(MagicMock(), MagicMock()), "foo")
+
+    asyncio.run(scenario())
+    assert app.custom_feeds.all() == []
+    assert app.seen.is_initialized("foo") is False and app.seen.seen_ids("foo") == set()

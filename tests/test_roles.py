@@ -108,3 +108,15 @@ def test_notify_officers_swallows_discord_errors():
     client = MagicMock()
     client.get_channel.return_value = channel
     run(notify_officers(client, 55, "role problem"))   # must not raise
+
+
+def test_role_failure_log_does_not_contain_the_member_name(caplog):
+    class Named(FakeMember):
+        def __repr__(self):
+            return "Alice Smith#1234"
+
+        __str__ = __repr__
+
+    forbidden = discord.Forbidden(SimpleNamespace(status=403, reason="Forbidden"), "missing permissions")
+    run(set_verified_role(guild_with(object()), Named(forbidden), 5, add=True, reason="r"))
+    assert caplog.records and "Alice Smith" not in caplog.text

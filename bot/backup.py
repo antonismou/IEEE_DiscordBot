@@ -12,6 +12,7 @@ def backup_database(conn: sqlite3.Connection, backup_dir: Path, *, keep: int = 7
     now = now or utcnow()
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(backup_dir, 0o700)  # ours alone: tighten it if it already existed
     dest = backup_dir / f"bot-{now:%Y%m%d}.sqlite3"
     os.close(os.open(dest, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600))
     target = sqlite3.connect(dest)
