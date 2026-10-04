@@ -11,9 +11,8 @@ and IEEE Xplore RSS items.
 2. **Gmail:** use a dedicated branch Gmail account. Turn on 2-Step Verification, then create an *App password*
    (Google Account -> Security -> App passwords).
 3. **Secrets:** `cp .env.example .env` and fill `DISCORD_TOKEN`, `GMAIL_ADDRESS`, `GMAIL_APP_PASSWORD`.
-4. **Config:** `cp config.example.toml config.toml` and fill the guild, role and channel IDs
-   (enable Developer Mode in Discord, then right-click -> Copy ID). Set `officer_log_channel_id` to a private
-   officers-only channel so the bot can tell you when it cannot assign the Verified role.
+4. **Config:** `cp config.example.toml config.toml` and fill the server ID and the two role IDs
+   (enable Developer Mode in Discord, then right-click -> Copy ID). Channels are set later, from Discord.
 5. **Run:** `mkdir -m 700 data && docker compose up -d --build`, then watch `docker compose logs -f`.
    The container runs as uid 1000, so `data` must belong to that user (`sudo chown -R 1000:1000 data` if your
    server account has a different uid). `config.toml` must exist **before** the first `up`; otherwise Docker
@@ -22,6 +21,10 @@ and IEEE Xplore RSS items.
    `docker compose run --rm bot python -m scripts.check_feeds /app/config.toml` (all lines should say `OK`;
    IEEE may block some addresses, which is why this runs on the server).
 7. In `#verify` run `/setup-verify` once to post the panel.
+8. Choose where each feed topic posts: `/channel set topic:ai-ml channel:#ai-ml`, and the same for `power-energy`,
+   `robotics` and `ieee-spectrum`. Also set `officer-log` to a private officers-only channel: the bot tells you
+   there when it cannot assign the Verified role. `/channel list` shows what is set. Feeds whose topic has no
+   channel yet stay paused (the log says so).
 
 ## Commands
 
@@ -31,6 +34,7 @@ and IEEE Xplore RSS items.
 | `/verify-manual user name note` | officers | verify someone without a TUC email |
 | `/unverify user` | officers | remove the Verified role (data kept) |
 | `/member lookup / export / delete` | officers | inspect, export CSV, delete stored data |
+| `/channel set / clear / list` | officers | choose the channel each feed topic (and the officer log) posts to |
 | `/feed list / add / remove` | officers | manage feeds without restarting |
 | `/forget-me` | everyone | delete your own stored data |
 

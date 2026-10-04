@@ -34,7 +34,7 @@ def make_cog(conn):
 
     members = MemberRepo(conn)
     app = SimpleNamespace(
-        settings=SimpleNamespace(verified_role_id=5, officer_role_id=9, officer_log_channel_id=None),
+        settings=SimpleNamespace(verified_role_id=5, officer_role_id=9),
         members=members,
         verification=VerificationService(conn, members),
     )

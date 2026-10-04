@@ -13,7 +13,7 @@ from bot.checks import handle_app_command_error
 from bot.config import ConfigError, load_settings
 from bot.db import DataDirError
 
-EXTENSIONS = ("bot.cogs.verify", "bot.cogs.officer", "bot.cogs.feeds", "bot.cogs.maintenance")
+EXTENSIONS = ("bot.cogs.verify", "bot.cogs.officer", "bot.cogs.feeds", "bot.cogs.channels", "bot.cogs.maintenance")
 
 
 class IEEEBot(commands.Bot):

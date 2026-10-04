@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.channels import OFFICER_LOG
 from bot.checks import officer_only
 from bot.mailer import MailError
 from bot.roles import notify_officers, set_verified_role
@@ -38,7 +39,7 @@ async def grant_role_and_reply(app, interaction: discord.Interaction, *, restore
         text = "Your Verified role was restored." if restored else "You are verified. Welcome!"
     else:
         await notify_officers(
-            interaction.client, app.settings.officer_log_channel_id,
+            interaction.client, app.channels.get(OFFICER_LOG),
             f"I could not assign the Verified role to <@{interaction.user.id}> although their verification is stored. "
             "Check that my role is above Verified and that I have Manage Roles; the member can press **Verify** "
             "again once it is fixed.",

@@ -4,6 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Callable
 
+from bot.channels import ChannelRepo
 from bot.config import Settings
 from bot.db import connect
 from bot.feeds.store import CustomFeedRepo, SeenStore
@@ -21,6 +22,7 @@ class AppContext:
     send_code: Callable[[str, str, int], None]
     seen: SeenStore
     custom_feeds: CustomFeedRepo
+    channels: ChannelRepo
 
 
 def build_app(settings: Settings) -> AppContext:
@@ -34,4 +36,5 @@ def build_app(settings: Settings) -> AppContext:
         send_code=make_gmail_sender(settings.gmail_address, settings.gmail_app_password),
         seen=SeenStore(conn),
         custom_feeds=CustomFeedRepo(conn),
+        channels=ChannelRepo(conn),
     )

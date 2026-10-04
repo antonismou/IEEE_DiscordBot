@@ -1,17 +1,12 @@
+# Channels are NOT set here: after the bot starts, use /channel set in Discord.
+# Each feed's `channel` below is a topic name; /channel set topic:<name> channel:<#channel> points it somewhere.
 guild_id = 0
 verified_role_id = 0
 officer_role_id = 0
-officer_log_channel_id = 0   # optional: private channel where the bot reports problems (0 = off)
 db_path = "data/bot.sqlite3"
 backup_dir = "data/backups"
 poll_interval_minutes = 30
 max_items_per_poll = 10
-
-[channels]
-ieee-spectrum = 0
-ai-ml = 0
-power-energy = 0
-robotics = 0
 
 [[feeds]]
 id = "spectrum"

@@ -11,9 +11,6 @@ guild_id = 1
 verified_role_id = 2
 officer_role_id = 3
 
-[channels]
-ai-ml = 10
-
 [[feeds]]
 id = "tpami"
 title = "Pattern Analysis and Machine Intelligence"
@@ -36,25 +33,12 @@ def test_loads_values_and_defaults(tmp_path):
     assert s.db_path == Path("data/bot.sqlite3")
     assert s.backup_dir == Path("data/backups")
     (feed,) = s.feeds
-    assert (feed.id, feed.channel_id) == ("tpami", 10)
-
-
-def test_officer_log_channel_is_optional(tmp_path):
-    assert load_settings(write(tmp_path, GOOD), ENV).officer_log_channel_id is None
-    with_channel = GOOD.replace("officer_role_id = 3", "officer_role_id = 3\nofficer_log_channel_id = 55")
-    assert load_settings(write(tmp_path, with_channel), ENV).officer_log_channel_id == 55
-    zero = GOOD.replace("officer_role_id = 3", "officer_role_id = 3\nofficer_log_channel_id = 0")
-    assert load_settings(write(tmp_path, zero), ENV).officer_log_channel_id is None
+    assert (feed.id, feed.topic, feed.channel_id) == ("tpami", "ai-ml", None)
 
 
 def test_missing_env_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="GMAIL_APP_PASSWORD"):
         load_settings(write(tmp_path, GOOD), {"DISCORD_TOKEN": "t", "GMAIL_ADDRESS": "a"})
-
-
-def test_unknown_channel_name(tmp_path):
-    with pytest.raises(ConfigError, match="nope"):
-        load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "nope"')), ENV)
 
 
 def test_duplicate_feed_id(tmp_path):
@@ -74,3 +58,13 @@ def test_config_path_that_is_a_directory_explains_the_docker_pitfall(tmp_path):
     (tmp_path / "config.toml").mkdir()
     with pytest.raises(ConfigError, match="directory"):
         load_settings(tmp_path / "config.toml", ENV)
+
+
+def test_feed_must_name_a_topic(tmp_path):
+    with pytest.raises(ConfigError, match="channel"):
+        load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"\n', "")), ENV)
+
+
+def test_officer_log_is_a_reserved_topic(tmp_path):
+    with pytest.raises(ConfigError, match="reserved"):
+        load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "officer-log"')), ENV)

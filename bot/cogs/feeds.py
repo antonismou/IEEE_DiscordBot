@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import re
 
@@ -42,6 +43,23 @@ class FeedsCog(commands.Cog):
         feeds.extend(feed for feed in self.app.custom_feeds.all() if feed.id not in used)
         return feeds
 
+    def _channel_for(self, feed: FeedConfig) -> int | None:
+        if feed.channel_id:
+            return feed.channel_id
+        return self.app.channels.get(feed.topic) if feed.topic else None
+
+    def ready_feeds(self) -> tuple[list[FeedConfig], list[FeedConfig]]:
+        """(feeds with a channel resolved, feeds still waiting for /channel set)."""
+        ready: list[FeedConfig] = []
+        skipped: list[FeedConfig] = []
+        for feed in self.all_feeds():
+            channel_id = self._channel_for(feed)
+            if channel_id:
+                ready.append(dataclasses.replace(feed, channel_id=channel_id))
+            else:
+                skipped.append(feed)
+        return ready, skipped
+
     async def send(self, channel_id: int, embeds: list[discord.Embed], content: str | None) -> None:
         channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
         await channel.send(content=content, embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
@@ -54,7 +72,11 @@ class FeedsCog(commands.Cog):
 
     @tasks.loop(minutes=30)
     async def poll(self) -> None:
-        for feed in self.all_feeds():
+        ready, skipped = self.ready_feeds()
+        if skipped:
+            topics = sorted({feed.topic for feed in skipped if feed.topic})
+            log.warning("Feeds paused, no channel set for topic(s) %s: run /channel set", ", ".join(topics))
+        for feed in ready:
             try:
                 posted = await self.poll_feed(feed)
                 log.info("Feed %s: %d new item(s) posted", feed.id, posted)
@@ -72,7 +94,9 @@ class FeedsCog(commands.Cog):
     async def list_feeds(self, interaction: discord.Interaction) -> None:
         custom_ids = {feed.id for feed in self.app.custom_feeds.all()}
         lines = [
-            f"`{feed.id}` {feed.title} -> <#{feed.channel_id}>" + (" (added by command)" if feed.id in custom_ids else "")
+            f"`{feed.id}` {feed.title} -> "
+            + (f"<#{self._channel_for(feed)}>" if self._channel_for(feed) else f"**no channel** (topic `{feed.topic}`: /channel set)")
+            + (" (added by command)" if feed.id in custom_ids else "")
             for feed in self.all_feeds()
         ]
         await interaction.response.send_message("\n".join(lines) or "No feeds.", ephemeral=True)

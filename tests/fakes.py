@@ -23,6 +23,7 @@ def fake_guild(*, role=None, cached=None, fetched=None, fetch_error=None):
         get_role=lambda role_id: role,
         get_member=lambda user_id: cached,
         fetch_member=fetch,
+        me=object(),
     )
 
 
@@ -41,4 +42,12 @@ def fake_interaction(user, guild, client=None):
 
 def followup_text(interaction) -> str:
     args, kwargs = interaction.followup.send.await_args
+    return args[0] if args else kwargs.get("content", "")
+
+
+def reply_text(interaction) -> str:
+    """Text of the interaction's reply, whether it used send_message or defer + followup."""
+    if interaction.followup.send.await_args is not None:
+        return followup_text(interaction)
+    args, kwargs = interaction.response.send_message.await_args
     return args[0] if args else kwargs.get("content", "")

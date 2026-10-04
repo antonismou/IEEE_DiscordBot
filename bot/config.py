@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
+from bot.channels import OFFICER_LOG
+
 REQUIRED_ENV = ("DISCORD_TOKEN", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD")
 
 
@@ -18,7 +20,8 @@ class FeedConfig:
     id: str
     title: str
     url: str
-    channel_id: int
+    channel_id: int | None  # set for feeds added with /feed add
+    topic: str | None = None  # set for feeds in config.toml; resolved through /channel set
 
 
 @dataclass(frozen=True)
@@ -34,7 +37,6 @@ class Settings:
     poll_interval_minutes: int
     max_items_per_poll: int
     feeds: tuple[FeedConfig, ...]
-    officer_log_channel_id: int | None = None
 
 
 def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Settings:
@@ -55,20 +57,19 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid config file: {exc}") from None
 
-    channels = raw.get("channels", {})
     feeds: list[FeedConfig] = []
     seen_ids: set[str] = set()
     for entry in raw.get("feeds", []):
         try:
-            feed_id, title, url, channel = entry["id"], entry["title"], entry["url"], entry["channel"]
+            feed_id, title, url, topic = entry["id"], entry["title"], entry["url"], entry["channel"]
         except KeyError as exc:
             raise ConfigError(f"Feed entry is missing key {exc}: {entry}") from None
-        if channel not in channels:
-            raise ConfigError(f"Feed '{feed_id}' uses unknown channel '{channel}'")
+        if topic == OFFICER_LOG:
+            raise ConfigError(f"Feed '{feed_id}' cannot use '{OFFICER_LOG}': that topic is reserved for the officers' log")
         if feed_id in seen_ids:
             raise ConfigError(f"Duplicate feed id '{feed_id}'")
         seen_ids.add(feed_id)
-        feeds.append(FeedConfig(feed_id, title, url, int(channels[channel])))
+        feeds.append(FeedConfig(feed_id, title, url, None, topic=topic))
 
     try:
         return Settings(
@@ -83,7 +84,6 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             poll_interval_minutes=int(raw.get("poll_interval_minutes", 30)),
             max_items_per_poll=int(raw.get("max_items_per_poll", 10)),
             feeds=tuple(feeds),
-            officer_log_channel_id=int(raw.get("officer_log_channel_id", 0)) or None,
         )
     except KeyError as exc:
         raise ConfigError(f"Missing config key: {exc}") from None

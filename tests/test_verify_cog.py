@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
+from bot.channels import OFFICER_LOG, ChannelRepo
 from bot.cogs.verify import CONSENT_TEXT, VerifyView, grant_role_and_reply
 from bot.members import MemberRepo
 from tests.fakes import fake_guild, fake_interaction, fake_member, followup_text
@@ -15,9 +16,13 @@ OFFICER_CHANNEL = 55
 
 
 def make_app(conn, *, log_channel=OFFICER_CHANNEL):
+    channels = ChannelRepo(conn)
+    if log_channel is not None:
+        channels.set(OFFICER_LOG, log_channel)
     return SimpleNamespace(
-        settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE, officer_log_channel_id=log_channel),
+        settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE),
         members=MemberRepo(conn),
+        channels=channels,
     )
 
 
@@ -29,13 +34,12 @@ def client_with_channel():
     return client, channel
 
 
-def test_successful_grant_welcomes_the_member():
+def test_successful_grant_welcomes_the_member(conn):
     async def scenario():
         user = fake_member(7)
         client, channel = client_with_channel()
         interaction = fake_interaction(user, fake_guild(), client)
-        await grant_role_and_reply(SimpleNamespace(settings=SimpleNamespace(
-            verified_role_id=VERIFIED_ROLE, officer_log_channel_id=OFFICER_CHANNEL)), interaction)
+        await grant_role_and_reply(make_app(conn), interaction)
         return user, channel, interaction
 
     user, channel, interaction = asyncio.run(scenario())
@@ -44,15 +48,13 @@ def test_successful_grant_welcomes_the_member():
     assert "You are verified" in followup_text(interaction)
 
 
-def test_role_failure_tells_the_member_and_notifies_officers():
+def test_role_failure_tells_the_member_and_notifies_officers(conn):
     async def scenario():
         user = fake_member(7)
         user.add_roles.side_effect = discord.Forbidden(SimpleNamespace(status=403, reason="x"), "no")
         client, channel = client_with_channel()
         interaction = fake_interaction(user, fake_guild(), client)
-        app = SimpleNamespace(settings=SimpleNamespace(
-            verified_role_id=VERIFIED_ROLE, officer_log_channel_id=OFFICER_CHANNEL))
-        await grant_role_and_reply(app, interaction)
+        await grant_role_and_reply(make_app(conn), interaction)
         return channel, interaction
 
     channel, interaction = asyncio.run(scenario())
@@ -108,7 +110,8 @@ def test_mail_failure_log_does_not_contain_the_recipient_address(conn, caplog):
     async def scenario():
         members = MemberRepo(conn)
         app = SimpleNamespace(
-            settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE, officer_log_channel_id=None),
+            settings=SimpleNamespace(verified_role_id=VERIFIED_ROLE),
+            channels=ChannelRepo(conn),
             verification=VerificationService(conn, members),
             send_code=failing_send,
         )
