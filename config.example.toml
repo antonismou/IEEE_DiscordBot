@@ -1,0 +1,97 @@
+guild_id = 0
+verified_role_id = 0
+officer_role_id = 0
+db_path = "data/bot.sqlite3"
+backup_dir = "data/backups"
+poll_interval_minutes = 30
+max_items_per_poll = 10
+
+[channels]
+ieee-spectrum = 0
+ai-ml = 0
+power-energy = 0
+robotics = 0
+
+[[feeds]]
+id = "spectrum"
+title = "IEEE Spectrum"
+url = "https://spectrum.ieee.org/feeds/feed.rss"
+channel = "ieee-spectrum"
+
+[[feeds]]
+id = "tpami"
+title = "IEEE Transactions on Pattern Analysis and Machine Intelligence"
+url = "https://ieeexplore.ieee.org/rss/TOC34.XML"
+channel = "ai-ml"
+
+[[feeds]]
+id = "tnnls"
+title = "IEEE Transactions on Neural Networks and Learning Systems"
+url = "https://ieeexplore.ieee.org/rss/TOC5962385.XML"
+channel = "ai-ml"
+
+[[feeds]]
+id = "tai"
+title = "IEEE Transactions on Artificial Intelligence"
+url = "https://ieeexplore.ieee.org/rss/TOC9078688.XML"
+channel = "ai-ml"
+
+[[feeds]]
+id = "tcyb"
+title = "IEEE Transactions on Cybernetics"
+url = "https://ieeexplore.ieee.org/rss/TOC6221036.XML"
+channel = "ai-ml"
+
+[[feeds]]
+id = "tpwrs"
+title = "IEEE Transactions on Power Systems"
+url = "https://ieeexplore.ieee.org/rss/TOC59.XML"
+channel = "power-energy"
+
+[[feeds]]
+id = "tpel"
+title = "IEEE Transactions on Power Electronics"
+url = "https://ieeexplore.ieee.org/rss/TOC63.XML"
+channel = "power-energy"
+
+[[feeds]]
+id = "tsg"
+title = "IEEE Transactions on Smart Grid"
+url = "https://ieeexplore.ieee.org/rss/TOC5165411.XML"
+channel = "power-energy"
+
+[[feeds]]
+id = "tste"
+title = "IEEE Transactions on Sustainable Energy"
+url = "https://ieeexplore.ieee.org/rss/TOC5165391.XML"
+channel = "power-energy"
+
+[[feeds]]
+id = "tro"
+title = "IEEE Transactions on Robotics"
+url = "https://ieeexplore.ieee.org/rss/TOC8860.XML"
+channel = "robotics"
+
+[[feeds]]
+id = "ral"
+title = "IEEE Robotics and Automation Letters"
+url = "https://ieeexplore.ieee.org/rss/TOC7083369.XML"
+channel = "robotics"
+
+[[feeds]]
+id = "tase"
+title = "IEEE Transactions on Automation Science and Engineering"
+url = "https://ieeexplore.ieee.org/rss/TOC8856.XML"
+channel = "robotics"
+
+[[feeds]]
+id = "tmech"
+title = "IEEE/ASME Transactions on Mechatronics"
+url = "https://ieeexplore.ieee.org/rss/TOC3516.XML"
+channel = "robotics"
+
+[[feeds]]
+id = "ram"
+title = "IEEE Robotics and Automation Magazine"
+url = "https://ieeexplore.ieee.org/rss/TOC100.XML"
+channel = "robotics"

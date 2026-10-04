@@ -1,0 +1,10 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      BOT_CONFIG: /app/config.toml
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+      - ./data:/app/data
