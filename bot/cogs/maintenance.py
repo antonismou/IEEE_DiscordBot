@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import time, timezone
+from datetime import time
+from zoneinfo import ZoneInfo
 
 from discord.ext import commands, tasks
 
 from bot.backup import backup_database
 
 log = logging.getLogger(__name__)
+
+ATHENS = ZoneInfo("Europe/Athens")
 
 
 class MaintenanceCog(commands.Cog):
@@ -20,7 +23,7 @@ class MaintenanceCog(commands.Cog):
     async def cog_unload(self) -> None:
         self.nightly_backup.cancel()
 
-    @tasks.loop(time=time(hour=3, minute=0, tzinfo=timezone.utc))
+    @tasks.loop(time=time(hour=3, minute=30, tzinfo=ATHENS))
     async def nightly_backup(self) -> None:
         app = self.bot.app
         try:
