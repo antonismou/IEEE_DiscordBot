@@ -11,6 +11,8 @@ def fake_member(user_id=1, role_ids=(), bot=False, admin=False):
     member.roles = [SimpleNamespace(id=r) for r in role_ids]
     member.mention = f"<@{user_id}>"
     member.guild_permissions = discord.Permissions(administrator=admin)
+    member.nick = None
+    member.edit = AsyncMock()
     member.add_roles = AsyncMock()
     member.remove_roles = AsyncMock()
     return member

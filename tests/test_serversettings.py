@@ -20,3 +20,10 @@ def test_reconfigure_overwrites(conn):
     server.configure(guild_id=111, verified_role_id=222, officer_role_id=333)
     server.configure(guild_id=111, verified_role_id=444, officer_role_id=555)
     assert (server.verified_role_id, server.officer_role_id) == (444, 555)
+
+
+def test_branch_roles_default_empty_and_round_trip(conn):
+    server = ServerSettings(conn)
+    assert server.branch_role_ids == {}
+    server.configure_branches({"main": 1, "cs": 2, "ias": 3, "quantum": 4})
+    assert ServerSettings(conn).branch_role_ids == {"main": 1, "cs": 2, "ias": 3, "quantum": 4}

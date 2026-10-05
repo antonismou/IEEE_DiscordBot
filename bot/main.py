@@ -18,7 +18,7 @@ log = logging.getLogger(__name__)
 
 EXTENSIONS = (
     "bot.cogs.setup", "bot.cogs.verify", "bot.cogs.officer", "bot.cogs.feeds", "bot.cogs.channels",
-    "bot.cogs.maintenance",
+    "bot.cogs.maintenance", "bot.cogs.branches",
 )
 
 

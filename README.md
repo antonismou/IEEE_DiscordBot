@@ -29,6 +29,16 @@ and IEEE Xplore RSS items.
    there when it cannot assign the Verified role. `/channel list` shows what is set. Feeds whose topic has no
    channel yet stay paused (the log says so).
 
+10. **Branch roles:** create four roles (Main Branch, CS, IAS, Quantum) and run
+    `/setup branches main:@.. cs:@.. ias:@.. quantum:@..`. Drag the bot's role above them and give it
+    **Manage Roles** and **Manage Nicknames**. After verifying, members pick one or more of them.
+11. **Channel visibility (done by hand in Discord):** `@everyone` sees only `#welcome`, `#rules` and `#verify`;
+    the **Verified** role sees everything else. Make a `#roles` channel visible to Verified only and run
+    `/setup-roles` there: members press **Choose my roles** to change their branches later, no commands needed.
+
+On verification the bot renames the member to the full name they gave (cut to Discord's 32 characters). It cannot
+rename the server owner or anyone above its role; officers are told in `officer-log` when that happens.
+
 Administrators can always use the officer commands, even before the officer role exists.
 
 ## Commands
@@ -36,6 +46,9 @@ Administrators can always use the officer commands, even before the officer role
 | Command | Who | What |
 |---|---|---|
 | `/setup roles / status` | administrators | choose the Verified and Officer roles; see what is missing |
+| `/setup branches` | administrators | choose the four branch roles members can pick |
+| `/setup branch-description` | administrators | set the short text (max 100 characters) shown under each branch in the picker; leave `text` empty to remove it |
+| `/setup-roles` | officers | post the "Choose my roles" panel in the current channel |
 | `/setup-verify` | officers | post the verification panel |
 | `/verify-manual user name note` | officers | verify someone without a TUC email |
 | `/unverify user` | officers | remove the Verified role (data kept) |

@@ -7,6 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.branches import picker_for, set_nickname
 from bot.channels import OFFICER_LOG
 from bot.checks import officer_only
 from bot.gate import gate_message
@@ -36,8 +37,19 @@ async def grant_role_and_reply(app, interaction: discord.Interaction, *, restore
         interaction.guild, interaction.user, app.server.verified_role_id,
         add=True, reason="TUC email verified",
     )
+    view = None
     if ok:
         text = "Your Verified role was restored." if restored else "You are verified. Welcome!"
+        member = app.members.get(interaction.user.id)
+        if member and not await set_nickname(interaction.user, member.full_name):
+            await notify_officers(
+                interaction.client, app.channels.get(OFFICER_LOG),
+                f"I could not set the nickname of <@{interaction.user.id}> to their verified name "
+                "(the server owner and members above my role can't be renamed; I also need Manage Nicknames).",
+            )
+        view = picker_for(app, interaction.user)
+        if view:
+            text += " Now choose your branch(es):"
     else:
         await notify_officers(
             interaction.client, app.channels.get(OFFICER_LOG),
@@ -49,7 +61,7 @@ async def grant_role_and_reply(app, interaction: discord.Interaction, *, restore
             "Your email is verified, but I couldn't assign the role. Officers were notified; "
             "press **Verify** again later to retry."
         )
-    await interaction.followup.send(text, ephemeral=True)
+    await interaction.followup.send(text, ephemeral=True, **({"view": view} if view else {}))
 
 
 async def start_verification(app, interaction: discord.Interaction, raw_name: str, raw_email: str) -> None:
@@ -131,7 +143,11 @@ class VerifyView(discord.ui.View):
             role_id = self.app.server.verified_role_id
             await interaction.response.defer(ephemeral=True, thinking=True)
             if any(role.id == role_id for role in interaction.user.roles):
-                await interaction.followup.send("You are already verified.", ephemeral=True)
+                picker = picker_for(self.app, interaction.user)
+                await interaction.followup.send(
+                    "You are already verified." + (" You can change your branches here:" if picker else ""),
+                    ephemeral=True, **({"view": picker} if picker else {}),
+                )
             else:  # stored but the role never arrived (e.g. the bot lacked permissions at the time)
                 await grant_role_and_reply(self.app, interaction, restored=True)
             return
