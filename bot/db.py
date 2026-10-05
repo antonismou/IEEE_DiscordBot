@@ -55,6 +55,11 @@ CREATE TABLE IF NOT EXISTS server_settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS pin_attempts (
+    discord_id   INTEGER PRIMARY KEY,
+    failures     INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT
+);
 CREATE TABLE IF NOT EXISTS channel_bindings (
     topic      TEXT PRIMARY KEY,
     channel_id INTEGER NOT NULL

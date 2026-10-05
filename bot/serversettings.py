@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+from bot.pins import hash_pin, pin_matches
+
 
 class ServerSettings:
     """The one Discord server the bot serves, and its two roles. Set with /setup roles, kept in the database."""
@@ -54,6 +56,27 @@ class ServerSettings:
                 )
             else:
                 self._c.execute("DELETE FROM server_settings WHERE key = ?", (f"branch_desc_{key}",))
+
+    def branch_pin_keys(self) -> set[str]:
+        """The branches that need a PIN."""
+        rows = self._c.execute("SELECT key FROM server_settings WHERE key LIKE 'branch_pin_%'").fetchall()
+        return {row["key"].removeprefix("branch_pin_") for row in rows}
+
+    def set_branch_pin(self, key: str, pin: str | None) -> None:
+        """Store a salted hash of the PIN (never the PIN itself); None removes it."""
+        with self._c:
+            if pin:
+                self._c.execute(
+                    "INSERT INTO server_settings (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (f"branch_pin_{key}", hash_pin(pin)),
+                )
+            else:
+                self._c.execute("DELETE FROM server_settings WHERE key = ?", (f"branch_pin_{key}",))
+
+    def check_branch_pin(self, key: str, pin: str) -> bool:
+        row = self._c.execute("SELECT value FROM server_settings WHERE key = ?", (f"branch_pin_{key}",)).fetchone()
+        return row is not None and pin_matches(pin, row["value"])
 
     def configure_branches(self, role_ids: dict[str, int]) -> None:
         with self._c:

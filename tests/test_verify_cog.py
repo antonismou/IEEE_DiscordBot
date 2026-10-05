@@ -20,7 +20,8 @@ def make_app(conn, *, log_channel=OFFICER_CHANNEL):
     if log_channel is not None:
         channels.set(OFFICER_LOG, log_channel)
     return SimpleNamespace(
-        server=SimpleNamespace(verified_role_id=VERIFIED_ROLE, guild_id=111, branch_role_ids={}, branch_descriptions={}),
+        server=SimpleNamespace(verified_role_id=VERIFIED_ROLE, guild_id=111, branch_role_ids={}, branch_descriptions={},
+                               branch_pin_keys=lambda: set()),
         members=MemberRepo(conn),
         channels=channels,
     )

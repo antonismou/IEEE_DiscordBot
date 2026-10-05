@@ -7,6 +7,7 @@ from discord.ext import commands
 from bot.branches import BRANCHES, DESCRIPTION_MAX
 from bot.channels import OFFICER_LOG, topics_for
 from bot.checks import admin_only
+from bot.pins import PIN_LENGTH, is_valid_pin
 
 NO_MENTIONS = discord.AllowedMentions.none()
 
@@ -108,6 +109,22 @@ class SetupCog(commands.Cog):
             f"{branch.name}: {text}" if text else f"{branch.name}: description removed.", ephemeral=True
         )
 
+    @setup_group.command(name="branch-pin", description="Set or remove the PIN needed to take a branch role")
+    @app_commands.choices(branch=[app_commands.Choice(name=label, value=key) for key, label in BRANCHES])
+    @admin_only()
+    async def setup_branch_pin(
+        self, interaction: discord.Interaction, branch: app_commands.Choice[str], pin: str | None = None
+    ) -> None:
+        if pin is not None and not is_valid_pin(pin.strip()):
+            await interaction.response.send_message(f"The PIN must be exactly {PIN_LENGTH} digits.", ephemeral=True)
+            return
+        self.app.server.set_branch_pin(branch.value, pin.strip() if pin else None)
+        await interaction.response.send_message(
+            f"{branch.name}: PIN saved. Share it only with the people who may take this role." if pin
+            else f"{branch.name}: PIN removed, anyone verified can take this role.",
+            ephemeral=True,
+        )
+
     @setup_group.command(name="status", description="Show what is set up and what is still missing")
     @admin_only()
     async def setup_status(self, interaction: discord.Interaction) -> None:
@@ -124,7 +141,13 @@ class SetupCog(commands.Cog):
         branches = server.branch_role_ids
         lines.append(
             "**Branch roles** (`/setup branches`): "
-            + (", ".join(f"<@&{rid}>" for rid in branches.values()) if branches else "**not set**")
+            + (
+                ", ".join(
+                    f"<@&{rid}>" + (" (PIN)" if key in server.branch_pin_keys() else "")
+                    for key, rid in branches.items()
+                )
+                if branches else "**not set**"
+            )
         )
         lines.append("**Channels** (`/channel set`):")
         for topic in topics_for(self.app.settings.feeds):

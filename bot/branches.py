@@ -4,6 +4,8 @@ import logging
 
 import discord
 
+from bot.pins import PIN_LENGTH
+
 log = logging.getLogger(__name__)
 
 BRANCHES = (("main", "Main Branch"), ("cs", "CS"), ("ias", "IAS"), ("quantum", "Quantum"))
@@ -58,21 +60,74 @@ class BranchSelect(discord.ui.Select):
         self.app = app
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        ok = await apply_branch_roles(
-            interaction.guild, interaction.user, self.app.server.branch_role_ids, set(self.values)
+        selected = set(self.values)
+        held = {role.id for role in interaction.user.roles}
+        ids = self.app.server.branch_role_ids
+        protected = self.app.server.branch_pin_keys()
+        needs_pin = [key for key, _ in BRANCHES if key in selected and key in protected and ids[key] not in held]
+        if not needs_pin:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            await finish_selection(self.app, interaction, selected)
+            return
+        wait = self.app.pin_limiter.locked_for(interaction.user.id)
+        if wait:
+            await interaction.response.send_message(locked_text(wait), ephemeral=True)
+            return
+        await interaction.response.send_modal(PinModal(self.app, selected, needs_pin))
+
+
+def locked_text(seconds: int) -> str:
+    return f"Too many wrong PINs. Please try again in {-(-seconds // 60)} minute(s)."
+
+
+async def finish_selection(app, interaction: discord.Interaction, selected: set[str]) -> None:
+    """Apply the (already authorised) selection and tell the member. The interaction must be deferred."""
+    ok = await apply_branch_roles(interaction.guild, interaction.user, app.server.branch_role_ids, selected)
+    if ok:
+        chosen = ", ".join(BRANCH_LABELS[key] for key, _ in BRANCHES if key in selected)
+        await interaction.followup.send(
+            f"Done. Your branches: **{chosen}**. You can change them any time in the roles channel.",
+            ephemeral=True,
         )
-        if ok:
-            chosen = ", ".join(BRANCH_LABELS[key] for key in self.values)
+    else:
+        await interaction.followup.send(
+            "I couldn't change your roles. Ask an officer to check that my role is above the branch roles.",
+            ephemeral=True,
+        )
+
+
+class PinModal(discord.ui.Modal, title="Branch PINs"):
+    def __init__(self, app, selected: set[str], needs_pin: list[str]):
+        super().__init__()
+        self.app, self.selected, self.needs_pin = app, selected, needs_pin
+        self.inputs = {}
+        for key in needs_pin:
+            field = discord.ui.TextInput(
+                label=f"PIN for {BRANCH_LABELS[key]}"[:45], min_length=PIN_LENGTH, max_length=PIN_LENGTH,
+                placeholder=f"{PIN_LENGTH} digits",
+            )
+            self.inputs[key] = field
+            self.add_item(field)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        limiter, user_id = self.app.pin_limiter, interaction.user.id
+        wait = limiter.locked_for(user_id)
+        if wait:
+            await interaction.followup.send(locked_text(wait), ephemeral=True)
+            return
+        # check every PIN so that the answer does not reveal which one was wrong
+        results = [self.app.server.check_branch_pin(key, str(field).strip()) for key, field in self.inputs.items()]
+        if not all(results):
+            left = limiter.record_failure(user_id)
             await interaction.followup.send(
-                f"Done. Your branches: **{chosen}**. You can change them any time in the roles channel.",
+                "A PIN was wrong, so no roles were changed. "
+                + (f"{left} attempt(s) left." if left else locked_text(limiter.locked_for(user_id))),
                 ephemeral=True,
             )
-        else:
-            await interaction.followup.send(
-                "I couldn't change your roles. Ask an officer to check that my role is above the branch roles.",
-                ephemeral=True,
-            )
+            return
+        limiter.record_success(user_id)
+        await finish_selection(self.app, interaction, self.selected)
 
 
 class BranchPickerView(discord.ui.View):

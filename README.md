@@ -36,6 +36,12 @@ and IEEE Xplore RSS items.
     the **Verified** role sees everything else. Make a `#roles` channel visible to Verified only and run
     `/setup-roles` there: members press **Choose my roles** to change their branches later, no commands needed.
 
+**Branch PINs:** `/setup branch-pin branch:CS pin:123456` makes CS need that PIN; give it only to the people who may
+take the role. Members enter it in a form when they pick the branch. Roles they already hold, and removing a role,
+never ask. The bot stores only a salted hash, and 5 wrong submissions lock a member out of all PIN checks for 15
+minutes (kept across restarts). Six digits is still guessable by someone with many accounts, so treat the PIN as a
+speed bump and change it if it leaks.
+
 On verification the bot renames the member to the full name they gave (cut to Discord's 32 characters). It cannot
 rename the server owner or anyone above its role; officers are told in `officer-log` when that happens.
 
@@ -48,6 +54,7 @@ Administrators can always use the officer commands, even before the officer role
 | `/setup roles / status` | administrators | choose the Verified and Officer roles; see what is missing |
 | `/setup branches` | administrators | choose the four branch roles members can pick |
 | `/setup branch-description` | administrators | set the short text (max 100 characters) shown under each branch in the picker; leave `text` empty to remove it |
+| `/setup branch-pin` | administrators | set or remove the 6-digit PIN a member must enter to take a branch role (branches without a PIN stay open) |
 | `/setup-roles` | officers | post the "Choose my roles" panel in the current channel |
 | `/setup-verify` | officers | post the verification panel |
 | `/verify-manual user name note` | officers | verify someone without a TUC email |
