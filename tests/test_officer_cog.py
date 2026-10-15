@@ -10,7 +10,7 @@ def test_officer_cog_registers_expected_commands():
 
     cog = asyncio.run(build())
     names = {command.name for command in cog.get_app_commands()}
-    assert {"verify-manual", "unverify", "member", "forget-me"} <= names
+    assert {"verify-manual", "unverify", "member", "forget-me", "stats"} <= names
     member_group = next(c for c in cog.get_app_commands() if c.name == "member")
     assert {c.name for c in member_group.commands} == {"lookup", "export", "delete"}
 
@@ -22,6 +22,7 @@ from unittest.mock import MagicMock  # noqa: E402
 
 import discord  # noqa: E402
 
+from bot.channels import AUDIT_LOG, ChannelRepo  # noqa: E402
 from bot.members import MemberRepo  # noqa: E402
 from bot.verification import VerificationService  # noqa: E402
 from tests.fakes import fake_guild, fake_interaction, fake_member, followup_text  # noqa: E402
@@ -37,6 +38,7 @@ def make_cog(conn):
         server=SimpleNamespace(verified_role_id=5, officer_role_id=9),
         members=members,
         verification=VerificationService(conn, members),
+        channels=ChannelRepo(conn),
     )
     return OfficerCog(SimpleNamespace(app=app)), app
 
@@ -140,3 +142,35 @@ def test_verify_manual_verifies_and_grants_the_role(conn):
     assert stored.method == "manual" and stored.verified_by == 1 and stored.note == "Visiting professor"
     target.add_roles.assert_awaited_once()
     interaction.response.defer.assert_awaited_once()
+
+
+def test_officer_actions_are_audited_without_personal_data(conn):
+    from unittest.mock import AsyncMock
+
+    cog, app = make_cog(conn)
+    app.channels.set(AUDIT_LOG, 77)
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    client = MagicMock()
+    client.get_channel.return_value = channel
+    guild = fake_guild()
+    officer, target = fake_member(1), fake_member(8)
+    interaction = fake_interaction(officer, guild, client)
+    asyncio.run(cog.verify_manual.callback(cog, interaction, target, "Real Student", "no tuc email"))
+    interaction = fake_interaction(officer, guild, client)
+    asyncio.run(cog.unverify.callback(cog, interaction, target))
+    interaction = fake_interaction(officer, guild, client)
+    asyncio.run(cog.export.callback(cog, interaction))
+    lines = [call.args[0] for call in channel.send.await_args_list]
+    assert any("<@1> verified <@8> manually" in line for line in lines)
+    assert any("removed the Verified role from <@8>" in line for line in lines)
+    assert any("exported the member list" in line for line in lines)
+    assert not any("Real Student" in line or "no tuc email" in line for line in lines)
+
+
+def test_stats_verification_reports_the_numbers(conn):
+    cog, app = make_cog(conn)
+    interaction = fake_interaction(fake_member(1), fake_guild())
+    asyncio.run(cog.verification_stats.callback(cog, interaction))
+    text = interaction.response.send_message.await_args.args[0]
+    assert "Codes sent: **0**" in text and "Last 7 days" in text

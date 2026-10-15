@@ -27,6 +27,7 @@ def fake_guild(*, role=None, cached=None, fetched=None, fetch_error=None):
         get_member=lambda user_id: cached,
         fetch_member=fetch,
         me=object(),
+        default_role=object(),
     )
 
 
@@ -41,17 +42,22 @@ def fake_interaction(user, guild, client=None):
     interaction.response.send_modal = AsyncMock()
     interaction.response.is_done.return_value = False
     interaction.followup.send = AsyncMock()
+    interaction.edit_original_response = AsyncMock()
+    interaction.response.edit_message = AsyncMock()
     return interaction
 
 
 def followup_text(interaction) -> str:
+    """Text of the interaction's last private message: a new followup or an edit of the pressed message."""
+    if interaction.followup.send.await_args is None:
+        return interaction.edit_original_response.await_args.kwargs["content"]
     args, kwargs = interaction.followup.send.await_args
     return args[0] if args else kwargs.get("content", "")
 
 
 def reply_text(interaction) -> str:
     """Text of the interaction's reply, whether it used send_message or defer + followup."""
-    if interaction.followup.send.await_args is not None:
+    if interaction.followup.send.await_args is not None or interaction.edit_original_response.await_args is not None:
         return followup_text(interaction)
     args, kwargs = interaction.response.send_message.await_args
     return args[0] if args else kwargs.get("content", "")

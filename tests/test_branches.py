@@ -62,7 +62,7 @@ def test_roles_panel_requires_verification_and_setup(conn):
     app.server.branch_role_ids = {}
     verified = fake_interaction(fake_member(7, role_ids=(VERIFIED_ROLE,)), fake_guild(), MagicMock())
     asyncio.run(RolesView(app).open.callback(verified))
-    assert "/setup branches" in reply_text(verified)
+    assert "/setup branch-add" in reply_text(verified)
 
 
 def test_roles_panel_shows_picker_with_current_roles_preselected(conn):
@@ -75,28 +75,88 @@ def test_roles_panel_shows_picker_with_current_roles_preselected(conn):
     assert select.min_values == 1 and select.max_values == 4
 
 
-def test_setup_branches_saves_and_rejects_duplicates(conn):
+def test_branch_add_saves_rejects_bad_roles_and_updates_in_place(conn):
     cog, app = make_cog(conn)
     app.server.configure(guild_id=111, verified_role_id=222, officer_role_id=333)
     guild = fake_guild()
     guild.me = fake_me()
 
-    def run(*roles):
+    def run(name, role, **kw):
         interaction = fake_interaction(fake_member(1, admin=True), guild)
-        asyncio.run(cog.setup_branches.callback(cog, interaction, *roles))
+        asyncio.run(cog.setup_branch_add.callback(cog, interaction, name, role, **kw))
         return reply_text(interaction)
 
-    assert "must be different" in run(FakeRole(1), FakeRole(1), FakeRole(2), FakeRole(3))
-    assert "must be different" in run(FakeRole(1), FakeRole(2), FakeRole(3), FakeRole(222))
+    assert "Verified" in run("Antennas Society", FakeRole(222))
+    assert "Verified" in run("Antennas Society", FakeRole(333))
+    assert "normal role" in run("Antennas Society", FakeRole(5, managed=True))
+    assert "letter or digit" in run("!!!", FakeRole(5))
+    assert "6 digits" in run("Antennas Society", FakeRole(5), pin="12")
     assert app.server.branch_role_ids == {}
-    run(FakeRole(1), FakeRole(2), FakeRole(3), FakeRole(4))
-    assert app.server.branch_role_ids == {"main": 1, "cs": 2, "ias": 3, "quantum": 4}
+
+    run("Antennas Society", FakeRole(5), description="Antennas and RF", pin="123456")
+    assert app.server.branch_role_ids == {"antennas-society": 5}
+    assert app.server.branch_labels == {"antennas-society": "Antennas Society"}
+    assert app.server.branch_descriptions == {"antennas-society": "Antennas and RF"}
+    assert app.server.branch_pin_keys() == {"antennas-society"}
+
+    assert "already used" in run("Robotics", FakeRole(5))           # another branch has that role
+    run("Antennas society", FakeRole(6))                            # same key: re-pointed, not duplicated
+    assert app.server.branch_role_ids == {"antennas-society": 6}
+
+
+def test_branch_add_stops_at_discords_dropdown_limit(conn):
+    from bot.serversettings import MAX_BRANCHES
+
+    cog, app = make_cog(conn)
+    app.server.configure(guild_id=111, verified_role_id=222, officer_role_id=333)
+    for i in range(MAX_BRANCHES):
+        app.server.add_branch(f"b{i}", f"B{i}", 1000 + i)
+    guild = fake_guild()
+    guild.me = fake_me()
+    interaction = fake_interaction(fake_member(1, admin=True), guild)
+    asyncio.run(cog.setup_branch_add.callback(cog, interaction, "One more", FakeRole(5)))
+    assert "at most" in reply_text(interaction) and len(app.server.branch_role_ids) == MAX_BRANCHES
+
+
+def test_branch_remove_forgets_settings_but_not_the_role(conn):
+    cog, app = make_cog(conn)
+    app.server.add_branch("cs", "CS", 11)
+    app.server.set_branch_pin("cs", "123456")
+    app.server.set_branch_description("cs", "Software")
+    app.server.add_branch("ias", "IAS", 12)
+
+    def run(key):
+        interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+        asyncio.run(cog.setup_branch_remove.callback(cog, interaction, key))
+        return reply_text(interaction)
+
+    assert "don't know" in run("nope")
+    assert "untouched" in run("cs")
+    assert app.server.branch_role_ids == {"ias": 12}
+    assert app.server.branch_pin_keys() == set() and app.server.branch_descriptions == {}
+
+
+def test_autocomplete_lists_existing_branches_matching_the_text(conn):
+    cog, app = make_cog(conn)
+    app.server.add_branch("cs", "CS", 11)
+    app.server.add_branch("antennas-society", "Antennas Society", 12)
+    choices = asyncio.run(cog._branch_autocomplete(MagicMock(), "ant"))
+    assert [(c.name, c.value) for c in choices] == [("Antennas Society", "antennas-society")]
+
+
+def test_legacy_branches_keep_their_original_names(conn):
+    app = make_app(conn)
+    from bot.serversettings import ServerSettings
+    server = ServerSettings(conn)
+    server.configure_branches(IDS)                                  # how the four were stored before names existed
+    assert server.branch_labels == {"main": "Main Branch", "cs": "CS", "ias": "IAS", "quantum": "Quantum"}
+    assert list(server.branch_role_ids) == ["main", "cs", "ias", "quantum"]
 
 
 def test_branch_descriptions_show_in_the_picker_and_can_be_removed(conn):
     cog, app = make_cog(conn)
     app.server.configure_branches(IDS)
-    choice = SimpleNamespace(name="CS", value="cs")
+    choice = "cs"
 
     def run(text, **kw):
         interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
@@ -219,7 +279,7 @@ def test_wrong_pin_grants_nothing_and_counts_down_then_locks(conn):
     assert "Too many" in followup_text(asyncio.run(submit(app, user, ["cs"], ["cs"], ["123456"])))
     blocked = asyncio.run(pick(app, user, ["cs"]))
     blocked.response.send_modal.assert_not_awaited()
-    assert "Too many" in blocked.response.send_message.await_args.args[0]
+    assert "Too many" in blocked.response.edit_message.await_args.kwargs["content"]
 
     clock.now += timedelta(minutes=16)                               # lockout over
     asyncio.run(submit(app, user, ["cs"], ["cs"], ["123456"]))
@@ -235,7 +295,8 @@ def test_lockout_survives_a_restart(conn):
 
 def test_setup_branch_pin_validates_and_never_echoes_the_pin(conn):
     cog, app = make_cog(conn)
-    choice = SimpleNamespace(name="CS", value="cs")
+    app.server.configure_branches({"cs": 11})
+    choice = "cs"
 
     def run(pin):
         interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
@@ -246,3 +307,22 @@ def test_setup_branch_pin_validates_and_never_echoes_the_pin(conn):
     text = run("123456")
     assert "123456" not in text and app.server.branch_pin_keys() == {"cs"}
     assert "removed" in run(None) and app.server.branch_pin_keys() == set()
+
+
+def test_finishing_the_picker_replaces_it_with_the_result_and_drops_the_dropdown(conn):
+    app = pin_app(conn)
+    user = fake_member(7, role_ids=(VERIFIED_ROLE,))
+    interaction = asyncio.run(pick(app, user, ["main"]))
+    interaction.response.defer.assert_awaited_once_with()
+    interaction.followup.send.assert_not_awaited()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "Done" in kwargs["content"] and kwargs["view"] is None
+
+
+def test_wrong_pin_keeps_the_picker_on_screen(conn):
+    from discord.utils import MISSING
+
+    app = pin_app(conn)
+    user = fake_member(7, role_ids=(VERIFIED_ROLE,))
+    interaction = asyncio.run(submit(app, user, ["cs"], ["cs"], ["000000"]))
+    assert interaction.edit_original_response.await_args.kwargs["view"] is MISSING

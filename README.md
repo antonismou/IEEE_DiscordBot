@@ -28,10 +28,15 @@ and IEEE Xplore RSS items.
    `robotics` and `ieee-spectrum`. Also set `officer-log` to a private officers-only channel: the bot tells you
    there when it cannot assign the Verified role. `/channel list` shows what is set. Feeds whose topic has no
    channel yet stay paused (the log says so).
+   Also set `audit-log` to a channel **visible only to the Officer role**: the bot posts one line there for every
+   officer/admin action (manual verify, unverify, data delete/export, role/branch/channel changes). It never
+   contains emails, names or PINs. Without it, nothing is recorded; `/setup status` flags that. Discord keeps
+   the messages until someone deletes them.
 
-10. **Branch roles:** create four roles (Main Branch, CS, IAS, Quantum) and run
-    `/setup branches main:@.. cs:@.. ias:@.. quantum:@..`. Drag the bot's role above them and give it
-    **Manage Roles** and **Manage Nicknames**. After verifying, members pick one or more of them.
+10. **Branch roles:** create a role per branch and add each with `/setup branch-add name:"CS" role:@..`
+    (optionally `description:` and `pin:`). Add as many as you like (up to 25) and use `/setup branch-remove` to
+    drop one; removing only stops offering it, the Discord role and its holders are untouched. Drag the bot's role
+    above them and give it **Manage Roles** and **Manage Nicknames**. After verifying, members pick one or more.
 11. **Channel visibility (done by hand in Discord):** `@everyone` sees only `#welcome`, `#rules` and `#verify`;
     the **Verified** role sees everything else. Make a `#roles` channel visible to Verified only and run
     `/setup-roles` there: members press **Choose my roles** to change their branches later, no commands needed.
@@ -41,6 +46,10 @@ take the role. Members enter it in a form when they pick the branch. Roles they 
 never ask. The bot stores only a salted hash, and 5 wrong submissions lock a member out of all PIN checks for 15
 minutes (kept across restarts). Six digits is still guessable by someone with many accounts, so treat the PIN as a
 speed bump and change it if it leaks.
+
+Members who don't receive the code can press **Resend code** (same rate limits). If Gmail refuses to send
+(e.g. the app password was revoked) the bot tells `officer-log` once an hour; `/setup status` tests the mail login
+and shows the last backup and feed poll.
 
 On verification the bot renames the member to the full name they gave (cut to Discord's 32 characters). It cannot
 rename the server owner or anyone above its role; officers are told in `officer-log` when that happens.
@@ -52,7 +61,8 @@ Administrators can always use the officer commands, even before the officer role
 | Command | Who | What |
 |---|---|---|
 | `/setup roles / status` | administrators | choose the Verified and Officer roles; see what is missing |
-| `/setup branches` | administrators | choose the four branch roles members can pick |
+| `/setup branch-add` | administrators | add a branch role members can pick (or change its role), with optional description and PIN |
+| `/setup branch-remove` | administrators | stop offering a branch in the picker (the Discord role is kept) |
 | `/setup branch-description` | administrators | set the short text (max 100 characters) shown under each branch in the picker; leave `text` empty to remove it |
 | `/setup branch-pin` | administrators | set or remove the 6-digit PIN a member must enter to take a branch role (branches without a PIN stay open) |
 | `/setup-roles` | officers | post the "Choose my roles" panel in the current channel |
@@ -62,6 +72,7 @@ Administrators can always use the officer commands, even before the officer role
 | `/member lookup / export / delete` | officers | inspect, export CSV, delete stored data |
 | `/channel set / clear / list` | officers | choose the channel each feed topic (and the officer log) posts to |
 | `/feed list / add / remove` | officers | manage feeds without restarting |
+| `/stats verification` | officers | codes sent vs members verified (24 h / 7 days), to spot emails that don't arrive |
 | `/forget-me` | everyone | delete your own stored data |
 
 ## Data

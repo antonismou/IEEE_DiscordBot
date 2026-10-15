@@ -35,3 +35,17 @@ def make_gmail_sender(
             raise MailError(str(exc)) from exc
 
     return send
+
+
+def make_gmail_checker(
+    address: str, app_password: str, *, host: str = "smtp.gmail.com", port: int = 465
+) -> Callable[[], None]:
+    """A check that logs in without sending anything. Raises MailError if Gmail refuses or is unreachable."""
+    def check() -> None:
+        try:
+            with smtplib.SMTP_SSL(host, port, timeout=20, context=ssl.create_default_context()) as smtp:
+                smtp.login(address, app_password)
+        except (smtplib.SMTPException, OSError) as exc:
+            raise MailError(str(exc)) from exc
+
+    return check

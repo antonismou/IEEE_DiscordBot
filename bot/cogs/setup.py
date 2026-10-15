@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import asyncio
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.branches import BRANCHES, DESCRIPTION_MAX
-from bot.channels import OFFICER_LOG, topics_for
+from bot.audit import audit
+from bot.branches import DESCRIPTION_MAX
+from bot.channels import AUDIT_LOG, OFFICER_LOG, topics_for
 from bot.checks import admin_only
+from bot.health import last_backup_time
+from bot.mailer import MailError
 from bot.pins import PIN_LENGTH, is_valid_pin
+from bot.serversettings import LABEL_MAX, MAX_BRANCHES, branch_key
 
 NO_MENTIONS = discord.AllowedMentions.none()
 
@@ -44,6 +50,7 @@ class SetupCog(commands.Cog):
         self.app.server.configure(
             guild_id=interaction.guild_id, verified_role_id=verified.id, officer_role_id=officer.id
         )
+        await audit(self.app, interaction, f"set the Verified role to <@&{verified.id}> and the Officer role to <@&{officer.id}>")
         me = interaction.guild.me
         warning = ""
         if not me.guild_permissions.manage_roles or not me.top_role > verified:
@@ -57,77 +64,148 @@ class SetupCog(commands.Cog):
             ephemeral=True, allowed_mentions=NO_MENTIONS,
         )
 
-    @setup_group.command(name="branches", description="Choose the roles members can pick after verifying")
+    @setup_group.command(name="branch-add", description="Add a branch role members can pick (or change an existing one)")
     @admin_only()
-    async def setup_branches(
-        self, interaction: discord.Interaction,
-        main: discord.Role, cs: discord.Role, ias: discord.Role, quantum: discord.Role,
+    async def setup_branch_add(
+        self, interaction: discord.Interaction, name: str, role: discord.Role,
+        description: str | None = None, pin: str | None = None,
     ) -> None:
-        roles = {"main": main, "cs": cs, "ias": ias, "quantum": quantum}
-        if any(r.is_default() or r.managed for r in roles.values()):
+        name = " ".join(name.split())
+        key = branch_key(name)
+        if not key or len(name) > LABEL_MAX:
             await interaction.response.send_message(
-                "A branch role can't be @everyone or a bot/integration role. Pick normal roles.", ephemeral=True
+                f"Give the branch a name of up to {LABEL_MAX} characters with at least one letter or digit.",
+                ephemeral=True,
             )
             return
-        if len({r.id for r in roles.values()}) != len(roles) or self.app.server.verified_role_id in {
-            r.id for r in roles.values()
-        }:
+        description = " ".join(description.split()) if description else None
+        if description and len(description) > DESCRIPTION_MAX:
             await interaction.response.send_message(
-                "The four branch roles must be different from each other and from the Verified role.", ephemeral=True
+                f"Keep the description to {DESCRIPTION_MAX} characters (it is {len(description)}).", ephemeral=True
             )
             return
-        self.app.server.configure_branches({key: role.id for key, role in roles.items()})
+        if pin is not None and not is_valid_pin(pin.strip()):
+            await interaction.response.send_message(f"The PIN must be exactly {PIN_LENGTH} digits.", ephemeral=True)
+            return
+        if role.is_default() or role.managed:
+            await interaction.response.send_message(
+                "A branch role can't be @everyone or a bot/integration role. Pick a normal role.", ephemeral=True
+            )
+            return
+        server, existing = self.app.server, self.app.server.branch_role_ids
+        taken = {rid for k, rid in existing.items() if k != key} | {server.verified_role_id, server.officer_role_id}
+        if role.id in taken:
+            await interaction.response.send_message(
+                "That role is already used by another branch, or is the Verified/Officer role. Pick a different one.",
+                ephemeral=True,
+            )
+            return
+        if key not in existing and len(existing) >= MAX_BRANCHES:
+            await interaction.response.send_message(
+                f"Discord allows at most {MAX_BRANCHES} options in the picker. Remove a branch first.", ephemeral=True
+            )
+            return
+        server.add_branch(key, name, role.id)
+        await audit(self.app, interaction, f"set branch **{discord.utils.escape_markdown(name)}** to <@&{role.id}>"
+                    + (" with a PIN" if pin else ""))
+        if description:
+            server.set_branch_description(key, description)
+        if pin:
+            server.set_branch_pin(key, pin.strip())
         me = interaction.guild.me
         warning = ""
-        if not me.guild_permissions.manage_roles or any(not me.top_role > r for r in roles.values()):
+        if not me.guild_permissions.manage_roles or not me.top_role > role:
             warning = (
-                "\n\n**Warning:** I can't assign all of these yet. Give my role **Manage Roles** and drag it "
-                "**above** them in Server Settings -> Roles."
+                f"\n\n**Warning:** I can't assign {role.mention} yet. Give my role **Manage Roles** and drag it "
+                "**above** this role in Server Settings -> Roles."
             )
         await interaction.response.send_message(
-            "Saved. After verifying, members choose among: "
-            + ", ".join(f"{role.mention}" for role in roles.values()) + f".{warning}",
+            f"Saved. **{name}** -> {role.mention}"
+            + (" (PIN set)" if pin else "") + f". There are now {len(server.branch_role_ids)} branches.{warning}",
             ephemeral=True, allowed_mentions=NO_MENTIONS,
+        )
+
+    async def _branch_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+        needle = current.lower()
+        return [
+            app_commands.Choice(name=label[:100], value=key)
+            for key, label in self.app.server.branch_labels.items() if needle in label.lower()
+        ][:25]
+
+    async def _known_branch(self, interaction: discord.Interaction, branch: str) -> str | None:
+        """The branch's display name, or None after telling the admin it does not exist."""
+        label = self.app.server.branch_labels.get(branch)
+        if label is None:
+            await interaction.response.send_message(
+                "I don't know that branch. Pick one from the list, or add it with `/setup branch-add`.",
+                ephemeral=True,
+            )
+        return label
+
+    @setup_group.command(name="branch-remove", description="Stop offering a branch role in the picker")
+    @app_commands.autocomplete(branch=_branch_autocomplete)
+    @admin_only()
+    async def setup_branch_remove(self, interaction: discord.Interaction, branch: str) -> None:
+        label = await self._known_branch(interaction, branch)
+        if label is None:
+            return
+        self.app.server.remove_branch(branch)
+        await audit(self.app, interaction, f"removed branch **{discord.utils.escape_markdown(label)}**")
+        await interaction.response.send_message(
+            f"**{label}** removed from the picker, along with its PIN and description. "
+            "The Discord role itself, and the members who hold it, are untouched.",
+            ephemeral=True,
         )
 
     @setup_group.command(
         name="branch-description", description="Set the short text shown under a branch in the role picker"
     )
-    @app_commands.choices(branch=[app_commands.Choice(name=label, value=key) for key, label in BRANCHES])
+    @app_commands.autocomplete(branch=_branch_autocomplete)
     @admin_only()
     async def setup_branch_description(
-        self, interaction: discord.Interaction, branch: app_commands.Choice[str], text: str | None = None
+        self, interaction: discord.Interaction, branch: str, text: str | None = None
     ) -> None:
+        label = await self._known_branch(interaction, branch)
+        if label is None:
+            return
         text = " ".join(text.split()) if text else None
         if text and len(text) > DESCRIPTION_MAX:
             await interaction.response.send_message(
                 f"Keep it to {DESCRIPTION_MAX} characters (it is {len(text)}).", ephemeral=True
             )
             return
-        self.app.server.set_branch_description(branch.value, text)
+        self.app.server.set_branch_description(branch, text)
         await interaction.response.send_message(
-            f"{branch.name}: {text}" if text else f"{branch.name}: description removed.", ephemeral=True
+            f"{label}: {text}" if text else f"{label}: description removed.", ephemeral=True
         )
 
     @setup_group.command(name="branch-pin", description="Set or remove the PIN needed to take a branch role")
-    @app_commands.choices(branch=[app_commands.Choice(name=label, value=key) for key, label in BRANCHES])
+    @app_commands.autocomplete(branch=_branch_autocomplete)
     @admin_only()
     async def setup_branch_pin(
-        self, interaction: discord.Interaction, branch: app_commands.Choice[str], pin: str | None = None
+        self, interaction: discord.Interaction, branch: str, pin: str | None = None
     ) -> None:
+        label = await self._known_branch(interaction, branch)
+        if label is None:
+            return
         if pin is not None and not is_valid_pin(pin.strip()):
             await interaction.response.send_message(f"The PIN must be exactly {PIN_LENGTH} digits.", ephemeral=True)
             return
-        self.app.server.set_branch_pin(branch.value, pin.strip() if pin else None)
+        self.app.server.set_branch_pin(branch, pin.strip() if pin else None)
+        await audit(
+            self.app, interaction,
+            f"{'changed' if pin else 'removed'} the PIN of branch **{discord.utils.escape_markdown(label)}**",
+        )
         await interaction.response.send_message(
-            f"{branch.name}: PIN saved. Share it only with the people who may take this role." if pin
-            else f"{branch.name}: PIN removed, anyone verified can take this role.",
+            f"{label}: PIN saved. Share it only with the people who may take this role." if pin
+            else f"{label}: PIN removed, anyone verified can take this role.",
             ephemeral=True,
         )
 
     @setup_group.command(name="status", description="Show what is set up and what is still missing")
     @admin_only()
     async def setup_status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True)  # the mail login test can take a few seconds
         server, bound = self.app.server, self.app.channels.all()
 
         def role(role_id):
@@ -138,12 +216,12 @@ class SetupCog(commands.Cog):
             f"**Verified role:** {role(server.verified_role_id)}",
             f"**Officer role:** {role(server.officer_role_id)}",
         ]
-        branches = server.branch_role_ids
+        branches, labels, pins = server.branch_role_ids, server.branch_labels, server.branch_pin_keys()
         lines.append(
-            "**Branch roles** (`/setup branches`): "
+            "**Branch roles** (`/setup branch-add`): "
             + (
                 ", ".join(
-                    f"<@&{rid}>" + (" (PIN)" if key in server.branch_pin_keys() else "")
+                    f"{labels.get(key, key)} -> <@&{rid}>" + (" (PIN)" if key in pins else "")
                     for key, rid in branches.items()
                 )
                 if branches else "**not set**"
@@ -153,8 +231,20 @@ class SetupCog(commands.Cog):
         for topic in topics_for(self.app.settings.feeds):
             where = f"<#{bound[topic]}>" if topic in bound else "**not set**"
             note = " (optional)" if topic == OFFICER_LOG and topic not in bound else ""
+            if topic == AUDIT_LOG and topic not in bound:
+                note = " (officer actions are not being recorded)"
             lines.append(f"- `{topic}` -> {where}{note}")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True, allowed_mentions=NO_MENTIONS)
+        lines.append("**Health:**")
+        try:
+            await asyncio.to_thread(self.app.check_mail)
+            lines.append("- Mail login: OK")
+        except MailError as exc:
+            lines.append(f"- Mail login: **FAILED** ({type(exc.__cause__ or exc).__name__}). Codes cannot be sent.")
+        backup = last_backup_time(self.app.settings.backup_dir)
+        lines.append(f"- Last backup: {f'<t:{int(backup.timestamp())}:R>' if backup else '**none yet**'}")
+        poll = self.app.health.last_poll
+        lines.append(f"- Last feed poll: {f'<t:{int(poll.timestamp())}:R>' if poll else 'not yet since the last restart'}")
+        await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_MENTIONS)
 
 
 async def setup(bot) -> None:

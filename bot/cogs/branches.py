@@ -10,7 +10,7 @@ from bot.gate import gate_message
 
 PANEL_TEXT = (
     "**Choose your branches**\n"
-    "Press **Choose my roles** and pick one or more of Main Branch, CS, IAS and Quantum. "
+    "Press **Choose my roles** and pick one or more branches. "
     "You can come back here and change them whenever you like."
 )
 
@@ -32,7 +32,7 @@ class RolesView(discord.ui.View):
         picker = picker_for(self.app, interaction.user)
         if picker is None:
             await interaction.response.send_message(
-                "The branch roles aren't set up yet. Ask an administrator to run `/setup branches`.", ephemeral=True
+                "The branch roles aren't set up yet. Ask an administrator to run `/setup branch-add`.", ephemeral=True
             )
             return
         await interaction.response.send_message("Pick your branches:", view=picker, ephemeral=True)

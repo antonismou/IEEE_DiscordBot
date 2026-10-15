@@ -9,9 +9,12 @@ from discord.ext import commands
 
 from bot.branches import picker_for, set_nickname
 from bot.channels import OFFICER_LOG
+from bot.audit import audit
 from bot.checks import officer_only
 from bot.gate import gate_message
+from bot.db import utcnow
 from bot.mailer import MailError
+from bot.replies import defer, reply
 from bot.roles import notify_officers, set_verified_role
 from bot.verification import VerificationError
 
@@ -31,7 +34,7 @@ CONSENT_TEXT = (
 )
 
 
-async def grant_role_and_reply(app, interaction: discord.Interaction, *, restored: bool = False) -> None:
+async def grant_role_and_reply(app, interaction: discord.Interaction, *, restored: bool = False, replace: bool = False) -> None:
     """Give the Verified role to a member whose verification is stored, and tell them (and officers) the result."""
     ok = await set_verified_role(
         interaction.guild, interaction.user, app.server.verified_role_id,
@@ -61,30 +64,56 @@ async def grant_role_and_reply(app, interaction: discord.Interaction, *, restore
             "Your email is verified, but I couldn't assign the role. Officers were notified; "
             "press **Verify** again later to retry."
         )
-    await interaction.followup.send(text, ephemeral=True, **({"view": view} if view else {}))
+    await reply(interaction, text, replace=replace, view=view)
 
 
-async def start_verification(app, interaction: discord.Interaction, raw_name: str, raw_email: str) -> None:
+async def start_verification(
+    app, interaction: discord.Interaction, raw_name: str, raw_email: str, *, replace: bool = False
+) -> None:
     """Validate, email a code and tell the member. Never logs the address."""
+    retry = RetryView(app) if replace else None
     try:
         pending = app.verification.begin(interaction.user.id, raw_name, raw_email)
     except VerificationError as exc:
-        await interaction.followup.send(str(exc), ephemeral=True)
+        await reply(interaction, str(exc), replace=replace, view=retry)
         return
+    await deliver_code(app, interaction, pending, replace=replace, failure_view=retry)
+
+
+async def resend_verification(app, interaction: discord.Interaction, *, replace: bool) -> None:
+    """Send a fresh code for the verification in progress. Limits and failure handling match the first send."""
+    try:
+        pending = app.verification.resend(interaction.user.id)
+    except VerificationError as exc:
+        await reply(interaction, str(exc), replace=replace, view=CodeView(app))
+        return
+    await deliver_code(app, interaction, pending, replace=replace, failure_view=RetryView(app) if replace else None)
+
+
+async def deliver_code(app, interaction: discord.Interaction, pending, *, replace: bool, failure_view) -> None:
     try:
         await asyncio.to_thread(app.send_code, pending.email, pending.code, pending.ttl_minutes)
     except MailError as exc:
         # the exception text can contain the recipient address (e.g. "recipient refused"): log the class only
         log.error("Could not send verification email (%s)", type(exc.__cause__ or exc).__name__)
         app.verification.send_failed(interaction.user.id)
-        await interaction.followup.send(
-            "I couldn't send the email right now. Please try again later or ask an officer.", ephemeral=True
+        if app.health.should_alert_mail(utcnow()):
+            await notify_officers(
+                interaction.client, app.channels.get(OFFICER_LOG),
+                "I could not send a verification email (e.g. the Gmail app password was revoked or Gmail is "
+                f"unreachable). Run `/setup status` to test the mail login. ({type(exc.__cause__ or exc).__name__})",
+            )
+        await reply(
+            interaction, "I couldn't send the email right now. Please try again later or ask an officer.",
+            replace=replace, view=failure_view,
         )
         return
-    await interaction.followup.send(
+    await reply(
+        interaction,
         f"A code was sent to **{pending.email}** (check spam too). "
-        f"Press **Enter code** within {pending.ttl_minutes} minutes.",
-        ephemeral=True,
+        f"Press **Enter code** within {pending.ttl_minutes} minutes. "
+        "Not received? Press **Resend code**, or ask an officer to verify you manually.",
+        replace=replace, view=CodeView(app),
     )
 
 
@@ -97,25 +126,27 @@ class StartModal(discord.ui.Modal, title="TUC verification"):
         self.app = app
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await start_verification(self.app, interaction, str(self.full_name), str(self.email))
+        await defer(interaction, replace=True)  # opened from our private message: that message becomes the next step
+        await start_verification(self.app, interaction, str(self.full_name), str(self.email), replace=True)
 
 
 class CodeModal(discord.ui.Modal, title="Enter your code"):
     code = discord.ui.TextInput(label="6-digit code", min_length=6, max_length=12)
 
-    def __init__(self, app):
+    def __init__(self, app, *, replace: bool):
         super().__init__()
         self.app = app
+        self.replace = replace  # False when opened from the public panel, which must never be edited
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await defer(interaction, replace=self.replace)
         try:
             self.app.verification.confirm(interaction.user.id, str(self.code))
         except VerificationError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
+            await reply(interaction, str(exc), replace=self.replace, view=CodeView(self.app))
             return
-        await grant_role_and_reply(self.app, interaction)
+        await audit(self.app, interaction, "verified by email")
+        await grant_role_and_reply(self.app, interaction, replace=self.replace)
 
 
 class ConsentView(discord.ui.View):
@@ -126,6 +157,35 @@ class ConsentView(discord.ui.View):
     @discord.ui.button(label="I agree", style=discord.ButtonStyle.success)
     async def agree(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(StartModal(self.app))
+
+
+class RetryView(discord.ui.View):
+    """Shown under a failed first step so the member can try again without going back to the panel."""
+
+    def __init__(self, app):
+        super().__init__(timeout=300)
+        self.app = app
+
+    @discord.ui.button(label="Try again", style=discord.ButtonStyle.success)
+    async def retry(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(StartModal(self.app))
+
+
+class CodeView(discord.ui.View):
+    """The Enter code and Resend code buttons, kept right under the message that asks for the code."""
+
+    def __init__(self, app):
+        super().__init__(timeout=900)
+        self.app = app
+
+    @discord.ui.button(label="Enter code", style=discord.ButtonStyle.primary)
+    async def enter_code(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(CodeModal(self.app, replace=True))
+
+    @discord.ui.button(label="Resend code", style=discord.ButtonStyle.secondary)
+    async def resend(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await defer(interaction, replace=True)
+        await resend_verification(self.app, interaction, replace=True)
 
 
 class VerifyView(discord.ui.View):
@@ -159,7 +219,7 @@ class VerifyView(discord.ui.View):
         if refusal:
             await interaction.response.send_message(refusal, ephemeral=True)
             return
-        await interaction.response.send_modal(CodeModal(self.app))
+        await interaction.response.send_modal(CodeModal(self.app, replace=False))
 
 
 class VerifyCog(commands.Cog):

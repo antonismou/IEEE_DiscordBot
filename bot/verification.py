@@ -88,7 +88,34 @@ class VerificationService:
             raise VerificationError("You are already verified.")
         if self._members.get_by_email(email):
             raise VerificationError("That email is already linked to another Discord account. Ask an officer for help.")
+        return self._issue(discord_id, name, email)
 
+    def resend(self, discord_id: int) -> PendingVerification:
+        """A fresh code for the verification already in progress (the old code stops working). Same limits as begin()."""
+        row = self._c.execute(
+            "SELECT email, full_name FROM pending_codes WHERE discord_id = ?", (discord_id,)
+        ).fetchone()
+        if row is None:
+            raise VerificationError("No verification in progress. Press **Verify** first.")
+        return self._issue(discord_id, row["full_name"], row["email"])
+
+    def stats(self) -> dict[str, int]:
+        """Counts for officers: codes sent and email verifications in the last 24 h (the send log is kept that
+        long), the last 7 days' verifications, and codes still waiting / expired without being entered."""
+        now = self._clock()
+        day, week, now_iso = to_iso(now - timedelta(hours=24)), to_iso(now - timedelta(days=7)), to_iso(now)
+        one = lambda q, *a: self._c.execute(q, a).fetchone()[0]  # noqa: E731
+        return {
+            "sent_24h": one("SELECT COUNT(*) FROM send_log WHERE sent_at >= ?", day),
+            "verified_24h": one(
+                "SELECT COUNT(*) FROM members WHERE method = 'email' AND verified_at >= ?", day),
+            "verified_7d": one(
+                "SELECT COUNT(*) FROM members WHERE method = 'email' AND verified_at >= ?", week),
+            "waiting": one("SELECT COUNT(*) FROM pending_codes WHERE expires_at > ?", now_iso),
+            "expired": one("SELECT COUNT(*) FROM pending_codes WHERE expires_at <= ?", now_iso),
+        }
+
+    def _issue(self, discord_id: int, name: str, email: str) -> PendingVerification:
         # All limits read send_log, which abort(), expiry and wrong codes never touch: deleting the pending
         # row (e.g. via /forget-me) must not reset them.
         now = self._clock()

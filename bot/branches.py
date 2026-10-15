@@ -5,11 +5,10 @@ import logging
 import discord
 
 from bot.pins import PIN_LENGTH
+from bot.replies import defer, reply
 
 log = logging.getLogger(__name__)
 
-BRANCHES = (("main", "Main Branch"), ("cs", "CS"), ("ias", "IAS"), ("quantum", "Quantum"))
-BRANCH_LABELS = dict(BRANCHES)
 NICKNAME_MAX = 32  # Discord's limit
 DESCRIPTION_MAX = 100  # Discord's limit for a dropdown option description
 
@@ -48,9 +47,10 @@ class BranchSelect(discord.ui.Select):
         ids = app.server.branch_role_ids
         held = {role.id for role in member.roles}
         descriptions = app.server.branch_descriptions
+        labels = app.server.branch_labels
         options = [
             discord.SelectOption(
-                label=BRANCH_LABELS[key], value=key, default=rid in held, description=descriptions.get(key)
+                label=labels.get(key, key), value=key, default=rid in held, description=descriptions.get(key)
             )
             for key, rid in ids.items()
         ]
@@ -64,14 +64,14 @@ class BranchSelect(discord.ui.Select):
         held = {role.id for role in interaction.user.roles}
         ids = self.app.server.branch_role_ids
         protected = self.app.server.branch_pin_keys()
-        needs_pin = [key for key, _ in BRANCHES if key in selected and key in protected and ids[key] not in held]
+        needs_pin = [key for key in ids if key in selected and key in protected and ids[key] not in held]
         if not needs_pin:
-            await interaction.response.defer(ephemeral=True, thinking=True)
+            await defer(interaction, replace=True)
             await finish_selection(self.app, interaction, selected)
             return
         wait = self.app.pin_limiter.locked_for(interaction.user.id)
         if wait:
-            await interaction.response.send_message(locked_text(wait), ephemeral=True)
+            await interaction.response.edit_message(content=locked_text(wait))
             return
         await interaction.response.send_modal(PinModal(self.app, selected, needs_pin))
 
@@ -81,18 +81,21 @@ def locked_text(seconds: int) -> str:
 
 
 async def finish_selection(app, interaction: discord.Interaction, selected: set[str]) -> None:
-    """Apply the (already authorised) selection and tell the member. The interaction must be deferred."""
+    """Apply the (already authorised) selection and turn the picker message into the result. Must be deferred."""
     ok = await apply_branch_roles(interaction.guild, interaction.user, app.server.branch_role_ids, selected)
     if ok:
-        chosen = ", ".join(BRANCH_LABELS[key] for key, _ in BRANCHES if key in selected)
-        await interaction.followup.send(
+        labels = app.server.branch_labels
+        chosen = ", ".join(labels.get(key, key) for key in app.server.branch_role_ids if key in selected)
+        await reply(
+            interaction,
             f"Done. Your branches: **{chosen}**. You can change them any time in the roles channel.",
-            ephemeral=True,
+            replace=True, view=None,
         )
     else:
-        await interaction.followup.send(
+        await reply(
+            interaction,
             "I couldn't change your roles. Ask an officer to check that my role is above the branch roles.",
-            ephemeral=True,
+            replace=True,
         )
 
 
@@ -101,29 +104,31 @@ class PinModal(discord.ui.Modal, title="Branch PINs"):
         super().__init__()
         self.app, self.selected, self.needs_pin = app, selected, needs_pin
         self.inputs = {}
+        labels = app.server.branch_labels
         for key in needs_pin:
             field = discord.ui.TextInput(
-                label=f"PIN for {BRANCH_LABELS[key]}"[:45], min_length=PIN_LENGTH, max_length=PIN_LENGTH,
+                label=f"PIN for {labels.get(key, key)}"[:45], min_length=PIN_LENGTH, max_length=PIN_LENGTH,
                 placeholder=f"{PIN_LENGTH} digits",
             )
             self.inputs[key] = field
             self.add_item(field)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        await defer(interaction, replace=True)
         limiter, user_id = self.app.pin_limiter, interaction.user.id
         wait = limiter.locked_for(user_id)
         if wait:
-            await interaction.followup.send(locked_text(wait), ephemeral=True)
+            await reply(interaction, locked_text(wait), replace=True)
             return
         # check every PIN so that the answer does not reveal which one was wrong
         results = [self.app.server.check_branch_pin(key, str(field).strip()) for key, field in self.inputs.items()]
         if not all(results):
             left = limiter.record_failure(user_id)
-            await interaction.followup.send(
+            await reply(
+                interaction,
                 "A PIN was wrong, so no roles were changed. "
                 + (f"{left} attempt(s) left." if left else locked_text(limiter.locked_for(user_id))),
-                ephemeral=True,
+                replace=True,
             )
             return
         limiter.record_success(user_id)
@@ -137,5 +142,5 @@ class BranchPickerView(discord.ui.View):
 
 
 def picker_for(app, member) -> BranchPickerView | None:
-    """The branch picker, or None if /setup branches has not been run."""
+    """The branch picker, or None if no branch has been added with /setup branch-add."""
     return BranchPickerView(app, member) if app.server.branch_role_ids else None

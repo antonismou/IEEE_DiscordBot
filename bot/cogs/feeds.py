@@ -11,6 +11,7 @@ from discord.ext import commands, tasks
 
 from bot.checks import officer_only
 from bot.config import FeedConfig
+from bot.db import utcnow
 from bot.feeds.parse import FeedError, fetch_feed, parse_feed
 from bot.feeds.service import process_feed
 from bot.feeds.store import FeedExists
@@ -84,6 +85,7 @@ class FeedsCog(commands.Cog):
                 log.warning("Feed %s failed: %s", feed.id, exc)
             except Exception:
                 log.exception("Feed %s crashed", feed.id)
+        self.app.health.last_poll = utcnow()
 
     @poll.before_loop
     async def before_poll(self) -> None:

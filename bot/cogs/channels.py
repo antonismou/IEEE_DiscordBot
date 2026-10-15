@@ -4,7 +4,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from bot.channels import OFFICER_LOG, topics_for
+from bot.audit import audit
+from bot.channels import AUDIT_LOG, OFFICER_LOG, PRIVATE_TOPICS, topics_for
 from bot.checks import officer_only
 
 
@@ -51,7 +52,14 @@ class ChannelsCog(commands.Cog):
             )
             return
         self.app.channels.set(topic, channel.id)
-        await interaction.response.send_message(f"`{topic}` now posts to {channel.mention}.", ephemeral=True)
+        await audit(self.app, interaction, f"set `{topic}` to post to <#{channel.id}>")
+        text = f"`{topic}` now posts to {channel.mention}."
+        if topic in PRIVATE_TOPICS and channel.permissions_for(interaction.guild.default_role).view_channel:
+            text += (
+                f"\n\n**Warning:** @everyone can see {channel.mention}. This channel shows officer activity: "
+                "make it visible to the Officer role only (channel settings -> Permissions)."
+            )
+        await interaction.response.send_message(text, ephemeral=True)
 
     @set_channel.autocomplete("topic")
     async def set_topic_choices(self, interaction: discord.Interaction, current: str):
@@ -61,6 +69,8 @@ class ChannelsCog(commands.Cog):
     @officer_only()
     async def clear_channel(self, interaction: discord.Interaction, topic: str) -> None:
         cleared = self.app.channels.clear(topic)
+        if cleared:
+            await audit(self.app, interaction, f"cleared the channel for `{topic}`")
         await interaction.response.send_message(
             f"`{topic}` cleared." if cleared else f"`{topic}` had no channel set.", ephemeral=True
         )
@@ -79,6 +89,8 @@ class ChannelsCog(commands.Cog):
                 lines.append(f"`{topic}` -> <#{bound[topic]}>")
             elif topic == OFFICER_LOG:
                 lines.append(f"`{topic}` -> **not set** (optional: problems are only logged)")
+            elif topic == AUDIT_LOG:
+                lines.append(f"`{topic}` -> **not set** (officer actions are not being recorded)")
             else:
                 lines.append(f"`{topic}` -> **not set** (its feeds are paused until you set one)")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)

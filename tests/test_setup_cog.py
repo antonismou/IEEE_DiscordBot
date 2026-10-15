@@ -1,9 +1,11 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from bot.channels import OFFICER_LOG, ChannelRepo
 from bot.config import FeedConfig
+from bot.health import Health
 from bot.serversettings import ServerSettings
 from tests.fakes import FakeRole, fake_guild, fake_interaction, fake_me, fake_member, reply_text
 
@@ -17,9 +19,11 @@ def make_cog(conn):
     from bot.cogs.setup import SetupCog
 
     app = SimpleNamespace(
-        settings=SimpleNamespace(feeds=FEEDS),
+        settings=SimpleNamespace(feeds=FEEDS, backup_dir=Path("/nonexistent-backups")),
         server=ServerSettings(conn),
         channels=ChannelRepo(conn),
+        check_mail=lambda: None,
+        health=Health(),
     )
     return SetupCog(SimpleNamespace(app=app)), app
 
@@ -87,3 +91,22 @@ def test_status_after_setup_shows_the_roles(conn):
     asyncio.run(cog.setup_status.callback(cog, interaction))
     text = reply_text(interaction)
     assert "<@&222>" in text and "<@&333>" in text
+
+
+def test_status_shows_health_and_reports_a_failed_mail_login(conn):
+    from bot.mailer import MailError
+
+    cog, app = make_cog(conn)
+    interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+    asyncio.run(cog.setup_status.callback(cog, interaction))
+    text = reply_text(interaction)
+    assert "Mail login: OK" in text and "Last backup: **none yet**" in text and "audit-log" in text
+
+    def refused():
+        raise MailError("535 bad credentials") from ValueError("x")
+
+    app.check_mail = refused
+    interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+    asyncio.run(cog.setup_status.callback(cog, interaction))
+    text = reply_text(interaction)
+    assert "FAILED" in text and "535" not in text            # the error text is not echoed, only its class

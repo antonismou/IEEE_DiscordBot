@@ -231,3 +231,49 @@ def test_email_taken_between_begin_and_confirm(service, members, clock):
 def test_kelvin_sign_look_alike_is_rejected_in_the_real_flow(service):
     with pytest.raises(VerificationError, match="tuc.gr"):
         begin(service, email="\u212aostas@tuc.gr")        # lowercases to ASCII "kostas" if normalised first
+
+
+def test_resend_issues_a_new_code_for_the_pending_verification(service, conn, clock):
+    codes = iter(["111111", "222222"])
+    service._code_factory = lambda: next(codes)
+    assert begin(service).code == "111111"
+    clock.advance(61)
+    again = service.resend(1)
+    assert again.code == "222222" and again.email == "alice@tuc.gr"
+    with pytest.raises(VerificationError, match="Wrong code"):
+        service.confirm(1, "111111")                                 # the old code no longer works
+    assert service.confirm(1, "222222").email == "alice@tuc.gr"
+
+
+def test_resend_without_a_pending_verification_is_refused(service):
+    with pytest.raises(VerificationError, match="Press \\*\\*Verify"):
+        service.resend(1)
+
+
+def test_resend_obeys_the_cooldown_and_hourly_caps(service, clock):
+    begin(service)
+    with pytest.raises(VerificationError, match="wait"):
+        service.resend(1)                                            # too soon
+    for _ in range(2):                                               # sends 2 and 3 for this address
+        clock.advance(61)
+        service.resend(1)
+    clock.advance(61)
+    with pytest.raises(VerificationError, match="too many codes"):
+        service.resend(1)                                            # a 4th within the hour
+
+
+def test_resend_works_after_the_code_expired(service, clock):
+    begin(service)
+    clock.advance(700)                                               # past the 10 minute lifetime
+    assert service.resend(1).code == "123456"
+
+
+def test_stats_count_sends_verifications_and_waiting_codes(service, conn, clock):
+    begin(service, 1, email="a@tuc.gr")
+    begin(service, 2, email="b@tuc.gr")
+    service.confirm(1, "123456")
+    stats = service.stats()
+    assert stats["sent_24h"] == 2 and stats["verified_24h"] == 1 and stats["verified_7d"] == 1
+    assert stats["waiting"] == 1 and stats["expired"] == 0
+    clock.advance(700)
+    assert service.stats()["waiting"] == 0 and service.stats()["expired"] == 1

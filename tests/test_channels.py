@@ -56,7 +56,7 @@ def run_command(cog, command, *args):
 
 def test_topics_come_from_the_feeds_plus_officer_log(conn):
     cog, _ = make_cog(conn, FEEDS)
-    assert cog.topics() == ["ai-ml", "officer-log", "robotics"]
+    assert cog.topics() == ["ai-ml", "audit-log", "officer-log", "robotics"]
 
 
 def test_set_stores_the_channel(conn):
@@ -101,3 +101,37 @@ def test_list_shows_each_topic_and_flags_unset_ones(conn):
     assert "ai-ml" in text and "<#10>" in text
     assert "robotics" in text and "not set" in text
     assert "officer-log" in text
+
+
+def test_private_channels_warn_when_everyone_can_see_them(conn):
+    cog, app = make_cog(conn, FEEDS)
+
+    def run(topic, everyone_can_see):
+        channel = fake_channel(55)
+        guild = fake_guild()
+        channel.permissions_for.side_effect = lambda who: discord.Permissions(
+            view_channel=who is not guild.default_role or everyone_can_see, send_messages=True, embed_links=True
+        )
+        interaction = fake_interaction(fake_member(1), guild)
+        asyncio.run(cog.set_channel.callback(cog, interaction, topic, channel))
+        return reply_text(interaction)
+
+    assert "@everyone can see" in run("audit-log", True)
+    assert "@everyone can see" in run("officer-log", True)
+    assert "Warning" not in run("audit-log", False)
+    assert "Warning" not in run("ai-ml", True)               # feed channels are meant to be public
+
+
+def test_setting_a_channel_is_written_to_the_audit_log(conn):
+    cog, app = make_cog(conn, FEEDS)
+    app.channels.set("audit-log", 99)
+    client = MagicMock()
+    sent = []
+
+    async def send(text, **kw):
+        sent.append(text)
+
+    client.get_channel.return_value.send = send
+    interaction = fake_interaction(fake_member(7), fake_guild(), client)
+    asyncio.run(cog.set_channel.callback(cog, interaction, "ai-ml", fake_channel(10)))
+    assert len(sent) == 1 and "<@7>" in sent[0] and "ai-ml" in sent[0] and "<#10>" in sent[0]

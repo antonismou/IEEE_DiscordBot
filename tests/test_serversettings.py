@@ -27,3 +27,21 @@ def test_branch_roles_default_empty_and_round_trip(conn):
     assert server.branch_role_ids == {}
     server.configure_branches({"main": 1, "cs": 2, "ias": 3, "quantum": 4})
     assert ServerSettings(conn).branch_role_ids == {"main": 1, "cs": 2, "ias": 3, "quantum": 4}
+
+
+def test_branch_key_is_a_safe_slug():
+    from bot.serversettings import branch_key
+    assert branch_key("  Antennas & Propagation Society! ") == "antennas-propagation-society"
+    assert branch_key("a_b") == "a-b" and branch_key("???") == ""
+
+
+def test_dynamic_branches_keep_order_and_do_not_mix_with_pin_or_description_rows(conn):
+    server = ServerSettings(conn)
+    server.add_branch("zeta", "Zeta", 1)
+    server.add_branch("alpha", "Alpha", 2)
+    server.set_branch_pin("zeta", "123456")
+    server.set_branch_description("zeta", "text")
+    assert server.branch_role_ids == {"zeta": 1, "alpha": 2}
+    assert server.branch_labels == {"zeta": "Zeta", "alpha": "Alpha"}
+    server.remove_branch("zeta")
+    assert server.branch_role_ids == {"alpha": 2} and server.branch_pin_keys() == set()

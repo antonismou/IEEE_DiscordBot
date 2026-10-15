@@ -6,6 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from bot.audit import audit
 from bot.checks import officer_only
 from bot.db import utcnow
 from bot.members import members_to_csv
@@ -55,6 +56,7 @@ class OfficerCog(commands.Cog):
             interaction.guild, user, self.app.server.verified_role_id,
             add=True, reason=f"Manual verification by {interaction.user}",
         )
+        await audit(self.app, interaction, f"verified <@{user.id}> manually")
         suffix = "" if ok else " (but I couldn't assign the role: check my permissions)"
         await interaction.followup.send(
             f"{user.mention} verified manually as **{full_name}**{suffix}.",
@@ -69,7 +71,27 @@ class OfficerCog(commands.Cog):
             interaction.guild, user, self.app.server.verified_role_id,
             add=False, reason=f"Unverified by {interaction.user}",
         )
+        await audit(self.app, interaction, f"removed the Verified role from <@{user.id}>" + ("" if ok else " (failed)"))
         text = "Role removed." if ok else "I couldn't remove the role: check my permissions."
+        await interaction.response.send_message(text, ephemeral=True)
+
+    stats_group = app_commands.Group(name="stats", description="Numbers for officers", guild_only=True)
+
+    @stats_group.command(name="verification", description="Codes sent versus members verified, to spot lost emails")
+    @officer_only()
+    async def verification_stats(self, interaction: discord.Interaction) -> None:
+        st = self.app.verification.stats()
+        sent, done = st["sent_24h"], st["verified_24h"]
+        rate = f" ({round(100 * done / sent)}% of codes sent)" if sent else ""
+        text = (
+            "**Last 24 hours**\n"
+            f"- Codes sent: **{sent}**\n"
+            f"- Verified by email: **{done}**{rate}\n"
+            f"**Last 7 days:** verified by email: **{st['verified_7d']}**\n"
+            f"**Right now:** {st['waiting']} code(s) waiting to be entered, "
+            f"{st['expired']} expired without being entered.\n"
+            "A low percentage with many expired codes usually means emails are not arriving."
+        )
         await interaction.response.send_message(text, ephemeral=True)
 
     @member_group.command(name="lookup", description="Show stored data for a user")
@@ -94,6 +116,7 @@ class OfficerCog(commands.Cog):
     @officer_only()
     async def export(self, interaction: discord.Interaction) -> None:
         data = members_to_csv(self.app.members.all()).encode("utf-8")
+        await audit(self.app, interaction, "exported the member list")
         await interaction.response.send_message(
             file=discord.File(io.BytesIO(data), filename="members.csv"), ephemeral=True
         )
@@ -111,6 +134,8 @@ class OfficerCog(commands.Cog):
     async def _forget(self, interaction: discord.Interaction, user) -> None:
         await interaction.response.defer(ephemeral=True)  # the member lookup and role call can be slow
         deleted = self.app.members.delete(user.id)
+        who = "their own" if user.id == interaction.user.id else f"<@{user.id}>'s"
+        await audit(self.app, interaction, f"deleted {who} stored data" + ("" if deleted else " (there was none)"))
         self.app.verification.abort(user.id)
         member = await resolve_member(interaction.guild, user)
         role_failed = False

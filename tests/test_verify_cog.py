@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 
 from bot.channels import OFFICER_LOG, ChannelRepo
+from bot.health import Health
 from bot.cogs.verify import CONSENT_TEXT, VerifyView, grant_role_and_reply
 from bot.members import MemberRepo
 from tests.fakes import fake_guild, fake_interaction, fake_member, followup_text
@@ -20,10 +21,11 @@ def make_app(conn, *, log_channel=OFFICER_CHANNEL):
     if log_channel is not None:
         channels.set(OFFICER_LOG, log_channel)
     return SimpleNamespace(
-        server=SimpleNamespace(verified_role_id=VERIFIED_ROLE, guild_id=111, branch_role_ids={}, branch_descriptions={},
+        server=SimpleNamespace(verified_role_id=VERIFIED_ROLE, guild_id=111, branch_role_ids={}, branch_descriptions={}, branch_labels={},
                                branch_pin_keys=lambda: set()),
         members=MemberRepo(conn),
         channels=channels,
+        health=Health(),
     )
 
 
@@ -115,6 +117,7 @@ def test_mail_failure_log_does_not_contain_the_recipient_address(conn, caplog):
             channels=ChannelRepo(conn),
             verification=VerificationService(conn, members),
             send_code=failing_send,
+            health=Health(),
         )
         interaction = fake_interaction(fake_member(7), fake_guild())
         await start_verification(app, interaction, "Real Student", "victim@tuc.gr")
@@ -176,3 +179,155 @@ def test_verify_buttons_refuse_other_servers(conn):
 
     interaction = asyncio.run(scenario())
     assert "different server" in interaction.response.send_message.await_args.args[0]
+
+
+# ---- one message per member: each step edits the previous one -------------------------------------------------
+
+def stub_verification(app, *, begin=None, confirm_error=None, resend_=None):
+    from bot.verification import PendingVerification
+
+    def begin_(discord_id, name, email):
+        if begin:
+            raise begin
+        return PendingVerification(email=email, code="123456", ttl_minutes=10)
+
+    def confirm_(discord_id, code):
+        if confirm_error:
+            raise confirm_error
+
+    app.verification = SimpleNamespace(
+        begin=begin_, confirm=confirm_, send_failed=lambda _id: None, resend=resend_ or (lambda _id: begin_(_id, 'n', 'real@tuc.gr'))
+    )
+    app.send_code = lambda *args: None
+    return app
+
+
+def modal_with(modal, **values):
+    for name, value in values.items():
+        getattr(modal, name)._value = value
+    return modal
+
+
+def button_labels(view):
+    return [child.label for child in view.children]
+
+
+def test_first_step_replaces_the_consent_message_and_carries_the_enter_code_button(conn):
+    from bot.cogs.verify import StartModal
+
+    app = stub_verification(make_app(conn))
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(modal_with(StartModal(app), full_name="Real Student", email="real@tuc.gr").on_submit(interaction))
+    interaction.response.defer.assert_awaited_once_with()                  # "update the message", not a new one
+    interaction.followup.send.assert_not_awaited()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "real@tuc.gr" in kwargs["content"] and button_labels(kwargs["view"]) == ["Enter code", "Resend code"]
+
+
+def test_first_step_error_offers_try_again_in_the_same_message(conn):
+    from bot.cogs.verify import StartModal
+    from bot.verification import VerificationError
+
+    app = stub_verification(make_app(conn), begin=VerificationError("Only @tuc.gr addresses are accepted."))
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(modal_with(StartModal(app), full_name="Real Student", email="x@gmail.com").on_submit(interaction))
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "tuc.gr" in kwargs["content"] and button_labels(kwargs["view"]) == ["Try again"]
+
+
+def test_code_step_from_our_message_edits_it_into_the_branch_picker(conn):
+    from bot.cogs.verify import CodeModal
+
+    app = stub_verification(make_app(conn))
+    app.server.branch_role_ids = {"main": 10, "cs": 11}
+    app.members.add_email_member(
+        discord_id=7, email="real@tuc.gr", full_name="Real Student", consent_at=NOW, verified_at=NOW)
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(modal_with(CodeModal(app, replace=True), code="123456").on_submit(interaction))
+    interaction.followup.send.assert_not_awaited()
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "You are verified" in kwargs["content"] and kwargs["view"].children[0].placeholder
+
+
+def test_wrong_code_keeps_the_enter_code_button_in_view(conn):
+    from bot.cogs.verify import CodeModal
+    from bot.verification import VerificationError
+
+    app = stub_verification(make_app(conn), confirm_error=VerificationError("Wrong code. 4 attempt(s) left."))
+    for replace in (True, False):
+        interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+        asyncio.run(modal_with(CodeModal(app, replace=replace), code="000000").on_submit(interaction))
+        send = interaction.edit_original_response if replace else interaction.followup.send
+        assert button_labels(send.await_args.kwargs["view"]) == ["Enter code", "Resend code"]
+
+
+def test_code_step_from_the_public_panel_never_edits_the_panel(conn):
+    from bot.cogs.verify import CodeModal
+
+    app = stub_verification(make_app(conn))
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(modal_with(CodeModal(app, replace=False), code="123456").on_submit(interaction))
+    interaction.edit_original_response.assert_not_awaited()
+    interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+    assert followup_text(interaction)
+
+
+def test_resend_button_sends_a_fresh_code_and_keeps_both_buttons(conn):
+    from bot.cogs.verify import CodeView
+
+    app = stub_verification(make_app(conn))
+    sent = []
+    app.send_code = lambda *args: sent.append(args)
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(CodeView(app).resend.callback(interaction))
+    interaction.response.defer.assert_awaited_once_with()          # edits the message the button is on
+    assert len(sent) == 1
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "real@tuc.gr" in kwargs["content"] and button_labels(kwargs["view"]) == ["Enter code", "Resend code"]
+
+
+def test_resend_refusal_keeps_the_buttons(conn):
+    from bot.cogs.verify import CodeView
+    from bot.verification import VerificationError
+
+    def refused(_id):
+        raise VerificationError("Please wait 30 seconds before requesting another code.")
+
+    app = stub_verification(make_app(conn), resend_=refused)
+    interaction = fake_interaction(fake_member(7), fake_guild(), MagicMock())
+    asyncio.run(CodeView(app).resend.callback(interaction))
+    kwargs = interaction.edit_original_response.await_args.kwargs
+    assert "wait 30 seconds" in kwargs["content"] and button_labels(kwargs["view"]) == ["Enter code", "Resend code"]
+
+
+def test_mail_failure_alerts_officers_at_most_once_an_hour(conn):
+    from bot.cogs.verify import start_verification
+    from bot.mailer import MailError
+
+    app = stub_verification(make_app(conn))
+
+    def failing(*args):
+        raise MailError("535 bad credentials")
+
+    app.send_code = failing
+    client, channel = client_with_channel()
+    for _ in range(3):
+        interaction = fake_interaction(fake_member(7), fake_guild(), client)
+        asyncio.run(start_verification(app, interaction, "Real Student", "real@tuc.gr"))
+    assert channel.send.await_count == 1
+    assert "/setup status" in channel.send.await_args.args[0] and "535" not in channel.send.await_args.args[0]
+
+
+def test_successful_verification_is_written_to_the_audit_log(conn):
+    from bot.channels import AUDIT_LOG
+    from bot.cogs.verify import CodeModal
+
+    app = stub_verification(make_app(conn))
+    app.channels.set(AUDIT_LOG, 77)
+    app.members.add_email_member(
+        discord_id=7, email="real@tuc.gr", full_name="Real Student", consent_at=NOW, verified_at=NOW)
+    client, channel = client_with_channel()
+    interaction = fake_interaction(fake_member(7), fake_guild(), client)
+    asyncio.run(modal_with(CodeModal(app, replace=True), code="123456").on_submit(interaction))
+    line = channel.send.await_args_list[0].args[0]
+    assert "<@7> verified by email" in line and "real@tuc.gr" not in line and "Real Student" not in line

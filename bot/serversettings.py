@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 
 from bot.pins import hash_pin, pin_matches
+
+MAX_BRANCHES = 25  # Discord's limit for the options of one dropdown
+LABEL_MAX = 80
+LEGACY_LABELS = {"main": "Main Branch", "cs": "CS", "ias": "IAS", "quantum": "Quantum"}  # set before branches were dynamic
+
+
+def branch_key(name: str) -> str:
+    """Stable identifier for a branch name: lowercase letters and digits joined by hyphens (no underscores, so
+    it can never be confused with the branch_pin_/branch_desc_/branch_label_ setting names)."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:30].strip("-")
 
 
 class ServerSettings:
@@ -33,13 +44,39 @@ class ServerSettings:
 
     @property
     def branch_role_ids(self) -> dict[str, int]:
-        """Branch key -> role id, for the branches that are set (see bot.branches.BRANCHES)."""
-        ids = {}
-        for key in ("main", "cs", "ias", "quantum"):
-            value = self._get(f"branch_{key}")
-            if value is not None:
-                ids[key] = value
-        return ids
+        """Branch key -> role id, in the order the branches were added."""
+        rows = self._c.execute(
+            "SELECT key, value FROM server_settings WHERE key LIKE 'branch\\_%' ESCAPE '\\' ORDER BY rowid"
+        ).fetchall()
+        # pin/description/label settings are branch_<kind>_<key>; role rows have no second underscore
+        return {
+            row["key"].removeprefix("branch_"): int(row["value"])
+            for row in rows if "_" not in row["key"].removeprefix("branch_")
+        }
+
+    @property
+    def branch_labels(self) -> dict[str, str]:
+        """Branch key -> display name (branches set before names were stored fall back to their original name)."""
+        rows = self._c.execute("SELECT key, value FROM server_settings WHERE key LIKE 'branch\\_label\\_%' ESCAPE '\\'").fetchall()
+        labels = {row["key"].removeprefix("branch_label_"): row["value"] for row in rows}
+        return {key: labels.get(key) or LEGACY_LABELS.get(key, key) for key in self.branch_role_ids}
+
+    def add_branch(self, key: str, label: str, role_id: int) -> None:
+        """Add a branch, or change the name and role of an existing one."""
+        with self._c:
+            self._c.executemany(
+                "INSERT INTO server_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [(f"branch_{key}", str(role_id)), (f"branch_label_{key}", label)],
+            )
+
+    def remove_branch(self, key: str) -> None:
+        """Forget a branch and its PIN and description. The Discord role and who holds it are left alone."""
+        with self._c:
+            self._c.execute(
+                "DELETE FROM server_settings WHERE key IN (?, ?, ?, ?)",
+                (f"branch_{key}", f"branch_label_{key}", f"branch_pin_{key}", f"branch_desc_{key}"),
+            )
 
     @property
     def branch_descriptions(self) -> dict[str, str]:
