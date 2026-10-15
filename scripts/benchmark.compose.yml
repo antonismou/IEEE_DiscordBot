@@ -27,7 +27,7 @@ services:
     entrypoint:
       - sh
       - -c
-      - pip install -q --no-cache-dir faster-whisper requests edge-tts && exec python /work/benchmark_models.py --ollama-url http://ollama:11434 "$$@"
+      - apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null && pip install -q --no-cache-dir faster-whisper requests edge-tts && exec python /work/benchmark_models.py --ollama-url http://ollama:11434 "$$@"
       - --
 
 volumes:

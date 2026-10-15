@@ -1,6 +1,6 @@
 """Benchmark Greek transcription + summary models. Run on the server, outside the bot:
 
-    pip install faster-whisper requests edge-tts
+    pip install faster-whisper requests edge-tts   # plus ffmpeg on PATH
     python scripts/benchmark_models.py --generate-sample
     python scripts/benchmark_models.py --audio meeting.wav --llm gemma3:12b --llm krikri
 
@@ -74,14 +74,20 @@ def generate_sample(path: Path) -> None:
     print(f"sample written to {path}")
 
 
-def audio_seconds(path: Path) -> float:
-    import av
+def load_audio(path: Path):
+    """Decode to 16 kHz mono float32 with ffmpeg, which avoids faster-whisper's PyAV decoding."""
+    import subprocess
 
-    with av.open(str(path)) as container:
-        return float(container.duration) / 1_000_000
+    import numpy as np
+
+    raw = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-f", "s16le", "-ac", "1", "-ar", "16000", "-"],
+        check=True, capture_output=True,
+    ).stdout
+    return np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
 
 
-def bench_whisper(model_name: str, audio: Path, threads: int, reference: str | None) -> str:
+def bench_whisper(model_name: str, audio, threads: int, reference: str | None) -> str:
     from faster_whisper import WhisperModel
 
     print(f"\n=== whisper {model_name} (cpu, int8, {threads} threads) ===")
@@ -89,9 +95,9 @@ def bench_whisper(model_name: str, audio: Path, threads: int, reference: str | N
     model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
     load = time.perf_counter() - t0
 
-    duration = audio_seconds(audio)
+    duration = len(audio) / 16000
     t0 = time.perf_counter()
-    segments, _ = model.transcribe(audio=str(audio), language="el", vad_filter=True, beam_size=5)
+    segments, _ = model.transcribe(audio, language="el", vad_filter=True, beam_size=5)
     text = " ".join(s.text.strip() for s in segments)
     took = time.perf_counter() - t0
 
@@ -155,9 +161,10 @@ def main() -> int:
     if args.reference:
         reference = args.reference.read_text(encoding="utf-8")
 
+    samples = load_audio(audio)
     transcript = ""
     for name in args.whisper or ["large-v3", "large-v3-turbo"]:
-        text = bench_whisper(name, audio, args.threads, reference)
+        text = bench_whisper(name, samples, args.threads, reference)
         transcript = transcript or text
 
     if not args.skip_llm:
