@@ -1,0 +1,35 @@
+# Throwaway benchmark stack. Nothing is installed on the host and nothing is published on a port.
+#   docker compose -f scripts/benchmark.compose.yml up -d ollama
+#   docker compose -f scripts/benchmark.compose.yml exec ollama ollama pull gemma3:12b
+#   docker compose -f scripts/benchmark.compose.yml run --rm bench --generate-sample
+#   docker compose -f scripts/benchmark.compose.yml down -v --rmi all     # removes everything
+name: ieee-bench
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    environment:
+      OLLAMA_KEEP_ALIVE: "0"
+
+  bench:
+    image: python:3.12-slim
+    profiles: ["bench"]
+    depends_on: [ollama]
+    working_dir: /tmp/out
+    environment:
+      HF_HOME: /cache
+    volumes:
+      - hfcache:/cache
+      - ./benchmark_models.py:/work/benchmark_models.py:ro
+      - ${BENCH_AUDIO_DIR:-./}:/audio:ro
+    entrypoint:
+      - sh
+      - -c
+      - pip install -q --no-cache-dir faster-whisper requests edge-tts && exec python /work/benchmark_models.py --ollama-url http://ollama:11434 "$$@"
+      - --
+
+volumes:
+  ollama:
+  hfcache:
