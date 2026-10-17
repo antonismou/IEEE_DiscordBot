@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 
@@ -326,3 +326,49 @@ def test_wrong_pin_keeps_the_picker_on_screen(conn):
     user = fake_member(7, role_ids=(VERIFIED_ROLE,))
     interaction = asyncio.run(submit(app, user, ["cs"], ["cs"], ["000000"]))
     assert interaction.edit_original_response.await_args.kwargs["view"] is MISSING
+
+
+def test_roles_panel_lists_every_branch_with_pin_and_description(conn):
+    from bot.cogs.branches import panel_embed
+
+    _, app = make_cog(conn)
+    for key, label, rid in (("main", "Main Branch", 10), ("cs", "CS", 11), ("robotics", "Robotics", 14)):
+        app.server.add_branch(key, label, rid)
+    app.server.set_branch_description("robotics", "Robots and drones")
+    app.server.set_branch_pin("cs", "123456")
+    embed = panel_embed(app.server)
+    assert all(f"<@&{rid}>" in embed.description for rid in (10, 11, 14))
+    assert "<@&11> 🔒" in embed.description and "Robots and drones" in embed.description
+    assert "(3)" in embed.description and "PIN" in embed.footer.text
+
+
+def _posted_panel(app):
+    message = MagicMock()
+    message.edit = AsyncMock()
+    channel = MagicMock()
+    channel.fetch_message = AsyncMock(return_value=message)
+    client = MagicMock()
+    client.get_channel.return_value = channel
+    app.server.set_roles_panel(50, 60)
+    return client, message
+
+
+def test_branch_add_updates_the_posted_panel(conn):
+    cog, app = make_cog(conn)
+    app.server.configure(guild_id=111, verified_role_id=222, officer_role_id=333)
+    client, message = _posted_panel(app)
+    guild = fake_guild()
+    guild.me = fake_me()
+    interaction = fake_interaction(fake_member(1, admin=True), guild, client)
+    asyncio.run(cog.setup_branch_add.callback(cog, interaction, "Robotics", FakeRole(5)))
+    assert "<@&5>" in message.edit.await_args.kwargs["embed"].description
+
+
+def test_panel_that_was_deleted_is_forgotten(conn):
+    from bot.cogs.branches import refresh_roles_panel
+
+    _, app = make_cog(conn)
+    client, message = _posted_panel(app)
+    message.edit.side_effect = discord.NotFound(SimpleNamespace(status=404, reason="x"), "gone")
+    assert asyncio.run(refresh_roles_panel(app, client)) is False
+    assert app.server.roles_panel is None

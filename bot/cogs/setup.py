@@ -10,6 +10,7 @@ from bot.audit import audit
 from bot.branches import DESCRIPTION_MAX
 from bot.channels import AUDIT_LOG, OFFICER_LOG, topics_for
 from bot.checks import admin_only
+from bot.cogs.branches import refresh_roles_panel
 from bot.health import last_backup_time
 from bot.mailer import MailError
 from bot.pins import PIN_LENGTH, is_valid_pin
@@ -124,6 +125,7 @@ class SetupCog(commands.Cog):
             + (" (PIN set)" if pin else "") + f". There are now {len(server.branch_role_ids)} branches.{warning}",
             ephemeral=True, allowed_mentions=NO_MENTIONS,
         )
+        await refresh_roles_panel(self.app, interaction.client)
 
     async def _branch_autocomplete(self, interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
         needle = current.lower()
@@ -156,6 +158,7 @@ class SetupCog(commands.Cog):
             "The Discord role itself, and the members who hold it, are untouched.",
             ephemeral=True,
         )
+        await refresh_roles_panel(self.app, interaction.client)
 
     @setup_group.command(
         name="branch-description", description="Set the short text shown under a branch in the role picker"
@@ -178,6 +181,7 @@ class SetupCog(commands.Cog):
         await interaction.response.send_message(
             f"{label}: {text}" if text else f"{label}: description removed.", ephemeral=True
         )
+        await refresh_roles_panel(self.app, interaction.client)
 
     @setup_group.command(name="branch-pin", description="Set or remove the PIN needed to take a branch role")
     @app_commands.autocomplete(branch=_branch_autocomplete)
@@ -201,6 +205,7 @@ class SetupCog(commands.Cog):
             else f"{label}: PIN removed, anyone verified can take this role.",
             ephemeral=True,
         )
+        await refresh_roles_panel(self.app, interaction.client)
 
     @setup_group.command(name="status", description="Show what is set up and what is still missing")
     @admin_only()

@@ -45,3 +45,14 @@ def test_dynamic_branches_keep_order_and_do_not_mix_with_pin_or_description_rows
     assert server.branch_labels == {"zeta": "Zeta", "alpha": "Alpha"}
     server.remove_branch("zeta")
     assert server.branch_role_ids == {"alpha": 2} and server.branch_pin_keys() == set()
+
+
+def test_roles_panel_is_remembered_and_not_mistaken_for_a_branch(conn):
+    server = ServerSettings(conn)
+    assert server.roles_panel is None
+    server.add_branch("cs", "CS", 11)
+    server.set_roles_panel(50, 60)
+    assert server.roles_panel == (50, 60)
+    assert server.branch_role_ids == {"cs": 11}
+    server.set_roles_panel(None)
+    assert server.roles_panel is None

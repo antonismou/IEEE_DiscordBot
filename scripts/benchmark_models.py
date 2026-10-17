@@ -87,17 +87,18 @@ def load_audio(path: Path):
     return np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
 
 
-def bench_whisper(model_name: str, audio, threads: int, reference: str | None) -> str:
+def bench_whisper(model_name: str, audio, threads: int, reference: str | None, beam: int, prompt: str) -> str:
     from faster_whisper import WhisperModel
 
-    print(f"\n=== whisper {model_name} (cpu, int8, {threads} threads) ===")
+    print(f"\n=== whisper {model_name} (cpu, int8, {threads} threads, beam {beam}) ===")
     t0 = time.perf_counter()
     model = WhisperModel(model_name, device="cpu", compute_type="int8", cpu_threads=threads)
     load = time.perf_counter() - t0
 
     duration = len(audio) / 16000
     t0 = time.perf_counter()
-    segments, _ = model.transcribe(audio, language="el", vad_filter=True, beam_size=5)
+    segments, _ = model.transcribe(audio, language="el", vad_filter=True, beam_size=beam,
+                                 initial_prompt=prompt or None)
     text = " ".join(s.text.strip() for s in segments)
     took = time.perf_counter() - t0
 
@@ -126,9 +127,11 @@ def bench_llm(model: str, transcript: str, url: str) -> None:
             },
             timeout=3600,
         )
-        r.raise_for_status()
+        if not r.ok:
+            print(f"failed: HTTP {r.status_code}: {r.text[:500]}")
+            return
     except requests.RequestException as exc:
-        print(f"failed: {exc} (is the model pulled? `ollama pull {model}`)")
+        print(f"failed: {exc}")
         return
     took = time.perf_counter() - t0
     data = r.json()
@@ -147,6 +150,9 @@ def main() -> int:
     p.add_argument("--whisper", action="append", help="whisper model, repeatable (default: large-v3, large-v3-turbo)")
     p.add_argument("--llm", action="append", help="ollama model or alias (gemma3:12b, qwen, krikri), repeatable")
     p.add_argument("--threads", type=int, default=4, help="CPU threads for whisper (default 4)")
+    p.add_argument("--beam", type=int, default=5, help="whisper beam size; 1 is much faster (default 5)")
+    p.add_argument("--prompt", default="IEEE Student Branch, workshop, event, email, Πέμπτη, Τρίτη",
+                   help="initial_prompt with vocabulary the transcript should get right")
     p.add_argument("--ollama-url", default="http://localhost:11434")
     p.add_argument("--skip-llm", action="store_true")
     args = p.parse_args()
@@ -164,7 +170,7 @@ def main() -> int:
     samples = load_audio(audio)
     transcript = ""
     for name in args.whisper or ["large-v3", "large-v3-turbo"]:
-        text = bench_whisper(name, samples, args.threads, reference)
+        text = bench_whisper(name, samples, args.threads, reference, args.beam, args.prompt)
         transcript = transcript or text
 
     if not args.skip_llm:

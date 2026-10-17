@@ -115,6 +115,26 @@ class ServerSettings:
         row = self._c.execute("SELECT value FROM server_settings WHERE key = ?", (f"branch_pin_{key}",)).fetchone()
         return row is not None and pin_matches(pin, row["value"])
 
+    @property
+    def roles_panel(self) -> tuple[int, int] | None:
+        """(channel id, message id) of the role panel posted with /setup-roles, if any."""
+        channel_id, message_id = self._get("roles_panel_channel_id"), self._get("roles_panel_message_id")
+        return (channel_id, message_id) if channel_id and message_id else None
+
+    def set_roles_panel(self, channel_id: int | None, message_id: int | None = None) -> None:
+        """Remember where the role panel is, or forget it (channel_id None)."""
+        with self._c:
+            if channel_id is None:
+                self._c.execute(
+                    "DELETE FROM server_settings WHERE key IN ('roles_panel_channel_id', 'roles_panel_message_id')"
+                )
+                return
+            self._c.executemany(
+                "INSERT INTO server_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [("roles_panel_channel_id", str(channel_id)), ("roles_panel_message_id", str(message_id))],
+            )
+
     def configure_branches(self, role_ids: dict[str, int]) -> None:
         with self._c:
             self._c.executemany(

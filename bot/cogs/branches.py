@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -8,11 +10,53 @@ from bot.branches import picker_for
 from bot.checks import officer_only
 from bot.gate import gate_message
 
-PANEL_TEXT = (
-    "**Choose your branches**\n"
-    "Press **Choose my roles** and pick one or more branches. "
-    "You can come back here and change them whenever you like."
-)
+log = logging.getLogger(__name__)
+
+PANEL_COLOUR = discord.Colour(0x00629B)  # IEEE blue
+
+
+def panel_embed(server) -> discord.Embed:
+    """The role panel: every branch members can pick right now, with its description and whether it needs a PIN."""
+    ids, labels = server.branch_role_ids, server.branch_labels
+    descriptions, pins = server.branch_descriptions, server.branch_pin_keys()
+    lines = []
+    for key, rid in ids.items():
+        line = f"**•** <@&{rid}>" + (" 🔒" if key in pins else "")
+        if descriptions.get(key):
+            line += f"\n> {descriptions[key]}"
+        lines.append(line)
+    embed = discord.Embed(
+        title="Choose your branch roles",
+        description=(
+            "Press **Choose my roles** below and pick one or more. "
+            "You can come back here and change them whenever you like.\n\n"
+            + (f"**Roles you can choose ({len(ids)})**\n" + "\n".join(lines) if lines else "*No branches yet.*")
+        ),
+        colour=PANEL_COLOUR,
+    )
+    if pins:
+        embed.set_footer(text="🔒 needs a PIN: ask an officer of that branch for it.")
+    return embed
+
+
+async def refresh_roles_panel(app, client) -> bool:
+    """Show the current branches on the posted role panel. False if there is no panel or it can't be edited.
+    Never raises: the branch change that triggered this is already saved."""
+    where = app.server.roles_panel
+    if where is None:
+        return False
+    channel_id, message_id = where
+    try:
+        channel = client.get_channel(channel_id) or await client.fetch_channel(channel_id)
+        message = await channel.fetch_message(message_id)
+        await message.edit(content=None, embed=panel_embed(app.server))
+    except discord.NotFound:
+        app.server.set_roles_panel(None)  # deleted by someone: stop trying
+        return False
+    except Exception:
+        log.exception("Could not update the role panel")
+        return False
+    return True
 
 
 class RolesView(discord.ui.View):
@@ -49,8 +93,10 @@ class BranchesCog(commands.Cog):
     @app_commands.guild_only()
     @officer_only()
     async def setup_roles_panel(self, interaction: discord.Interaction) -> None:
+        app = self.bot.app
+        old = app.server.roles_panel
         try:
-            await interaction.channel.send(PANEL_TEXT, view=RolesView(self.bot.app))
+            message = await interaction.channel.send(embed=panel_embed(app.server), view=RolesView(app))
         except discord.Forbidden:
             await interaction.response.send_message(
                 "I can't post in this channel. Give my role **View Channel** and **Send Messages** here, "
@@ -58,7 +104,16 @@ class BranchesCog(commands.Cog):
                 ephemeral=True,
             )
             return
-        await interaction.response.send_message("Panel posted.", ephemeral=True)
+        app.server.set_roles_panel(message.channel.id, message.id)
+        await interaction.response.send_message(
+            "Panel posted. It updates by itself when branches are added, removed or changed.", ephemeral=True
+        )
+        if old is not None:  # only one panel stays up to date, so take the previous one down
+            try:
+                channel = interaction.client.get_channel(old[0]) or await interaction.client.fetch_channel(old[0])
+                await (await channel.fetch_message(old[1])).delete()
+            except Exception:
+                log.info("Could not delete the previous role panel (already gone?)")
 
 
 async def setup(bot) -> None:

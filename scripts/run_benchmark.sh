@@ -46,3 +46,7 @@ fi
 
 echo ">> running benchmark"
 "${COMPOSE[@]}" run --rm -T bench "${args[@]}" 2>&1 | tee "$OUT"
+
+if [[ $skip_llm -eq 0 ]]; then
+  { echo; echo "=== ollama log (last 40 lines) ==="; "${COMPOSE[@]}" logs --no-log-prefix --tail 40 ollama 2>&1; } | tee -a "$OUT"
+fi
