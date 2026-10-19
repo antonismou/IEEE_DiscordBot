@@ -4,6 +4,7 @@ db_path = "data/bot.sqlite3"
 backup_dir = "data/backups"
 poll_interval_minutes = 30
 max_items_per_poll = 10
+quiet_alert_days = 7  # tell officer-log when a feed has had nothing new for this many days (0 = off)
 
 [[feeds]]
 id = "spectrum"

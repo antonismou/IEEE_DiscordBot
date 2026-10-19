@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -5,6 +6,7 @@ from unittest.mock import MagicMock
 
 from bot.channels import OFFICER_LOG, ChannelRepo
 from bot.config import FeedConfig
+from bot.feeds.store import SeenStore
 from bot.health import Health
 from bot.serversettings import ServerSettings
 from tests.fakes import FakeRole, fake_guild, fake_interaction, fake_me, fake_member, reply_text
@@ -19,7 +21,8 @@ def make_cog(conn):
     from bot.cogs.setup import SetupCog
 
     app = SimpleNamespace(
-        settings=SimpleNamespace(feeds=FEEDS, backup_dir=Path("/nonexistent-backups")),
+        settings=SimpleNamespace(feeds=FEEDS, backup_dir=Path("/nonexistent-backups"), quiet_alert_days=7),
+        seen=SeenStore(conn),
         server=ServerSettings(conn),
         channels=ChannelRepo(conn),
         check_mail=lambda: None,
@@ -110,3 +113,21 @@ def test_status_shows_health_and_reports_a_failed_mail_login(conn):
     asyncio.run(cog.setup_status.callback(cog, interaction))
     text = reply_text(interaction)
     assert "FAILED" in text and "535" not in text            # the error text is not echoed, only its class
+
+
+def test_status_names_failing_feeds(conn):
+    cog, app = make_cog(conn)
+    app.health.feed_ok("tpami", 0, datetime.now(timezone.utc))
+    interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+    asyncio.run(cog.setup_status.callback(cog, interaction))
+    assert "Feeds: all 1 OK" in reply_text(interaction)
+
+    app.health.feed_failed("tro", "HTTP 500")
+    interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+    asyncio.run(cog.setup_status.callback(cog, interaction))
+    assert "Feeds failing: **`tro`**" in reply_text(interaction)
+
+    app.seen.set_quiet_alerted("tpami", True, datetime.now(timezone.utc))
+    interaction = fake_interaction(fake_member(1, admin=True), fake_guild())
+    asyncio.run(cog.setup_status.callback(cog, interaction))
+    assert "nothing new for 7+ days: `tpami`" in reply_text(interaction)

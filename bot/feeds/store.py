@@ -4,7 +4,7 @@ import sqlite3
 from datetime import datetime
 
 from bot.config import FeedConfig
-from bot.db import to_iso
+from bot.db import from_iso, to_iso
 
 
 class FeedExists(Exception):
@@ -38,6 +38,29 @@ class SeenStore:
         with self._c:
             self._c.execute("DELETE FROM seen_items WHERE feed_id = ?", (feed_id,))
             self._c.execute("DELETE FROM feed_state WHERE feed_id = ?", (feed_id,))
+            self._c.execute("DELETE FROM feed_quiet_alerts WHERE feed_id = ?", (feed_id,))
+
+    def last_new(self, feed_id: str) -> datetime | None:
+        """When the feed last had an item the bot had not seen (or when it was first polled)."""
+        row = self._c.execute("SELECT MAX(posted_at) AS at FROM seen_items WHERE feed_id = ?", (feed_id,)).fetchone()
+        return from_iso(row["at"]) if row["at"] else None
+
+    def quiet_alerted(self, feed_id: str) -> bool:
+        row = self._c.execute("SELECT 1 FROM feed_quiet_alerts WHERE feed_id = ?", (feed_id,)).fetchone()
+        return row is not None
+
+    def quiet_feeds(self) -> list[str]:
+        return [r["feed_id"] for r in self._c.execute("SELECT feed_id FROM feed_quiet_alerts ORDER BY feed_id")]
+
+    def set_quiet_alerted(self, feed_id: str, alerted: bool, now: datetime) -> None:
+        """Remember that officers were told the feed went quiet, so a restart does not tell them again."""
+        with self._c:
+            if alerted:
+                self._c.execute(
+                    "INSERT OR IGNORE INTO feed_quiet_alerts (feed_id, alerted_at) VALUES (?, ?)", (feed_id, to_iso(now))
+                )
+            else:
+                self._c.execute("DELETE FROM feed_quiet_alerts WHERE feed_id = ?", (feed_id,))
 
     def _insert_seen(self, feed_id: str, item_ids: list[str], now: datetime) -> None:
         self._c.executemany(

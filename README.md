@@ -51,6 +51,12 @@ Members who don't receive the code can press **Resend code** (same rate limits).
 (e.g. the app password was revoked) the bot tells `officer-log` once an hour; `/setup status` tests the mail login
 and shows the last backup and feed poll.
 
+If a feed fails 3 polls in a row (site down, broken feed) the bot tells `officer-log` once, and again when it
+works. `/feed list` shows each feed's status (last successful poll, items posted, or the error); `/setup status`
+names the failing feeds. This status resets when the bot restarts.
+If a feed loads fine but has had nothing new for `quiet_alert_days` (default 7, `0` turns it off), the bot also
+tells `officer-log` once, and again when new posts appear; this survives restarts.
+
 On verification the bot renames the member to the full name they gave (cut to Discord's 32 characters). It cannot
 rename the server owner or anyone above its role; officers are told in `officer-log` when that happens.
 

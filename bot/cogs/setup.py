@@ -249,6 +249,17 @@ class SetupCog(commands.Cog):
         lines.append(f"- Last backup: {f'<t:{int(backup.timestamp())}:R>' if backup else '**none yet**'}")
         poll = self.app.health.last_poll
         lines.append(f"- Last feed poll: {f'<t:{int(poll.timestamp())}:R>' if poll else 'not yet since the last restart'}")
+        failing = sorted(fid for fid, status in self.app.health.feeds.items() if status.failures)
+        if failing:
+            lines.append(f"- Feeds failing: **{', '.join(f'`{fid}`' for fid in failing)}** (`/feed list` for details)")
+        elif self.app.health.feeds:
+            lines.append(f"- Feeds: all {len(self.app.health.feeds)} OK")
+        quiet = self.app.seen.quiet_feeds()
+        if quiet:
+            lines.append(
+                f"- Feeds with nothing new for {self.app.settings.quiet_alert_days}+ days: "
+                f"{', '.join(f'`{fid}`' for fid in quiet)}"
+            )
         await interaction.followup.send("\n".join(lines), ephemeral=True, allowed_mentions=NO_MENTIONS)
 
 

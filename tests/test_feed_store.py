@@ -40,6 +40,17 @@ def test_forget_clears_one_feed_so_a_re_added_feed_starts_fresh(conn):
     store = SeenStore(conn)
     store.initialize("f", ["a", "b"], NOW)
     store.initialize("g", ["c"], NOW)
+    store.set_quiet_alerted("f", True, NOW)
     store.forget("f")
+    assert store.quiet_feeds() == [] and store.last_new("f") is None
     assert store.is_initialized("f") is False and store.seen_ids("f") == set()
     assert store.is_initialized("g") is True and store.seen_ids("g") == {"c"}
+
+
+def test_last_new_is_when_the_newest_unseen_item_was_recorded(conn):
+    from datetime import timedelta
+
+    store = SeenStore(conn)
+    store.initialize("f", ["a"], NOW)
+    store.mark_seen("f", ["b"], NOW + timedelta(days=2))
+    assert store.last_new("f") == NOW + timedelta(days=2)

@@ -56,3 +56,13 @@ def test_mail_checker_logs_in_without_sending_and_reports_failure(monkeypatch):
         assert isinstance(exc.__cause__, smtplib.SMTPAuthenticationError)
     else:
         raise AssertionError("expected MailError")
+
+
+def test_feed_alert_fires_once_per_outage_and_recovery_only_after_an_alert():
+    health = Health()
+    assert not health.feed_ok("s", 1, T0)                     # healthy feed: nothing to report
+    assert [health.feed_failed("s", "boom") for _ in range(4)] == [False, False, True, False]
+    assert health.feeds["s"].failures == 4 and health.feeds["s"].last_error == "boom"
+    assert health.feed_ok("s", 0, T0)                         # it was alerted, so report the recovery
+    assert not health.feed_failed("s", "x" * 500)             # a new outage counts from zero
+    assert len(health.feeds["s"].last_error) == 200

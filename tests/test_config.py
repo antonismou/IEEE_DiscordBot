@@ -24,7 +24,7 @@ def write(tmp_path: Path, text: str) -> Path:
 def test_loads_values_and_defaults(tmp_path):
     s = load_settings(write(tmp_path, GOOD), ENV)
     assert s.discord_token == "t" and s.gmail_address == "a@gmail.com"
-    assert s.poll_interval_minutes == 30 and s.max_items_per_poll == 10
+    assert s.poll_interval_minutes == 30 and s.max_items_per_poll == 10 and s.quiet_alert_days == 7
     assert s.db_path == Path("data/bot.sqlite3")
     assert s.backup_dir == Path("data/backups")
     (feed,) = s.feeds
