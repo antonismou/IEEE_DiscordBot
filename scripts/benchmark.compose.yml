@@ -30,6 +30,20 @@ services:
       - apt-get update -qq && apt-get install -y -qq --no-install-recommends ffmpeg >/dev/null && pip install -q --no-cache-dir faster-whisper requests edge-tts && exec python /work/benchmark_models.py --ollama-url http://ollama:11434 "$$@"
       - --
 
+  summary:
+    image: python:3.12-slim
+    profiles: ["summary"]
+    depends_on: [ollama]
+    working_dir: /tmp/out
+    volumes:
+      - ./benchmark_summary.py:/work/benchmark_summary.py:ro
+      - ${BENCH_TRANSCRIPT_DIR:-./}:/data:ro
+    entrypoint:
+      - sh
+      - -c
+      - pip install -q --no-cache-dir requests && exec python /work/benchmark_summary.py --ollama-url http://ollama:11434 "$$@"
+      - --
+
 volumes:
   ollama:
   hfcache:
