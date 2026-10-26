@@ -1,0 +1,45 @@
+from types import SimpleNamespace
+
+from bot.recording.sink import MeetingSink
+
+
+class FakePipeline:
+    def __init__(self):
+        self.frames = []
+
+    def handle(self, user_id, opus):
+        self.frames.append((user_id, opus))
+
+
+def data(opus=b"opus", ssrc=99):
+    return SimpleNamespace(packet=SimpleNamespace(decrypted_data=opus, ssrc=ssrc))
+
+
+def test_the_sink_asks_for_raw_opus_so_the_dave_layer_can_be_removed_before_decoding():
+    assert MeetingSink(FakePipeline(), lambda ssrc: None).wants_opus() is True
+
+
+def test_a_frame_from_a_known_member_goes_to_the_pipeline_under_their_id():
+    pipeline = FakePipeline()
+    MeetingSink(pipeline, lambda ssrc: None).write(SimpleNamespace(id=5), data())
+    assert pipeline.frames == [(5, b"opus")]
+
+
+def test_a_speaker_missing_from_the_member_cache_is_identified_by_their_audio_stream():
+    pipeline = FakePipeline()
+    MeetingSink(pipeline, {99: 7}.get).write(None, data(ssrc=99))
+    assert pipeline.frames == [(7, b"opus")]
+
+
+def test_a_speaker_who_cannot_be_identified_at_all_is_skipped():
+    pipeline = FakePipeline()
+    MeetingSink(pipeline, lambda ssrc: None).write(None, data())
+    assert pipeline.frames == []
+
+
+def test_a_lost_packet_has_no_audio_and_is_skipped():
+    pipeline = FakePipeline()
+    sink = MeetingSink(pipeline, lambda ssrc: None)
+    sink.write(SimpleNamespace(id=5), SimpleNamespace(packet=SimpleNamespace(ssrc=99)))  # no decrypted_data at all
+    sink.write(SimpleNamespace(id=5), data(opus=b""))
+    assert pipeline.frames == []
