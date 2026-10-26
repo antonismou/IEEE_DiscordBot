@@ -30,7 +30,7 @@ The server's CPU decides most choices: an Intel i7-3770 (4 cores, 8 threads, AVX
 | Language | Greek only | All meetings are in Greek |
 | Transcription | `faster-whisper` `large-v3-turbo`, int8, 8 threads, beam 1 | 1.2x realtime and 4.1% WER in the benchmark |
 | Summary | Gemma 3 12B through Ollama, model name in config | Good Greek output; swappable if a faster or better model appears |
-| Voice receive | `discord-ext-voice-recv` on top of discord.py | Avoids migrating the bot; must be verified in a spike |
+| Voice receive | `discord-ext-voice-recv` on top of discord.py, plus our own DAVE decryption step | Avoids migrating the bot; the extension lacks DAVE support, so it must be verified in a real call |
 | Processing | One short-lived container per meeting | Nothing resident between meetings |
 | Audio retention | Deleted after transcription | Privacy and disk space |
 
@@ -53,9 +53,10 @@ Speakers talk (1) and the bot writes a chunk per speaker (2) into the meeting fo
 The bot only captures audio and writes it to disk; all heavy work happens in the processing job.
 
 - **Receiving audio.** discord.py cannot receive voice on its own, so the bot adds the community extension `discord-ext-voice-recv`. It is the least disruptive option (no migration to py-cord) but is community-maintained and has broken before when Discord changed its voice protocol. A spike must prove it works on the server before anything else is built.
-- **Dependencies.** `PyNaCl`, `libopus` and `ffmpeg` are added to the bot image.
+- **Dependencies.** `discord.py[voice]` 2.7+ (brings `PyNaCl` and `davey`), `discord-ext-voice-recv` pinned to one version, and `libopus0` in the bot image. No `ffmpeg` is needed in the bot: audio is decoded with libopus and written with Python's `wave` module.
+- **End-to-end encryption (DAVE).** Discord now encrypts voice end to end. discord.py negotiates this when the bot joins, but `discord-ext-voice-recv` 0.5.2a179 only removes the transport encryption, so received audio would still be encrypted and fail to decode. Several fixes are open upstream (pull requests since March 2026) but none is merged. The bot therefore asks the library for raw opus frames, removes the DAVE layer itself with `davey`'s session (the one discord.py already keeps), and decodes with libopus. This relies on private attributes of discord.py and the extension, so it is the first thing to verify in a real call and the likeliest thing to break after a library update.
 - **One stream per speaker.** Each user's audio is written to its own file, so the transcript knows who spoke without any diarization.
-- **Chunks.** Audio is cut into chunks of about 5 minutes, at a pause where possible so words are not split. Each chunk records its speaker and its offset from the meeting start.
+- **Segments, not fixed chunks.** Each speaker's continuous speech is written as one 16 kHz mono WAV file, closed after a pause of more than 2 seconds or at 5 minutes. Discord stops sending audio while someone is silent, so pauses are natural cut points, and a finished file is a ready unit of work for the job. Each segment records its speaker and its start offset from the meeting start.
 - **Consent.** When recording starts the bot posts an announcement in the voice channel's own text chat. Decision: that announcement is enough, with no opt-in step.
 
 ## Processing job
@@ -88,7 +89,7 @@ A status message is posted when processing starts and edited as it advances, so 
 
 ## State, storage and recovery
 
-Each meeting gets its own directory on a host volume shared by the bot and the job (exact path to be chosen next to the bot's existing `data` folder). A `manifest.json` in it is the single source of truth.
+Each meeting gets its own directory under `meetings_dir` (default `data/meetings`). Today `data` is a Docker-managed volume, so for the host's path unit to see it, step 5 must either watch the volume's path under `/var/lib/docker/volumes/` or switch this folder to a bind mount. A `manifest.json` in it is the single source of truth.
 
 - **Manifest.** Meeting id, start time, speaker map (Discord id to display name), the list of chunks with offsets, and a status.
 - **Statuses.** `recording`, `queued`, `transcribing`, `summarizing`, `done`, `failed`, `interrupted`.
@@ -142,10 +143,10 @@ The biggest technical risk is voice receiving; the biggest non-technical one is 
 
 | Risk | Mitigation |
 | --- | --- |
-| `discord-ext-voice-recv` fails or breaks after a Discord protocol change | Spike first; fallback is a small separate recorder (for example Node with `@discordjs/voice`) |
+| `discord-ext-voice-recv` fails or breaks after a Discord protocol change (it already lacks DAVE decryption) | Own decryption step, pinned versions, `/record stop` reports decrypt statistics; fallback is a small separate recorder (for example Node with `@discordjs/voice`) |
 | Greek accuracy drops on real calls (noise, overlapping speakers, Whisper inventing text in silence) | Silence filtering, vocabulary prompt, test on a real recording before release |
 | Summary invents or misattributes a task | Prompt forbids adding information; full transcript always attached |
-| Summary too slow | Swap in a smaller or Greek-specific model (Gemma 3 4B, Llama-Krikri-8B) via config |
+| Summary too slow | Swap in a smaller model (Gemma 3 4B, Llama-Krikri-8B) via config, accepting lower accuracy |
 | Recording people without notice (GDPR and Discord rules) | Announcement on start, officer-only commands, audio deleted after transcription. Transcripts stay until manually deleted, so officers own that cleanup |
 | Job competes with other services | Lowest priority, CPU and memory limits, runs about twice a month |
 
@@ -157,15 +158,15 @@ Decided:
 - Transcripts and summaries are kept until deleted manually.
 - The job is launched by a systemd path unit on the host; the bot gets no Docker access.
 
-Open questions:
+Summary model (decided from `scripts/run_summary_benchmark.sh` on the sample meeting): Gemma 3 12B. It was the only model to get all 9 facts. Gemma 3 4B was 3x faster but dropped the budget and invented a date; Llama-Krikri-8B was in between on speed but put tasks under decisions and missed some facts. The summary prompt should also say to list only tasks that were explicitly assigned, since the 12B model added one inferred task.
 
-- [ ] Which summary model wins: Gemma 3 12B, Gemma 3 4B or Llama-Krikri-8B? Compare with `scripts/run_summary_benchmark.sh`, first on the built-in sample, then on the first real transcript. Krikri has an official GGUF build, pulled with `ollama pull hf.co/ilsp/Llama-Krikri-8B-Instruct-GGUF:Q4_K_M`.
+Open questions: none. What is still unproven is the voice-receive library (step 1 of the plan) and accuracy on a real Greek recording.
 
 ## Implementation plan
 
 Six steps, each ending in something that can be tested. Step 1 gates everything else.
 
-1. **Recording spike.** Add `discord-ext-voice-recv`; `/record start` and `/record stop` write per-speaker chunks. Done when two people talk and each file plays back correctly. If it is unreliable, switch to the fallback recorder before going further.
+1. **Recording spike.** *Code written and unit-tested; needs a live test.* `/record start` and `/record stop` write per-speaker segments. Done when two people talk in a real call, `/record stop` reports decrypted frames, and each file plays back correctly. If it is unreliable, switch to the fallback recorder before going further.
 2. **Meeting state.** Manifest, statuses, officer role check, single-recording guard, start announcement, `/channel set` support for the summaries channel, unit tests for chunk naming and manifest updates.
 3. **Transcription job.** Worker image that transcribes chunks and builds the merged transcript. Tested on a real Greek meeting recording.
 4. **Summary stage.** Piece-by-piece notes and the merge pass, Ollama start and stop, retry. Compare Gemma 3 12B with Krikri and Gemma 3 4B on the real transcript.
