@@ -35,6 +35,7 @@ class Settings:
     max_items_per_poll: int
     feeds: tuple[FeedConfig, ...]
     quiet_alert_days: int = 7  # tell officers when a feed has had nothing new for this long; 0 turns it off
+    meetings_dir: Path = Path("data/meetings")  # recordings and their manifests
 
 
 def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Settings:
@@ -80,6 +81,7 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             max_items_per_poll=int(raw.get("max_items_per_poll", 10)),
             feeds=tuple(feeds),
             quiet_alert_days=int(raw.get("quiet_alert_days", 7)),
+            meetings_dir=Path(raw.get("meetings_dir", "data/meetings")),
         )
     except KeyError as exc:
         raise ConfigError(f"Missing config key: {exc}") from None
