@@ -3,10 +3,13 @@ import gc
 import json
 import weakref
 from datetime import datetime, timedelta
+from functools import partial
+from types import SimpleNamespace
 
 import pytest
 
 from bot.recording.meeting import Meeting
+from worker.transcribe import transcribe_meeting
 from worker.run import DEFAULT_MEETINGS_DIR, LOCK_BUSY, LOCK_FILE, Config, WorkerError, main, process, run, wait_for_ollama
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
@@ -69,8 +72,9 @@ class Fakes:
         (directory / "summary.md").write_text(SUMMARY, encoding="utf-8")
         return SUMMARY
 
-    def run(self, root):
-        return run(Config(meetings_dir=root), transcribe=self.transcribe, summarize=self.summarize, wait=self.wait)
+    def run(self, root, live=False):
+        return run(Config(meetings_dir=root, live=live), transcribe=self.transcribe, summarize=self.summarize,
+                   wait=self.wait)
 
 
 class Model:
@@ -223,7 +227,7 @@ def test_nothing_to_do_exits_cleanly(tmp_path):
     assert fakes.run(tmp_path / "missing") == 0
 
 
-@pytest.mark.parametrize("status", ["recording", "done", "failed", "interrupted"])
+@pytest.mark.parametrize("status", ["done", "failed", "interrupted"])
 def test_meetings_that_need_no_work_are_left_alone(tmp_path, status):
     meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status=status)
     fakes = Fakes()
@@ -241,6 +245,155 @@ def test_meetings_are_processed_oldest_first_and_a_failure_does_not_stop_the_res
     assert fakes.run(tmp_path) != 0
     assert [e[1] for e in fakes.events if e[0] == "transcribe"] == [older.id, older.id, newer.id]
     assert status_of(older) == "failed" and status_of(newer) == "done"
+
+
+# --- during the call ------------------------------------------------------------------------------------------
+
+def manifest_bytes(meeting):
+    return (meeting.directory / "manifest.json").read_bytes()
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_a_recording_meeting_gets_its_finished_segments_transcribed_and_nothing_else(tmp_path, live):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status="recording")
+    before = manifest_bytes(meeting)
+    fakes = Fakes()
+
+    assert fakes.run(tmp_path, live=live) == 0
+
+    assert fakes.events == [("transcribe", meeting.id, "recording")]  # no wait for Ollama, no summary
+    assert manifest_bytes(meeting) == before  # the bot owns the manifest during the call
+    assert (meeting.directory / "7/000001.txt").exists() and not (meeting.directory / "summary.md").exists()
+
+
+def test_segments_still_without_text_during_the_call_are_not_a_failure(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status="recording")
+    before = manifest_bytes(meeting)
+    fakes = Fakes(fail_segments={"7/000002.wav"})
+
+    assert fakes.run(tmp_path, live=True) == 0
+
+    assert [e[0] for e in fakes.events] == ["transcribe"]  # one pass, no retry: the next run tries again
+    assert manifest_bytes(meeting) == before and Meeting.load(meeting.directory).error is None
+
+
+def test_a_transcription_error_during_the_call_leaves_the_meeting_recording(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
+    before = manifest_bytes(meeting)
+    fakes = Fakes()
+
+    def broken(directory):
+        raise RuntimeError("model download failed")
+    fakes.transcribe = broken
+
+    assert fakes.run(tmp_path, live=True) == 1  # visible in the unit's state, retried on the next tick
+    assert manifest_bytes(meeting) == before
+
+
+def test_a_recording_meeting_with_nothing_new_does_not_load_whisper(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording", transcribed={(7, 1)})
+    before = manifest_bytes(meeting)
+    loads = []
+
+    def factory(name, threads):
+        loads.append(name)
+        raise AssertionError("Whisper must not be loaded")
+    transcribe = partial(transcribe_meeting, model_factory=factory)
+
+    assert run(Config(meetings_dir=tmp_path, live=True), transcribe=transcribe, summarize=Fakes().summarize,
+               wait=Fakes().wait) == 0
+    assert loads == [] and manifest_bytes(meeting) == before
+
+
+class GrowingModel:
+    """A Whisper stand-in; while it decodes, the bot closes another segment, as it would during a call."""
+
+    def __init__(self, bot_meeting):
+        self.bot_meeting = bot_meeting
+
+    def transcribe(self, path, **options):
+        if not (self.bot_meeting.directory / "7/000002.wav").exists():
+            (self.bot_meeting.directory / "7/000002.wav").write_bytes(b"RIFF")
+            self.bot_meeting.add_segment({"speaker": 7, "file": "7/000002.wav", "start": 9.0, "duration": 1.0})
+        return iter([SimpleNamespace(text="Γεια.")]), SimpleNamespace(language="el")
+
+
+def test_a_segment_the_bot_adds_during_a_pass_is_never_lost(tmp_path):
+    bot_meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")  # the bot's in-memory copy
+    transcribe = partial(transcribe_meeting, model_factory=lambda name, threads: GrowingModel(bot_meeting))
+
+    assert run(Config(meetings_dir=tmp_path, live=True), transcribe=transcribe, summarize=Fakes().summarize,
+               wait=Fakes().wait) == 0
+
+    def files():
+        manifest = json.loads((bot_meeting.directory / "manifest.json").read_text(encoding="utf-8"))
+        return manifest["status"], [s["file"] for s in manifest["segments"]]
+    assert files() == ("recording", ["7/000001.wav", "7/000002.wav"])
+    assert (bot_meeting.directory / "7/000001.txt").exists()
+    bot_meeting.set_status("queued")  # /record stop rewrites the manifest from the bot's copy: nothing is dropped
+    assert files() == ("queued", ["7/000001.wav", "7/000002.wav"])
+
+
+def test_the_live_mode_leaves_ended_meetings_for_a_run_with_ollama(tmp_path):
+    queued = meeting_with(tmp_path, [(7, 1, 0.0)], status="queued", minute=10)
+    recording = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording", minute=50)
+    fakes = Fakes()
+
+    assert fakes.run(tmp_path, live=True) == 0
+    assert fakes.events == [("transcribe", recording.id, "recording")]
+    assert status_of(queued) == "queued" and (queued.directory / "7/000001.wav").exists()
+
+
+def test_a_full_run_finishes_ended_meetings_and_transcribes_the_recording_one(tmp_path):
+    queued = meeting_with(tmp_path, [(7, 1, 0.0)], status="queued", minute=10)
+    recording = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording", minute=50)
+    fakes = Fakes()
+
+    assert fakes.run(tmp_path) == 0
+    assert [e[:3] for e in fakes.events] == [
+        ("transcribe", queued.id, "transcribing"), ("wait",), ("summarize", queued.id, "summarizing"),
+        ("transcribe", recording.id, "recording"),
+    ]
+    assert status_of(queued) == "done" and status_of(recording) == "recording"
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_a_meeting_stopped_during_its_pass_is_finished_by_a_run_with_ollama(tmp_path, live):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status="recording")
+    fakes = Fakes()
+    first = fakes.transcribe
+
+    def stopped_meanwhile(directory):
+        result = first(directory)
+        if len(fakes.events) == 1:
+            Meeting.load(directory).set_status("queued")  # /record stop while Whisper was busy
+        return result
+    fakes.transcribe = stopped_meanwhile
+
+    assert fakes.run(tmp_path, live=live) == 0
+
+    if live:  # no Ollama in this run: the next tick starts the full job
+        assert [e[0] for e in fakes.events] == ["transcribe"] and status_of(meeting) == "queued"
+    else:  # the re-scan picks it up again, once, with the full pipeline
+        assert [e[:3] for e in fakes.events] == [
+            ("transcribe", meeting.id, "recording"), ("transcribe", meeting.id, "transcribing"), ("wait",),
+            ("summarize", meeting.id, "summarizing"),
+        ]
+        assert status_of(meeting) == "done"
+
+
+def test_a_meeting_that_keeps_recording_gets_one_pass_per_run(tmp_path):
+    meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
+    fakes = Fakes()
+    assert fakes.run(tmp_path) == 0 and len(fakes.events) == 1
+    assert fakes.run(tmp_path, live=True) == 0 and len(fakes.events) == 2
+
+
+def test_main_live_flag_selects_the_live_mode():
+    used = []
+    assert main(["--live"], env={}, runner=lambda config: used.append(config) or 0) == 0
+    main([], env={}, runner=lambda config: used.append(config) or 0)
+    assert [config.live for config in used] == [True, False]
 
 
 def test_process_handles_one_meeting(tmp_path):

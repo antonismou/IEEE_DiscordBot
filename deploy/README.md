@@ -1,9 +1,27 @@
 # Meeting processing job: install on the server
 
-After `/record stop` a meeting waits in `data/meetings/<id>/manifest.json`. A systemd timer on the host checks every
-2 minutes for a pending meeting and, only if there is one, runs the one-shot `worker` container (Whisper, then the
-summary through an `ollama` container). Both containers are profile-gated (`job`), so `docker compose up` never
-starts them, and nothing stays running between meetings. The bot gets no Docker access.
+Each meeting lives in `data/meetings/<id>/manifest.json`. A systemd timer on the host checks every 2 minutes for a
+meeting that needs work and, only if there is one, runs the one-shot `worker` container. Both `worker` and
+`ollama` are profile-gated (`job`), so `docker compose up` never starts them, and nothing stays running between
+runs. The bot gets no Docker access.
+
+`deploy/meeting-job.sh` picks one of two runs:
+
+- **During the call** (a meeting is `recording`, none has ended): `worker python -m worker.run --live` with
+  `--no-deps`. It transcribes the segments the bot has closed so far and exits; it never summarizes, never writes
+  the manifest (the bot owns it until `/record stop`) and does not start Ollama. A tick with no new segments exits
+  in about a second without loading Whisper. A tick with new segments loads Whisper fresh (a few seconds from the
+  model cache, 3-4 GB of RAM while it runs): simpler than a long-lived worker, and the cost is only paid when there
+  is speech to transcribe.
+- **After the call** (a meeting is `queued`, or `transcribing`/`summarizing` after a crash): the full job, which
+  starts Ollama through `depends_on`. It transcribes what is left, frees Whisper, summarizes, then marks the
+  meeting `done`. Since most of the call was transcribed while it went on, the wait after `/record stop` is mostly
+  the summary.
+
+If `/record stop` happens while a live run is busy, that run finishes its pass and exits; the next tick (2 minutes
+after it ends) sees the meeting `queued` and starts the full job. The timer uses `OnUnitInactiveSec`, counted from
+the end of each run, so a long run delays the next tick instead of overlapping it; the worker's flock in the
+meetings folder and the fixed container name also prevent overlap.
 
 Files:
 
@@ -14,6 +32,7 @@ Files:
 | `deploy/ieee-meeting-worker.timer` | Starts the service 1 minute after boot, then 2 minutes after each run ends |
 | `deploy/ieee-meeting-worker.service` | Oneshot: skips unless a meeting is pending, runs the job, then stops Ollama |
 | `deploy/meeting-pending.sh` | The cheap check: exit 0 if a manifest has status `recording`, `queued`, `transcribing` or `summarizing` |
+| `deploy/meeting-job.sh` | The run itself: the full job (with Ollama) if a meeting has ended, otherwise a live transcription run |
 
 ## Why a timer and not a path unit
 
@@ -22,8 +41,8 @@ A `.path` unit on `data/meetings` only fires when an entry directly in that fold
 directory watch never sees the `recording` -> `queued` transition. inotify is not recursive and systemd cannot
 watch a glob. The timer avoids that: each tick runs `meeting-pending.sh` as `ExecCondition` (one `grep`, no
 container), so idle cost is negligible, and a queued meeting starts within about 2 minutes. While a call is still
-`recording`, the job also runs every few minutes to transcribe finished segments, so transcription overlaps with the
-call as the design intends.
+`recording`, the live run transcribes finished segments every few minutes, so transcription overlaps with the call
+as the design intends.
 
 Optional follow-up for instant start: the bot could `touch data/meetings/.queue` whenever it writes a manifest (a
 3-line change in `bot/recording/meeting.py`'s `_write`). Then a path unit with `PathChanged=.../data/meetings/.queue`
@@ -65,7 +84,7 @@ All commands run in the folder that holds `docker-compose.yml` (below: `/home/do
    ```
 
 4. **Install the units.** Adjust the paths in `ieee-meeting-worker.service` if the project is not in
-   `/home/docker/IEEE_DiscordBot` (`WorkingDirectory`, and both paths in `ExecCondition`), then:
+   `/home/docker/IEEE_DiscordBot` (`WorkingDirectory`, and both paths in `ExecCondition` and in `ExecStart`), then:
 
    ```bash
    sudo cp deploy/ieee-meeting-worker.service deploy/ieee-meeting-worker.timer /etc/systemd/system/
@@ -92,6 +111,7 @@ Run a pending meeting by hand, without waiting for the timer:
 sudo systemctl start ieee-meeting-worker.service              # same as the timer: skipped if nothing is pending
 docker compose --profile job run --rm worker                  # directly, in the foreground
 docker compose --profile job stop ollama                      # afterwards, when run directly
+docker compose --profile job run --rm --no-deps worker python -m worker.run --live   # a live pass, no Ollama
 ```
 
 To reprocess a meeting, set its `status` in `data/meetings/<id>/manifest.json` back to `queued` (segments that
@@ -104,7 +124,8 @@ already have a `.txt` are not transcribed again). To pause processing: `sudo sys
 | `worker` | 6 of 8 threads, weight 128 (default 1024) | 6 GB | `nice 19`, idle I/O |
 | `ollama` | 6 of 8 threads, weight 128 | 12 GB | `nice 19`, idle I/O |
 
-The two do their heavy work one after the other (transcription, then summarizing), and `OLLAMA_KEEP_ALIVE=0`
+During a call only `worker` runs (Ollama is not started). The two do their heavy work one after the other
+(transcription, then summarizing), and `OLLAMA_KEEP_ALIVE=0`
 unloads Gemma right after each request. Memory limits are ceilings: a run that exceeds one is killed (the unit then
 shows as failed and the timer retries 2 minutes later) instead of pushing the bot and other services into swap.
 The service times out after 8 hours; `ExecStopPost` always removes the job container and stops Ollama.

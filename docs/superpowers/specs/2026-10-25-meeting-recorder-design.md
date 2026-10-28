@@ -61,9 +61,12 @@ The bot only captures audio and writes it to disk; all heavy work happens in the
 
 ## Processing job
 
-A one-shot container does transcription, then summarization, then exits. Only one model is in memory at a time.
+A one-shot container does transcription, then summarization, then exits. Only one model is in memory at a time. A host timer starts it every 2 minutes while a meeting needs work, in one of two modes (`deploy/meeting-job.sh`):
 
-1. **Transcribe chunks as they appear**, during the call. `faster-whisper` `large-v3-turbo`, int8, CPU, 8 threads, beam size 1, language set to Greek, silence filtering on. An initial prompt lists vocabulary the transcript should get right (IEEE Student Branch, workshop, event, email, day names).
+- **During the call** (`recording`): a live run (`worker.run --live`, without Ollama) transcribes the chunks the bot has closed so far and exits. It never summarizes, never fails the meeting and never writes the manifest, which the bot owns until `/record stop`. A run with no new chunks exits without loading Whisper; otherwise Whisper is loaded fresh each run, which keeps the job stateless at the cost of a few seconds per run.
+- **After the call** (`queued`): the full run starts Ollama, transcribes the remaining chunks, unloads Whisper, summarizes and marks the meeting `done`. A meeting stopped while a live run is busy is picked up by the next tick.
+
+1. **Transcribe chunks as they appear**, during the call (the live runs above). `faster-whisper` `large-v3-turbo`, int8, CPU, 8 threads, beam size 1, language set to Greek, silence filtering on. An initial prompt lists vocabulary the transcript should get right (IEEE Student Branch, workshop, event, email, day names).
 2. **Merge speakers** by timestamp into one transcript, one line per segment: `[00:00:09] Μαρία: ...`.
 3. **Unload Whisper, then summarize.** The transcript is split into pieces of about 10-15 minutes. Gemma 3 12B (through Ollama, 8192-token context, temperature 0.2) extracts topics, decisions, tasks and open questions from each piece, then a final pass merges them into one summary. The prompt is in Greek and forbids adding information that is not in the text.
 4. **Post and clean up.** The summary and the transcript file go to Discord, and the job removes remaining audio.

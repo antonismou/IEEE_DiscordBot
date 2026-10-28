@@ -1,5 +1,5 @@
 # The meeting processing job: transcribes with faster-whisper, summarizes through Ollama over HTTP, then exits.
-# Started by deploy/ieee-meeting-worker.service through `docker compose --profile job run --rm worker`.
+# Started by deploy/ieee-meeting-worker.service through deploy/meeting-job.sh (`docker compose --profile job run`).
 FROM python:3.12-slim
 ENV TZ=Europe/Athens \
     PYTHONDONTWRITEBYTECODE=1 \

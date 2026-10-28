@@ -1,10 +1,17 @@
-"""The processing job: `python -m worker.run [--meetings-dir DIR]`, started by the host once a meeting is queued.
+"""The processing job: `python -m worker.run [--live] [--meetings-dir DIR]`, started by the host's timer.
 
 It loops until no meeting needs work, oldest first: `queued`, or `transcribing`/`summarizing` left by a crash. Each
 meeting is transcribed (Whisper), its transcript checked and written, then summarized (Ollama over HTTP), and only
 then marked `done`, so the bot finds transcript.txt and summary.md when it sees the status. A failure marks that
-meeting `failed` with an `error` in the manifest and the job moves on. Exit codes: 0 when everything finished or
-there was nothing to do, 1 when a meeting failed, 2 for bad configuration, 75 when another worker holds the lock.
+meeting `failed` with an `error` in the manifest and the job moves on.
+
+A meeting still `recording` gets one live pass per run: the segments the bot has closed so far are transcribed and
+nothing else happens. The bot owns the manifest during the call (it rewrites it from memory on every segment), so
+a live pass never writes it, never summarizes and never fails the meeting; whatever is left is retried next run.
+With `--live` the job does only live passes and leaves ended meetings alone, because Ollama is not running then.
+
+Exit codes: 0 when everything finished or there was nothing to do, 1 when a meeting (or a live pass) failed, 2 for
+bad configuration, 75 when another worker holds the lock.
 """
 from __future__ import annotations
 
@@ -29,7 +36,8 @@ from worker import transcribe as transcribe_stage
 log = logging.getLogger(__name__)
 
 DEFAULT_MEETINGS_DIR = "/app/data/meetings"
-WORK = ("queued", "transcribing", "summarizing")  # recording, done, failed and interrupted are left alone
+WORK = ("queued", "transcribing", "summarizing")  # the full pipeline; done, failed and interrupted are left alone
+LIVE = "recording"  # transcription only, while the call goes on
 LOCK_FILE = ".worker.lock"
 LOCK_BUSY = 75  # EX_TEMPFAIL: another worker is running and will pick up whatever is queued
 OLLAMA_WAIT = 120  # seconds; the ollama container starts with the job
@@ -49,6 +57,7 @@ class Config:
     ollama_url: str = "http://ollama:11434"
     ollama_model: str = summary_stage.DEFAULT_MODEL
     chunk_minutes: int = summary_stage.DEFAULT_CHUNK_MINUTES
+    live: bool = False  # only transcribe meetings still recording (set by --live, when Ollama is not started)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -127,6 +136,24 @@ def process(directory: Path, transcribe: Stage, summarize: Stage, wait: Callable
         return False
 
 
+def live_pass(directory: Path, transcribe: Stage) -> bool:
+    """Transcribe the segments a recording meeting has so far. Returns False if the pass raised.
+
+    Only closed segments are in the manifest (the bot adds each one after its WAV is complete), so all are safe to
+    read. transcribe_meeting leaves the manifest alone while the status is `recording`; nothing here writes it
+    either, since the bot's next save would overwrite it, or a write here could drop a segment the bot just added.
+    """
+    try:
+        done = transcribe(directory)
+        log.info("meeting %s: %s new segment(s) transcribed during the call", Path(directory).name, done)
+        return True
+    except Exception:
+        log.exception("meeting %s: live transcription failed, retrying next run", Path(directory).name)
+        return False
+    finally:
+        gc.collect()
+
+
 def _transcribe(directory: Path, transcribe: Stage) -> None:
     Meeting.load(directory).set_status("transcribing")
     transcribe(directory)
@@ -167,24 +194,44 @@ def run(config: Config, transcribe: Stage | None = None, summarize: Stage | None
             log.warning("another worker holds %s, not starting", root / LOCK_FILE)
             return LOCK_BUSY
         failed = 0
-        tried: set[str] = set()
-        while (meeting := _next(root, tried)) is not None:
-            tried.add(meeting.id)
+        tried: set[tuple[str, str]] = set()
+        while (found := _next(root, tried, config.live)) is not None:
+            meeting, kind = found
+            tried.add((meeting.id, kind))
             log.info("processing meeting %s (%s)", meeting.id, meeting.status)
-            if not process(meeting.directory, transcribe, summarize, wait):
+            if kind == "live":
+                ok = live_pass(meeting.directory, transcribe)
+            else:
+                ok = process(meeting.directory, transcribe, summarize, wait)
+            if not ok:
                 failed += 1
         return 1 if failed else 0
 
 
-def _next(root: Path, tried: set[str]) -> Meeting | None:
-    """Looked up again after each meeting, so one queued meanwhile is not missed. Ids are start times."""
-    return next((m for m in all_meetings(root) if m.status in WORK and m.id not in tried), None)
+def _next(root: Path, tried: set[tuple[str, str]], live: bool) -> tuple[Meeting, str] | None:
+    """Looked up again after each meeting, so one queued meanwhile is not missed. Ids are start times.
+
+    Each meeting gets at most one live pass and one full run per job, so a call that goes on does not keep the job
+    looping. A meeting stopped during its live pass is finished by the same job, or, with `live`, by the next one.
+    """
+    for meeting in all_meetings(root):
+        if meeting.status == LIVE:
+            kind = "live"
+        elif meeting.status in WORK and not live:
+            kind = "full"
+        else:
+            continue
+        if (meeting.id, kind) not in tried:
+            return meeting, kind
+    return None
 
 
 def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
          runner: Callable[[Config], int] = run) -> int:
     parser = argparse.ArgumentParser(prog="python -m worker.run", description=__doc__.splitlines()[0])
     parser.add_argument("--meetings-dir", help=f"default: $MEETINGS_DIR or {DEFAULT_MEETINGS_DIR}")
+    parser.add_argument("--live", action="store_true",
+                        help="only transcribe meetings still recording; never summarize (Ollama is not running)")
     args = parser.parse_args(argv)
     try:
         config = Config.from_env(os.environ if env is None else env)
@@ -193,6 +240,8 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
         return 2
     if args.meetings_dir:
         config = replace(config, meetings_dir=args.meetings_dir)
+    if args.live:
+        config = replace(config, live=True)
     return runner(config)
 
 

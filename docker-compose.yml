@@ -20,6 +20,8 @@ services:
 
   # The meeting processing job. Profile-gated: `docker compose up` never starts it; the systemd timer in deploy/
   # runs it with `docker compose --profile job run --rm worker` and it exits when there is nothing left to do.
+  # During a call it runs `--no-deps worker python -m worker.run --live` instead (transcription only), so Ollama
+  # is not started then; depends_on below applies only to the full run after the meeting ends.
   worker:
     build:
       context: .
@@ -52,7 +54,8 @@ services:
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
 
-  # The summary model server. Profile-gated and started only as the worker's dependency; the systemd unit stops it
+  # The summary model server. Profile-gated and started only as the worker's dependency (full runs, not the live
+  # transcription runs during a call); the systemd unit stops it
   # again when the job ends. OLLAMA_KEEP_ALIVE=0 unloads the model right after each request. No port is published:
   # only the worker reaches it, over the compose network.
   ollama:
