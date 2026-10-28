@@ -61,14 +61,17 @@ The bot only captures audio and writes it to disk; all heavy work happens in the
 
 ## Processing job
 
-A one-shot container does transcription, then summarization, then exits. Only one model is in memory at a time. A host timer starts it every 2 minutes while a meeting needs work, in one of two modes (`deploy/meeting-job.sh`):
+One-shot containers do transcription and summarization, then exit. Only one model is in memory at a time: Whisper and Gemma never run together (the worker's 6 GB and Ollama's 12 GB limits would not fit next to the other services in 16 GB, and both use all the CPU). A host timer starts a run every 2 minutes while a meeting needs work (`deploy/meeting-job.sh`):
 
-- **During the call** (`recording`): a live run (`worker.run --live`, without Ollama) transcribes the chunks the bot has closed so far and exits. It never summarizes, never fails the meeting and never writes the manifest, which the bot owns until `/record stop`. A run with no new chunks exits without loading Whisper; otherwise Whisper is loaded fresh each run, which keeps the job stateless at the cost of a few seconds per run.
-- **After the call** (`queued`): the full run starts Ollama, transcribes the remaining chunks, unloads Whisper, summarizes and marks the meeting `done`. A meeting stopped while a live run is busy is picked up by the next tick.
+- **During the call** (`recording`): a live run (`worker.run --live`, without Ollama) transcribes the chunks the bot has closed so far. It never summarizes, never fails the meeting and never writes the manifest, which the bot owns until `/record stop`. A run with no new chunks exits without loading Whisper; otherwise Whisper is loaded fresh each run, which keeps the job stateless at the cost of a few seconds per run. If a summary window (below) is complete and has no notes yet, the run exits with code 3 and the script starts a second container, `worker.run --extract`, with Ollama: it makes that window's notes without loading Whisper and exits, and the unit stops Ollama. Whisper's memory is released with its process before Ollama starts, and a tick with nothing to extract never starts Ollama. A failed notes run only logs; the window is retried on the next tick or after the call.
+- **After the call** (`queued`): the full run starts Ollama, transcribes the remaining chunks, unloads Whisper, makes the notes of the windows still missing (the last, partial one included), merges them and marks the meeting `done`. A meeting stopped while a live run is busy is picked up by the next tick. A meeting recovered after a bot restart is queued the same way and reuses the notes already made.
 
 1. **Transcribe chunks as they appear**, during the call (the live runs above). `faster-whisper` `large-v3-turbo`, int8, CPU, 8 threads, beam size 1, language set to Greek, silence filtering on. An initial prompt lists vocabulary the transcript should get right (IEEE Student Branch, workshop, event, email, day names).
 2. **Merge speakers** by timestamp into one transcript, one line per segment: `[00:00:09] Μαρία: ...`.
-3. **Unload Whisper, then summarize.** The transcript is split into pieces of about 10-15 minutes. Gemma 3 12B (through Ollama, 8192-token context, temperature 0.2) extracts topics, decisions, tasks and open questions from each piece, then a final pass merges them into one summary. The prompt is in Greek and forbids adding information that is not in the text.
+3. **Notes per window, then merge.** The transcript is cut into fixed windows of `CHUNK_MINUTES` (12) minutes by segment start: window k always covers [12k, 12(k+1)) minutes, so a window means the same lines during the call and after it. Gemma 3 12B (through Ollama, 8192-token context, temperature 0.2) extracts topics, decisions, tasks and open questions from each window into `notes/12min/<k>.md` (written atomically, skipped when present), then a final pass merges all notes into one summary. A meeting inside one window is summarized in a single call. The prompt is in Greek and forbids adding information that is not in the text; the merge keeps the four headings, lets later corrections win, lists only explicitly assigned tasks and puts undecided items under Ανοιχτά θέματα.
+   - *When a window is complete during the call* (`worker/notes.py`): the bot adds a segment to the manifest only when its file closes (after a 2 s pause or 5 minutes of audio), with its start offset from the meeting start. A window is complete when the meeting has run 6 minutes past its end (5 minutes of segment plus a margin, measured from `started_at` in UTC), every segment starting before its end has its text, and no WAV still being written (on disk but not in the manifest; it started after the speaker's previous segment ended) can belong to it. After `/record stop` every window is complete.
+   - *Context size*: at most 5500 estimated transcript tokens per call (about 400 for instructions and 1500 for the answer complete the 8192). The estimate is deliberately high (2.5 characters per token, each digit a token). A window that does not fit is extracted in parts into the same notes file; notes that do not fit one merge call are merged in groups and the group summaries merged again. 12 minutes of Greek speech (120-150 words a minute, 2.2 tokens a word) is about 3,400-5,000 tokens; 20 minutes (5,700-8,000+) would not fit.
+   - Speaker names are only known after `/record stop`, so notes made during the call name speakers by Discord id; the merge pass replaces the ids with the names.
 4. **Post and clean up.** The summary and the transcript file go to Discord, and the job removes remaining audio.
 
 The model names are config values, so the summary model can be swapped without code changes. The job retries an Ollama error once: the benchmark hit one unexplained HTTP 500 that did not repeat.
@@ -108,14 +111,16 @@ Between meetings the feature uses no CPU or RAM; its only permanent cost is abou
 | Stage | CPU | RAM (approximate) |
 | --- | --- | --- |
 | Idle | none | none |
-| Recording | light (bot writes audio files) | small |
-| Transcribing | up to 8 threads, lowest priority | 3-4 GB |
-| Summarizing | up to 8 threads, lowest priority | about 8 GB |
+| Recording | light (bot writes audio files), plus the runs below during the call | small |
+| Transcribing | up to 6 of 8 threads, lowest priority | 3-4 GB |
+| Summarizing (window notes during or after the call, merge after it) | up to 6 of 8 threads, lowest priority | about 8 GB |
+
+Transcribing and summarizing never overlap: within one tick the transcription container exits before the notes container and Ollama start.
 
 Containers:
 
-- A `worker` image (Python, `faster-whisper`, `ffmpeg`) runs once per meeting and exits.
-- `ollama` starts for the summary stage and stops afterwards; `keep_alive` is 0 so the model leaves memory immediately.
+- A `worker` image (Python, `faster-whisper`) runs once per tick and exits.
+- `ollama` starts only for a run that has notes to make or a summary to write, and stops afterwards; `keep_alive` is 0 so the model leaves memory immediately.
 - Models live in named volumes (about 1.6 GB for Whisper, about 8 GB for Gemma), so they download once.
 - The job runs at `nice 19` with a container CPU and memory limit, so other services on the server always win.
 
@@ -137,8 +142,8 @@ Turbo with 8 threads and beam 1 reaches 1.2x realtime at 4.1% word error rate, w
 Expected time for a 1-hour meeting (estimates, not measurements):
 
 - Transcription runs during the call, leaving about 10-15 minutes after it ends.
-- Summary: Greek is about 2.2 tokens per word, so roughly 17,000 tokens to read (about 40 minutes) plus 15-20 minutes of writing.
-- Total after the meeting ends: about 1-1.5 hours.
+- Summary: Greek is about 2.2 tokens per word, so roughly 17,000 tokens to read (about 40 minutes) plus 15-20 minutes of writing, about 10-13 minutes per 12-minute window plus the merge pass.
+- Window notes are made during the call only in the CPU time transcription leaves free, since transcription alone is close to realtime when people talk most of the time. Wait after the meeting ends: about 1-1.25 hours for a call with talk most of the time (0-1 of 5 windows done during it), about 40-60 minutes for a typical one with pauses (2-3 of 5), never below the tail of about 20-30 minutes (the last window or two, the last segments and the merge). Without notes during the call it was about 1-1.5 hours.
 
 ## Risks, privacy and open questions
 
