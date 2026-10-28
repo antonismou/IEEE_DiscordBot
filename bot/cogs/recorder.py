@@ -10,13 +10,15 @@ from typing import Callable
 
 import discord
 from discord import app_commands
-from discord.ext import commands, voice_recv
+from discord.ext import commands, tasks, voice_recv
 
 from bot.audit import audit
+from bot.channels import MEETING_SUMMARIES
 from bot.checks import officer_only
 from bot.recording.dave import DaveDecryptor
-from bot.recording.meeting import Meeting, find_busy, interrupt_stale
+from bot.recording.meeting import Meeting, all_meetings, find_busy, interrupt_stale, latest
 from bot.recording.pipeline import SpeakerPipeline
+from bot.recording.posting import FINAL, STATUS_TEXT, post_update
 from bot.recording.segments import SegmentWriter
 from bot.recording.sink import MeetingSink
 from bot.roles import resolve_member
@@ -30,12 +32,32 @@ ANNOUNCEMENT = (
     "🔴 **Ξεκίνησε η ηχογράφηση.** Η συζήτηση ηχογραφείται για απομαγνητοφώνηση και σύνοψη. "
     "Αποχωρήστε από το κανάλι αν διαφωνείτε."
 )
-STATUS_AFTER_STOP = "done"  # becomes "queued" once the processing job exists
+STOPPED = {  # posted in the same chat when the recording ends without /record stop
+    "kicked": (
+        "⏹️ **Recording stopped:** I was disconnected from the call. What was recorded so far will be summarized.\n"
+        "⏹️ **Η ηχογράφηση σταμάτησε:** αποσυνδέθηκα από την κλήση. Όσα ηχογραφήθηκαν θα συνοψιστούν."
+    ),
+    "empty": (
+        "⏹️ **Recording stopped:** everyone left the call. The meeting will be summarized.\n"
+        "⏹️ **Η ηχογράφηση σταμάτησε:** όλοι αποχώρησαν από την κλήση. Η συνάντηση θα συνοψιστεί."
+    ),
+}
+STATUS_AFTER_STOP = "queued"  # the host's path unit starts the processing job when it sees this
+STAGES = {  # how /record status names each status
+    "recording": "recording",
+    "queued": "waiting for the processing job to start",
+    "transcribing": "transcribing",
+    "summarizing": "summarizing",
+    "done": "done",
+    "failed": "**failed**",
+    "interrupted": "interrupted (the bot restarted during the recording)",
+}
 
 
 @dataclass
 class ActiveRecording:
     meeting: Meeting
+    channel: discord.VoiceChannel
     voice_client: voice_recv.VoiceRecvClient
     writer: SegmentWriter
     decryptor: DaveDecryptor
@@ -52,6 +74,8 @@ class RecorderCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.active: ActiveRecording | None = None
+        self._warned_no_channel = False
+        self._post_problems: set[tuple[str, str]] = set()  # (meeting id, error) already logged
 
     @property
     def app(self):
@@ -61,8 +85,10 @@ class RecorderCog(commands.Cog):
         # A recording cannot survive a restart: the voice session is gone.
         for meeting in interrupt_stale(self.app.settings.meetings_dir):
             log.warning("Meeting %s was recording when the bot stopped; marked interrupted", meeting.id)
+        self.poster.start()
 
     async def cog_unload(self) -> None:
+        self.poster.cancel()
         if self.active:
             self.active.flusher.cancel()
 
@@ -111,7 +137,7 @@ class RecorderCog(commands.Cog):
         decryptor = DaveDecryptor(lambda: voice_client._connection)
         pipeline = SpeakerPipeline(decryptor, discord.opus.Decoder, writer, clock)
         flusher = asyncio.create_task(self._flush_idle_segments(writer, clock))
-        self.active = ActiveRecording(meeting, voice_client, writer, decryptor, pipeline, clock, flusher)
+        self.active = ActiveRecording(meeting, channel, voice_client, writer, decryptor, pipeline, clock, flusher)
         voice_client.listen(MeetingSink(pipeline, voice_client._get_id_from_ssrc))
 
     @staticmethod
@@ -129,16 +155,111 @@ class RecorderCog(commands.Cog):
             await interaction.response.send_message("No recording is in progress.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
+        await self._end(active, interaction.guild)
+        await audit(self.app, interaction, f"stopped the recording {active.meeting.id}")
+        await interaction.followup.send(self._report(active), ephemeral=True)
+
+    async def _end(self, active: ActiveRecording, guild) -> None:
         active.flusher.cancel()
         active.voice_client.stop_listening()
         active.writer.close()
         try:
-            await self._save_speaker_names(interaction.guild, active)
+            await self._save_speaker_names(guild, active)
         finally:
-            await active.voice_client.disconnect()
+            await active.voice_client.disconnect(force=True)  # force: after a kick the connection is already gone
             active.meeting.set_status(STATUS_AFTER_STOP)
-        await audit(self.app, interaction, f"stopped the recording {active.meeting.id}")
-        await interaction.followup.send(self._report(active), ephemeral=True)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after) -> None:
+        """Stop like /record stop would when the bot is kicked (or moved) out of the call, or the call empties."""
+        active = self.active
+        if active is None:
+            return
+        recorded = active.channel.id
+        if member.id == self.bot.user.id:
+            if after.channel is not None and after.channel.id == recorded:
+                return
+            reason = "kicked"
+        elif before.channel is not None and before.channel.id == recorded:
+            # voice_states, not members: without the members intent the member cache is mostly empty
+            if any(user_id != self.bot.user.id for user_id in active.channel.voice_states):
+                return
+            reason = "empty"
+        else:
+            return
+        self.active = None
+        log.info("Recording %s stopped automatically (%s)", active.meeting.id, reason)
+        await self._end(active, active.channel.guild)
+        try:
+            await active.channel.send(STOPPED[reason])
+        except discord.HTTPException:
+            log.warning("Could not announce the end of recording %s", active.meeting.id)
+
+    @record_group.command(name="status", description="Show how far the latest meeting has got")
+    @officer_only()
+    async def status(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(self._status_text(), ephemeral=True)
+
+    def _status_text(self) -> str:
+        active = self.active
+        if active:
+            return (
+                f"Recording `{active.meeting.id}` in {active.channel.mention} for {active.clock() / 60:.0f} min, "
+                f"{plural(len(active.writer.segments), 'segment')} finished so far. Use `/record stop` to end it."
+            )
+        meeting = latest(self.app.settings.meetings_dir)
+        if meeting is None:
+            return "No meetings have been recorded yet."
+        started = f"<t:{int(meeting.started_at.timestamp())}:f>"
+        text = f"Meeting `{meeting.id}` (started {started}): {STAGES.get(meeting.status, meeting.status)}."
+        if meeting.status == "failed" and meeting.error:
+            text += f" Reason: {meeting.error[:300]}"
+        channel_id = self.app.channels.get(MEETING_SUMMARIES)
+        if meeting.posted:
+            text += f"\nPosted in <#{channel_id}>." if channel_id else ""
+        elif meeting.status in STATUS_TEXT and channel_id is None:
+            text += f"\nNo summaries channel is set, so nothing is posted: `/channel set` it for `{MEETING_SUMMARIES}`."
+        elif meeting.status in FINAL:
+            text += f"\nThe result is waiting to be posted in <#{channel_id}>: I keep retrying, check my permissions."
+        return text
+
+    @tasks.loop(seconds=30)
+    async def poster(self) -> None:
+        try:
+            await self.post_updates()
+        except Exception:
+            log.exception("Posting meeting updates failed")  # keep the loop alive; it tries again next time
+
+    async def post_updates(self) -> None:
+        """Post status changes and finished meetings to the summaries channel. Anything not posted stays pending."""
+        root = self.app.settings.meetings_dir
+        pending = [m for m in all_meetings(root) if m.status in STATUS_TEXT and not m.posted]
+        if not pending:
+            return
+        channel_id = self.app.channels.get(MEETING_SUMMARIES)
+        if channel_id is None:
+            if not self._warned_no_channel:
+                log.warning("Meeting results are waiting: set the %s channel with /channel set", MEETING_SUMMARIES)
+                self._warned_no_channel = True
+            return
+        self._warned_no_channel = False
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+        except discord.HTTPException as exc:
+            log.warning("Cannot reach the %s channel %s: %s", MEETING_SUMMARIES, channel_id, exc)
+            return
+        for meeting in pending:
+            try:
+                await post_update(channel, meeting)
+            except (discord.HTTPException, OSError) as exc:
+                problem = (meeting.id, str(exc))
+                level = logging.DEBUG if problem in self._post_problems else logging.WARNING  # once, not every turn
+                self._post_problems.add(problem)
+                log.log(level, "Could not post meeting %s yet, will retry: %s", meeting.id, exc)
+
+    @poster.before_loop
+    async def before_poster(self) -> None:
+        await self.bot.wait_until_ready()
 
     @staticmethod
     async def _save_speaker_names(guild, active: ActiveRecording) -> None:
