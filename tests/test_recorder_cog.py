@@ -192,15 +192,57 @@ def test_stop_warns_when_no_audio_could_be_decoded(conn, tmp_path):
     assert "no audio" in text.lower()
 
 
-def test_after_a_restart_a_leftover_recording_is_marked_interrupted(conn, tmp_path):
+def test_after_a_restart_a_leftover_recording_is_queued_so_its_audio_is_still_processed(conn, tmp_path):
     async def scenario():
         cog, app = make_cog(conn, tmp_path)
         left = Meeting.create(app.settings.meetings_dir, 1, 1, datetime(2026, 10, 1, 10, 0, 0))
+        left.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 0.0, "duration": 2.0})
         await cog.cog_load()
         await cog.cog_unload()
-        return Meeting.load(left.directory).status
+        interaction = fake_interaction(officer_in(None), fake_guild())
+        await cog.status.callback(cog, interaction)
+        return Meeting.load(left.directory), reply_text(interaction)
 
-    assert asyncio.run(scenario()) == "interrupted"
+    meeting, status = asyncio.run(scenario())
+    assert meeting.status == "queued" and meeting.interrupted
+    assert "restart" in status.lower()
+
+
+def test_a_new_recording_waits_for_a_recovered_meeting_but_not_for_an_empty_one(conn, tmp_path):
+    async def scenario(with_audio):
+        cog, app = make_cog(conn, tmp_path / str(with_audio))
+        left = Meeting.create(app.settings.meetings_dir, 1, 1, datetime(2026, 10, 1, 10, 0, 0))
+        if with_audio:
+            left.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 0.0, "duration": 2.0})
+        await cog.cog_load()
+        channel, _ = make_channel([])
+        interaction = fake_interaction(officer_in(channel), fake_guild())
+        await cog.start.callback(cog, interaction)
+        started = cog.active is not None
+        await cog.cog_unload()
+        return started
+
+    assert asyncio.run(scenario(True)) is False
+    assert asyncio.run(scenario(False)) is True
+
+
+def test_an_empty_interrupted_recording_posts_one_failure_notice(conn, tmp_path):
+    summaries = FakeChannel()
+
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path, summaries)
+        app.channels.set(MEETING_SUMMARIES, 77)
+        left = Meeting.create(app.settings.meetings_dir, 1, 1, datetime(2026, 10, 1, 10, 0, 0))
+        await cog.cog_load()
+        await cog.cog_unload()
+        await cog.post_updates()
+        await cog.post_updates()
+        return Meeting.load(left.directory)
+
+    meeting = asyncio.run(scenario())
+    [notice] = summaries.sent
+    assert meeting.posted and "απέτυχε" in notice.content and "no audio was captured" in notice.content
+    assert "επανεκκίνηση" in notice.content
 
 
 def test_the_recorder_extension_loads_into_a_bot_and_is_part_of_startup(tmp_path):

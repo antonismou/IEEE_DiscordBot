@@ -95,10 +95,10 @@ A status message is posted when processing starts and edited as it advances, so 
 Each meeting gets its own directory under `meetings_dir` (default `data/meetings`). Today `data` is a Docker-managed volume, so for the host's path unit to see it, step 5 must either watch the volume's path under `/var/lib/docker/volumes/` or switch this folder to a bind mount. A `manifest.json` in it is the single source of truth.
 
 - **Manifest.** Meeting id, start time, speaker map (Discord id to display name), the list of chunks with offsets, and a status.
-- **Statuses.** `recording`, `queued`, `transcribing`, `summarizing`, `done`, `failed`, `interrupted`.
-- **One at a time.** `/record start` is refused while any meeting is in a status other than `done`, `failed` or `interrupted`, so the job also never runs two meetings at once.
+- **Statuses.** `recording`, `queued`, `transcribing`, `summarizing`, `done`, `failed`. (`interrupted` was written by earlier versions; the bot recovers it at startup like a `recording` one.)
+- **One at a time.** `/record start` is refused while any meeting is in a status other than `done` or `failed`, so the job also never runs two meetings at once.
 - **Job recovery.** The job skips any chunk that already has a transcript file, so a crash or restart resumes where it stopped.
-- **Bot restart during a call.** The voice session cannot resume by itself. The meeting is marked `interrupted` and the chunks already on disk are still processed.
+- **Bot restart during a call.** The voice session cannot resume by itself. At startup, before it can record again, the bot ends the meeting as `/record stop` would: with at least one chunk it becomes `queued`, so the chunks already on disk are still processed, and with none it becomes `failed` ("no audio was captured"). Either way `posting.json` gets `interrupted: true`, written before the status changes, so the posted summary or failure notice says in Greek that the recording was cut short and may be incomplete. This is safe without locking: at startup the bot is the only writer of a `recording` manifest, since the job's live pass never writes it. Speaker names are only resolved at `/record stop`, so a recovered transcript shows speakers by Discord id.
 - **Cleanup.** Audio for a chunk is deleted once its transcript is written. The transcript and summary are kept as text until an officer deletes them by hand; there is no automatic expiry.
 
 ## Resources and operations

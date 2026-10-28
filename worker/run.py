@@ -36,7 +36,7 @@ from worker import transcribe as transcribe_stage
 log = logging.getLogger(__name__)
 
 DEFAULT_MEETINGS_DIR = "/app/data/meetings"
-WORK = ("queued", "transcribing", "summarizing")  # the full pipeline; done, failed and interrupted are left alone
+WORK = ("queued", "transcribing", "summarizing")  # the full pipeline; done and failed are left alone
 LIVE = "recording"  # transcription only, while the call goes on
 LOCK_FILE = ".worker.lock"
 LOCK_BUSY = 75  # EX_TEMPFAIL: another worker is running and will pick up whatever is queued

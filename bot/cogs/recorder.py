@@ -16,7 +16,7 @@ from bot.audit import audit
 from bot.channels import MEETING_SUMMARIES
 from bot.checks import officer_only
 from bot.recording.dave import DaveDecryptor
-from bot.recording.meeting import Meeting, all_meetings, find_busy, interrupt_stale, latest
+from bot.recording.meeting import Meeting, all_meetings, find_busy, latest, recover_interrupted
 from bot.recording.pipeline import SpeakerPipeline
 from bot.recording.posting import FINAL, STATUS_TEXT, post_update
 from bot.recording.segments import SegmentWriter
@@ -50,7 +50,6 @@ STAGES = {  # how /record status names each status
     "summarizing": "summarizing",
     "done": "done",
     "failed": "**failed**",
-    "interrupted": "interrupted (the bot restarted during the recording)",
 }
 
 
@@ -82,9 +81,9 @@ class RecorderCog(commands.Cog):
         return self.bot.app
 
     async def cog_load(self) -> None:
-        # A recording cannot survive a restart: the voice session is gone.
-        for meeting in interrupt_stale(self.app.settings.meetings_dir):
-            log.warning("Meeting %s was recording when the bot stopped; marked interrupted", meeting.id)
+        # A recording cannot survive a restart: the voice session is gone, so what was captured is processed as is.
+        for meeting in recover_interrupted(self.app.settings.meetings_dir):
+            log.warning("Meeting %s was recording when the bot stopped; now %s", meeting.id, meeting.status)
         self.poster.start()
 
     async def cog_unload(self) -> None:
@@ -214,6 +213,8 @@ class RecorderCog(commands.Cog):
         text = f"Meeting `{meeting.id}` (started {started}): {STAGES.get(meeting.status, meeting.status)}."
         if meeting.status == "failed" and meeting.error:
             text += f" Reason: {meeting.error[:300]}"
+        if meeting.interrupted:
+            text += "\nThe bot restarted during this recording, so only what was captured before it is processed."
         channel_id = self.app.channels.get(MEETING_SUMMARIES)
         if meeting.posted:
             text += f"\nPosted in <#{channel_id}>." if channel_id else ""

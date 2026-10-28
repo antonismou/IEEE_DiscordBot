@@ -187,3 +187,34 @@ def test_a_meeting_found_already_done_gets_no_separate_status_message(tmp_path):
     channel = FakeChannel()
     run(channel, meeting_with(tmp_path, "done"))
     assert len(channel.sent) == 2 and channel.edits == []                # summary + transcript only
+
+
+def test_a_recording_cut_short_by_a_restart_says_so_above_its_summary(tmp_path):
+    channel = FakeChannel()
+    meeting = meeting_with(tmp_path, "done")
+    meeting.mark_interrupted()
+
+    run(channel, meeting)
+
+    summary, _ = channel.sent
+    assert summary.content.startswith("**Σύνοψη συνάντησης")
+    assert "επανεκκίνηση" in summary.content and "ελλιπής" in summary.content
+    assert all(m.allowed_mentions.to_dict() == {"parse": []} for m in channel.sent)
+
+
+def test_a_normal_recording_has_no_interruption_note(tmp_path):
+    channel = FakeChannel()
+    run(channel, meeting_with(tmp_path, "done"))
+    assert "επανεκκίνηση" not in channel.sent[0].content
+
+
+def test_the_interruption_note_still_fits_a_long_summary_into_discord_messages(tmp_path):
+    channel = FakeChannel()
+    long_summary = "ε" * 1990                                         # one block that alone nearly fills a message
+    meeting = meeting_with(tmp_path, "done", summary=long_summary)
+    meeting.mark_interrupted()
+
+    run(channel, meeting)
+
+    *summary, _ = channel.sent
+    assert all(len(m.content) <= 2000 for m in summary) and "επανεκκίνηση" in summary[0].content

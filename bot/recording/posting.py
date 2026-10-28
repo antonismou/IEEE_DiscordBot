@@ -11,6 +11,7 @@ LIMIT = 2000  # Discord's message length limit
 HEADING = re.compile(r"\s*(#{1,6}\s|\*\*[^*]+\*\*:?\s*$)")  # "## Θέματα" or a line that is all bold
 NO_MENTIONS = discord.AllowedMentions.none()  # a transcript can contain "@everyone"
 FINAL = ("done", "failed")
+INTERRUPTED_NOTE = "⚠️ Η ηχογράφηση διακόπηκε από επανεκκίνηση του bot, οπότε μπορεί να είναι ελλιπής."
 STATUS_TEXT = {  # the status message, in Greek like the summary
     "queued": "⏳ Συνάντηση {when}: σε αναμονή για επεξεργασία.",
     "transcribing": "🎙️ Συνάντηση {when}: απομαγνητοφώνηση σε εξέλιξη...",
@@ -74,9 +75,10 @@ async def post_update(channel, meeting: Meeting) -> None:
         await _post_result(channel, meeting)
     elif meeting.status == "failed":
         reason = f" Αιτία: {meeting.error[:300]}" if meeting.error else ""
+        note = f"\n{INTERRUPTED_NOTE}" if meeting.interrupted else ""
         await channel.send(
             f"❌ Η επεξεργασία της συνάντησης {_when(meeting)} (`{meeting.id}`) απέτυχε.{reason} "
-            "Δείτε το log της επεξεργασίας στον server.",
+            f"Δείτε το log της επεξεργασίας στον server.{note}",
             allowed_mentions=NO_MENTIONS,
         )
         meeting.mark_posted()
@@ -103,7 +105,10 @@ async def _post_result(channel, meeting: Meeting) -> None:
     summary = meeting.summary_path.read_text(encoding="utf-8")
     if not meeting.transcript_path.is_file():
         raise FileNotFoundError(meeting.transcript_path)  # check before posting anything
-    parts = split_summary(f"**Σύνοψη συνάντησης {_when(meeting)}**\n\n{summary}")
+    header = f"**Σύνοψη συνάντησης {_when(meeting)}**"
+    if meeting.interrupted:
+        header += f"\n{INTERRUPTED_NOTE}"
+    parts = split_summary(f"{header}\n\n{summary}")
     for number in range(meeting.parts_sent, len(parts)):
         await channel.send(parts[number], allowed_mentions=NO_MENTIONS)
         meeting.set_parts_sent(number + 1)

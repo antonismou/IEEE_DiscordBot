@@ -89,7 +89,7 @@ Built, with tests (309 pass in total: the 261 that existed plus 48 new ones):
 - `bot/recording/dave.py`: DAVE decryption with statistics.
 - `bot/recording/pipeline.py`: decrypt, decode, convert, write, one opus decoder per speaker.
 - `bot/recording/sink.py`: the `voice_recv.AudioSink` glue.
-- `bot/recording/meeting.py`: `manifest.json` per meeting, "one at a time" rule, restart recovery; thread-safe.
+- `bot/recording/meeting.py`: `manifest.json` per meeting, "one at a time" rule, restart recovery (a call cut short by a restart is queued with what was captured, or failed if nothing was); thread-safe.
 - `bot/cogs/recorder.py`: `/record start` and `/record stop` (officers only; announcement before any audio; refuses
   if the announcement cannot be posted; stop reports captured segments and decrypt statistics). Registered in
   `bot/main.py`.

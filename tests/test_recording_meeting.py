@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from bot.recording.meeting import Meeting, find_busy, interrupt_stale, latest
+from bot.recording.meeting import Meeting, find_busy, latest, recover_interrupted
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
@@ -57,17 +57,67 @@ def test_find_busy_on_a_missing_folder_is_none(tmp_path):
     assert find_busy(tmp_path / "nope") is None
 
 
-def test_after_a_restart_a_recording_cannot_continue_so_it_is_marked_interrupted(tmp_path):
+SEGMENT = {"speaker": 7, "file": "7/000001.wav", "start": 1.5, "duration": 3.0}
+
+
+def test_after_a_restart_a_recording_with_audio_is_queued_and_flagged_as_interrupted(tmp_path):
     recording = Meeting.create(tmp_path, 11, 22, NOW)
-    queued = Meeting.create(tmp_path, 11, 22, NOW.replace(second=6))
-    queued.set_status("queued")
+    recording.add_segment(SEGMENT)
 
-    interrupted = interrupt_stale(tmp_path)
+    recovered = recover_interrupted(tmp_path)
 
-    assert [m.id for m in interrupted] == [recording.id]
-    assert Meeting.load(recording.directory).status == "interrupted"
-    assert Meeting.load(queued.directory).status == "queued"   # the job owns it, not the bot
-    assert find_busy(tmp_path).id == queued.id
+    loaded = Meeting.load(recording.directory)
+    assert [m.id for m in recovered] == [recording.id]
+    assert loaded.status == "queued" and loaded.interrupted and loaded.error is None
+    assert manifest(loaded)["segments"] == [SEGMENT]                 # the chunks on disk are still processed
+    assert find_busy(tmp_path).id == recording.id                    # it blocks a new recording until processed
+
+
+def test_after_a_restart_a_recording_with_no_audio_fails_with_a_reason(tmp_path):
+    empty = Meeting.create(tmp_path, 11, 22, NOW)
+
+    recover_interrupted(tmp_path)
+
+    loaded = Meeting.load(empty.directory)
+    assert loaded.status == "failed" and loaded.interrupted
+    assert "no audio was captured" in loaded.error
+    assert find_busy(tmp_path) is None                               # nothing to process, nothing blocks
+
+
+def test_a_meeting_left_interrupted_by_an_older_version_is_recovered_too(tmp_path):
+    old = Meeting.create(tmp_path, 11, 22, NOW)
+    old.add_segment(SEGMENT)
+    old.set_status("interrupted")
+
+    recover_interrupted(tmp_path)
+
+    assert Meeting.load(old.directory).status == "queued"
+
+
+def test_recovery_leaves_meetings_that_were_not_recording_alone(tmp_path):
+    others = {}
+    for second, status in enumerate(("queued", "transcribing", "summarizing", "done", "failed")):
+        meeting = Meeting.create(tmp_path, 11, 22, NOW.replace(second=second))
+        meeting.add_segment(SEGMENT)
+        meeting.set_status(status)
+        others[meeting.id] = (status, (meeting.directory / "manifest.json").read_bytes())
+
+    assert recover_interrupted(tmp_path) == []
+    for meeting in [Meeting.load(tmp_path / meeting_id) for meeting_id in others]:
+        status, before = others[meeting.id]
+        assert meeting.status == status and not meeting.interrupted
+        assert (meeting.directory / "manifest.json").read_bytes() == before   # the job owns these, not the bot
+
+
+def test_recovery_run_twice_changes_nothing_the_second_time(tmp_path):
+    Meeting.create(tmp_path, 11, 22, NOW).add_segment(SEGMENT)
+    Meeting.create(tmp_path, 11, 22, NOW.replace(second=9))
+
+    recover_interrupted(tmp_path)
+    before = {p: p.read_bytes() for p in sorted(tmp_path.glob("*/*.json"))}
+
+    assert recover_interrupted(tmp_path) == []
+    assert {p: p.read_bytes() for p in sorted(tmp_path.glob("*/*.json"))} == before
 
 
 def test_saving_from_two_threads_at_once_never_corrupts_or_loses_the_manifest(tmp_path):

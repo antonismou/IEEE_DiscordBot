@@ -12,6 +12,8 @@ POSTING = "posting.json"  # what the bot posted about the meeting; the job never
 TRANSCRIPT = "transcript.txt"  # written by the job: lines "[hh:mm:ss] Name: text"
 SUMMARY = "summary.md"  # written by the job, in Greek
 BUSY = ("recording", "queued", "transcribing", "summarizing")  # statuses that block a new recording
+STALE = ("recording", "interrupted")  # left by a bot restart during the call ("interrupted" by older versions)
+NO_AUDIO = "the bot restarted during the recording and no audio was captured"
 
 
 class Meeting:
@@ -73,6 +75,11 @@ class Meeting:
         return self._posting.get("posted", False)
 
     @property
+    def interrupted(self) -> bool:
+        """The recording was cut short by a bot restart, so the result may be incomplete."""
+        return self._posting.get("interrupted", False)
+
+    @property
     def status_message_id(self) -> int | None:
         return self._posting.get("status_message_id")
 
@@ -120,6 +127,9 @@ class Meeting:
     def mark_posted(self) -> None:
         self._set_posting(posted=True)
 
+    def mark_interrupted(self) -> None:
+        self._set_posting(interrupted=True)
+
     def save(self) -> None:
         with self._lock:
             self._write()
@@ -158,9 +168,20 @@ def find_busy(root: Path) -> Meeting | None:
     return next((m for m in all_meetings(root) if m.status in BUSY), None)
 
 
-def interrupt_stale(root: Path) -> list[Meeting]:
-    """After a bot restart, recordings cannot continue (the voice session is gone), so mark them interrupted."""
-    stale = [m for m in all_meetings(root) if m.status == "recording"]
+def recover_interrupted(root: Path) -> list[Meeting]:
+    """After a bot restart a recording cannot continue (the voice session is gone), so end it as /record stop would.
+
+    Called once at startup, before any recording begins, so the bot is the only writer of these manifests: the job
+    never writes a `recording` manifest (a live pass only adds segment texts) and never touches `interrupted` ones.
+    A meeting with audio is queued for the job; one without fails, so nothing waits for it. The flag goes to
+    posting.json first, so it is there before the job can pick the meeting up, and a crash in between only repeats it.
+    """
+    stale = [m for m in all_meetings(root) if m.status in STALE]
     for meeting in stale:
-        meeting.set_status("interrupted")
+        meeting.mark_interrupted()
+        if meeting._data["segments"]:
+            meeting.set_status("queued")
+        else:
+            meeting.set_error(NO_AUDIO)
+            meeting.set_status("failed")
     return stale
