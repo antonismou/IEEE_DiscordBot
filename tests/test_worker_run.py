@@ -217,6 +217,106 @@ def test_a_summary_error_fails_the_meeting_and_records_why(tmp_path):
     assert loaded.speakers == {7: "Μαρία"}  # the rest of the manifest is kept
 
 
+def test_a_failed_meeting_loses_its_audio_but_keeps_its_texts(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], transcribed={(7, 1)})
+    orphan = meeting.directory / "8" / "000001.wav"  # open when the bot died, so never in the manifest
+    orphan.parent.mkdir()
+    write_wav(orphan)
+    notes = meeting.directory / "notes" / "12min" / "000.md"
+    notes.parent.mkdir(parents=True)
+    notes.write_text("σημειώσεις", encoding="utf-8")
+    (meeting.directory / "transcript.txt").write_text("[00:00:00] Μαρία: ήδη 1\n", encoding="utf-8")
+
+    assert Fakes(fail_segments={"7/000002.wav"}).run(tmp_path) != 0
+
+    assert status_of(meeting) == "failed"
+    assert list(meeting.directory.rglob("*.wav")) == []
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == "ήδη 1"
+    assert (meeting.directory / "transcript.txt").exists() and notes.exists()
+
+
+def test_a_meeting_that_ends_done_keeps_no_attempt_count(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    assert Fakes().run(tmp_path) == 0
+    assert status_of(meeting) == "done" and not (meeting.directory / "attempts.json").exists()
+
+
+class Killed(BaseException):
+    """The worker dying mid-run (OOM kill, a crash inside Whisper): nothing after it runs."""
+
+
+def test_a_meeting_the_worker_keeps_dying_on_is_failed_after_max_attempts(tmp_path):
+    stuck = meeting_with(tmp_path, [(7, 1, 0.0)], minute=10)
+    fakes = Fakes()
+
+    def dies(directory):
+        raise Killed()
+    fakes.transcribe = dies
+    for _ in range(3):
+        with pytest.raises(Killed):
+            fakes.run(tmp_path)
+        assert status_of(stuck) == "transcribing"
+
+    later = meeting_with(tmp_path, [(7, 1, 0.0)], minute=50)
+    fakes.transcribe = Fakes().transcribe
+    assert fakes.run(tmp_path) == 1
+
+    loaded = Meeting.load(stuck.directory)
+    assert loaded.status == "failed" and "3 times" in loaded.error
+    assert list(stuck.directory.rglob("*.wav")) == []
+    assert not (stuck.directory / "attempts.json").exists()
+    assert status_of(later) == "done"  # the queue goes on, and /record start is no longer blocked
+
+
+def test_the_attempt_limit_comes_from_the_environment(tmp_path):
+    assert Config.from_env({"MAX_ATTEMPTS": "5"}).max_attempts == 5
+    with pytest.raises(ValueError, match="MAX_ATTEMPTS"):
+        Config.from_env({"MAX_ATTEMPTS": "0"})
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    (meeting.directory / "attempts.json").write_text('{"full": 1}', encoding="utf-8")
+    fakes = Fakes()
+    assert run(Config(meetings_dir=tmp_path, max_attempts=1), transcribe=fakes.transcribe,
+               summarize=fakes.summarize, wait=fakes.wait) == 1
+    assert status_of(meeting) == "failed" and fakes.events == []
+
+
+def test_an_attempt_that_ended_in_a_handled_failure_does_not_count(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    fakes = Fakes(summary_error=RuntimeError("Ollama returned HTTP 500"))
+    assert fakes.run(tmp_path) == 1
+    assert "HTTP 500" in Meeting.load(meeting.directory).error
+    assert not (meeting.directory / "attempts.json").exists()  # a requeue by hand starts afresh
+
+
+def test_live_passes_that_keep_dying_stop_without_touching_the_manifest(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
+    before = manifest_bytes(meeting)
+    fakes = Fakes()
+    real = fakes.transcribe
+
+    def dies(directory):
+        raise Killed()
+    fakes.transcribe = dies
+    for _ in range(3):
+        with pytest.raises(Killed):
+            fakes.run(tmp_path, live=True)
+
+    fakes.transcribe = real
+    assert fakes.run(tmp_path, live=True) == 0
+    assert fakes.events == [] and manifest_bytes(meeting) == before
+    assert (meeting.directory / "7/000001.wav").exists()  # kept for the full run after the call
+
+    Meeting.load(meeting.directory).set_status("queued")  # /record stop: the full run has its own attempts
+    assert fakes.run(tmp_path) == 0 and status_of(meeting) == "done"
+
+
+def test_a_live_pass_that_returns_resets_its_count(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
+    (meeting.directory / "attempts.json").write_text('{"live": 2}', encoding="utf-8")
+    assert Fakes().run(tmp_path, live=True) == 0
+    assert not (meeting.directory / "attempts.json").exists()
+
+
 def test_an_empty_transcript_still_ends_done(tmp_path):
     meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
     fakes = Fakes()

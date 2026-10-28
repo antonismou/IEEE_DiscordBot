@@ -6,6 +6,13 @@ then marked `done`, so the bot finds transcript.txt and summary.md when it sees 
 meeting `failed` with an `error` in the manifest and the job moves on. The summary saves its window notes as it goes
 and reuses them, so a job killed during the summary only extracts the missing windows next time (worker/summarize.py).
 
+A meeting the worker keeps dying on (killed for memory, a crash inside Whisper) would otherwise be picked up again on
+every run, forever, and keep /record start blocked. So each run that starts on a meeting is counted in the
+worker's own `<meeting>/attempts.json` (never the manifest, which the bot owns during the call) and the count is
+cleared once the run ends; after MAX_ATTEMPTS (3) runs that never ended, the meeting is marked `failed`, and live
+passes for it stop. When the worker fails a meeting for good, its leftover audio is deleted (every WAV in its folder,
+including ones the manifest does not list); the transcript, the segment texts and the notes are kept.
+
 A meeting still `recording` gets one live pass per run: the segments the bot has closed so far are transcribed and
 nothing else happens. The bot owns the manifest during the call (it rewrites it from memory on every segment), so
 a live pass never writes it, never summarizes and never fails the meeting; whatever is left is retried next run.
@@ -20,6 +27,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import gc
+import json
 import logging
 import os
 import sys
@@ -43,6 +51,7 @@ LIVE = "recording"  # transcription only, while the call goes on
 LOCK_FILE = ".worker.lock"
 LOCK_BUSY = 75  # EX_TEMPFAIL: another worker is running and will pick up whatever is queued
 OLLAMA_WAIT = 120  # seconds; the ollama container starts with the job
+ATTEMPTS = "attempts.json"  # written by the worker only: {"full": n, "live": n} runs started and not yet ended
 
 Stage = Callable[[Path], object]
 
@@ -59,6 +68,7 @@ class Config:
     ollama_url: str = "http://ollama:11434"
     ollama_model: str = summary_stage.DEFAULT_MODEL
     chunk_minutes: int = summary_stage.DEFAULT_CHUNK_MINUTES
+    max_attempts: int = 3  # runs on one meeting that may die before it is failed
     live: bool = False  # only transcribe meetings still recording (set by --live, when Ollama is not started)
 
     @classmethod
@@ -72,6 +82,12 @@ class Config:
             except ValueError:
                 raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
 
+        def positive(name: str, default: int) -> int:
+            value = number(name, default)
+            if value < 1:
+                raise ValueError(f"{name} must be at least 1, got {value}")
+            return value
+
         return cls(
             meetings_dir=env.get("MEETINGS_DIR") or cls.meetings_dir,
             whisper_model=env.get("WHISPER_MODEL") or cls.whisper_model,
@@ -79,6 +95,7 @@ class Config:
             ollama_url=env.get("OLLAMA_URL") or cls.ollama_url,
             ollama_model=env.get("OLLAMA_MODEL") or cls.ollama_model,
             chunk_minutes=number("CHUNK_MINUTES", cls.chunk_minutes),
+            max_attempts=positive("MAX_ATTEMPTS", cls.max_attempts),
         )
 
 
@@ -129,13 +146,29 @@ def process(directory: Path, transcribe: Stage, summarize: Stage, wait: Callable
         return True
     except Exception as exc:
         log.exception("meeting %s failed", directory.name)
-        try:
-            meeting = Meeting.load(directory)  # fresh, so nothing the stages wrote is overwritten
-            meeting.set_error(f"{type(exc).__name__}: {exc}")
-            meeting.set_status("failed")
-        except Exception:
-            log.exception("could not mark meeting %s failed", directory.name)
+        give_up(directory, f"{type(exc).__name__}: {exc}")
         return False
+
+
+def give_up(directory: Path, error: str) -> None:
+    """Mark a meeting failed for good and delete the audio it still has; its texts and notes are kept."""
+    directory = Path(directory)
+    try:
+        meeting = Meeting.load(directory)  # fresh, so nothing the stages wrote is overwritten
+        meeting.set_error(error)
+        meeting.set_status("failed")
+    except Exception:
+        log.exception("could not mark meeting %s failed", directory.name)
+        return  # not failed, so the audio may still be needed
+    deleted = 0
+    for audio in directory.rglob("*.wav"):  # also WAVs the manifest never listed (a segment open when the bot died)
+        try:
+            audio.unlink()
+            deleted += 1
+        except OSError:
+            log.exception("could not delete %s", audio)
+    if deleted:
+        log.info("meeting %s: deleted %d audio file(s) left after the failure", directory.name, deleted)
 
 
 def live_pass(directory: Path, transcribe: Stage) -> bool:
@@ -200,14 +233,67 @@ def run(config: Config, transcribe: Stage | None = None, summarize: Stage | None
         while (found := _next(root, tried, config.live)) is not None:
             meeting, kind = found
             tried.add((meeting.id, kind))
-            log.info("processing meeting %s (%s)", meeting.id, meeting.status)
+            attempt = start_attempt(meeting.directory, kind)
+            if attempt > config.max_attempts:
+                if kind == "live":  # the bot owns the manifest: leave the meeting to the full run after the call
+                    log.error("meeting %s: %d live passes never ended, none until the call ends", meeting.id,
+                              attempt - 1)
+                    continue
+                log.error("meeting %s: giving up after %d runs that never ended", meeting.id, attempt - 1)
+                give_up(meeting.directory, f"WorkerError: processing stopped {attempt - 1} times without finishing "
+                                           "(the worker was killed or crashed each time)")
+                clear_attempts(meeting.directory)
+                failed += 1
+                continue
+            log.info("processing meeting %s (%s), attempt %d", meeting.id, meeting.status, attempt)
             if kind == "live":
                 ok = live_pass(meeting.directory, transcribe)
+                end_attempt(meeting.directory, kind)
             else:
                 ok = process(meeting.directory, transcribe, summarize, wait)
+                clear_attempts(meeting.directory)  # done, or failed for good: a requeue by hand starts afresh
             if not ok:
                 failed += 1
         return 1 if failed else 0
+
+
+# --- attempts -----------------------------------------------------------------------------------------------------
+
+def _attempts(directory: Path) -> dict[str, int]:
+    try:
+        data = json.loads((Path(directory) / ATTEMPTS).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(v, int)} if isinstance(data, dict) else {}
+
+
+def _write_attempts(directory: Path, attempts: dict[str, int]) -> None:
+    path = Path(directory) / ATTEMPTS
+    if not attempts:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(attempts), encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def start_attempt(directory: Path, kind: str) -> int:
+    """Count a run of `kind` ("full" or "live") on the meeting before any work starts; returns its number."""
+    attempts = _attempts(directory)
+    attempts[kind] = attempts.get(kind, 0) + 1
+    _write_attempts(directory, attempts)
+    return attempts[kind]
+
+
+def end_attempt(directory: Path, kind: str) -> None:
+    """The run returned, whatever its result, so it did not take the worker down."""
+    attempts = _attempts(directory)
+    attempts.pop(kind, None)
+    _write_attempts(directory, attempts)
+
+
+def clear_attempts(directory: Path) -> None:
+    _write_attempts(directory, {})
 
 
 def _next(root: Path, tried: set[tuple[str, str]], live: bool) -> tuple[Meeting, str] | None:
