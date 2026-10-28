@@ -3,18 +3,30 @@ import requests
 
 from worker.summarize import (
     EMPTY_SECTION,
+    EXTRACT_BUDGET,
     HEADINGS,
+    MERGE_BUDGET,
+    NUM_CTX,
+    OUTPUT_RESERVE,
     OllamaError,
     SummaryError,
     chunk_lines,
     ensure_headings,
+    estimate_tokens,
     extract_prompt,
+    extract_window,
     final_prompt,
+    group_notes,
     make_ollama_generate,
+    merge_notes,
     merge_prompt,
+    notes_path,
     parse_transcript,
     split_for_discord,
+    split_to_fit,
     summarize_meeting,
+    windows,
+    with_names,
 )
 
 GOOD_SUMMARY = (
@@ -76,10 +88,12 @@ def test_chunks_start_a_new_piece_once_the_time_window_is_reached():
     assert [[l.seconds for l in chunk] for chunk in chunks] == [[0, 300, 719], [720, 1000], [1440, 1500]]
 
 
-def test_the_window_is_measured_from_the_first_line_of_each_chunk():
-    lines = parse_transcript("\n".join(line(s) for s in [100, 800, 900, 1500, 1520, 1620]))
+def test_windows_are_fixed_by_absolute_time_not_by_the_first_line():
+    # so a window found complete during the call is the same window after it, whatever came before
+    lines = parse_transcript("\n".join(line(s) for s in [100, 800, 900, 1500, 1520, 1620, 4400]))
     chunks = chunk_lines(lines, chunk_minutes=12)
-    assert [[l.seconds for l in chunk] for chunk in chunks] == [[100, 800], [900, 1500, 1520], [1620]]
+    assert [[l.seconds for l in chunk] for chunk in chunks] == [[100], [800, 900], [1500, 1520, 1620], [4400]]
+    assert sorted(windows(lines, chunk_minutes=12)) == [0, 1, 2, 6]  # window k covers [k*12 min, (k+1)*12 min)
 
 
 def test_chunking_never_splits_or_loses_a_line():
@@ -93,7 +107,7 @@ def test_chunking_never_splits_or_loses_a_line():
 # --- prompts ----------------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("prompt", [
-    extract_prompt("[00:00:04] Μαρία: γεια", part=1, total=3),
+    extract_prompt("[00:00:04] Μαρία: γεια", start=0, end=720),
     merge_prompt(["σημειώσεις 1", "σημειώσεις 2"]),
     final_prompt("[00:00:04] Μαρία: γεια"),
 ])
@@ -111,8 +125,10 @@ def test_the_final_prompts_ask_for_the_four_headings_in_order():
 
 
 def test_prompts_contain_their_input():
-    assert "[00:00:04] Μαρία: γεια" in extract_prompt("[00:00:04] Μαρία: γεια", part=2, total=3)
-    assert "μέρος 2 από 3" in extract_prompt("x", part=2, total=3)
+    assert "[00:00:04] Μαρία: γεια" in extract_prompt("[00:00:04] Μαρία: γεια", start=0, end=720)
+    assert "από 00:12:00 έως 00:24:00" in extract_prompt("x", start=720, end=1440)
+    assert "μέρος 2 από 3" in extract_prompt("x", start=720, end=1440, part=2, total=3)
+    assert "μέρος" not in extract_prompt("x", start=720, end=1440)
     merged = merge_prompt(["πρώτες σημειώσεις", "δεύτερες σημειώσεις"])
     assert merged.index("πρώτες σημειώσεις") < merged.index("δεύτερες σημειώσεις")
 
@@ -216,8 +232,8 @@ def test_a_long_meeting_is_extracted_per_chunk_then_merged(tmp_path):
 
     assert summary == GOOD_SUMMARY
     assert len(generate.prompts) == 4
-    assert "Μαρία: α" in generate.prompts[0] and "μέρος 1 από 3" in generate.prompts[0]
-    assert "Μαρία: γ" in generate.prompts[2] and "μέρος 3 από 3" in generate.prompts[2]
+    assert "Μαρία: α" in generate.prompts[0] and "από 00:00:00 έως 00:12:00" in generate.prompts[0]
+    assert "Μαρία: γ" in generate.prompts[2] and "από 00:24:00 έως 00:36:00" in generate.prompts[2]
     assert all(f"σημειώσεις {x}" in generate.prompts[3] for x in "αβγ")
 
 
@@ -256,6 +272,173 @@ def test_a_second_ollama_error_raises_a_clear_error_and_writes_nothing(tmp_path)
 def test_a_missing_transcript_raises_a_clear_error(tmp_path):
     with pytest.raises(SummaryError, match="transcript.txt"):
         summarize_meeting(tmp_path, generate=Recorder())
+
+
+# --- context size -------------------------------------------------------------------------------------------
+
+GREEK = ("Καλησπέρα σε όλους, σήμερα θα συζητήσουμε για το workshop του Νοεμβρίου και τον προϋπολογισμό "
+         "των 300 ευρώ που ζήτησε η σχολή. ")
+
+
+def test_the_token_estimate_is_conservative_for_greek_and_counts_every_digit():
+    words = len(GREEK.split())
+    assert estimate_tokens(GREEK) >= 2.4 * words  # measured on Gemma: about 2.2 tokens per Greek word
+    assert estimate_tokens("123456789012345678") == 18  # Gemma splits numbers into single digits
+    assert estimate_tokens("") == 0
+
+
+def test_the_budgets_leave_room_for_the_prompt_and_the_answer_inside_the_context():
+    assert estimate_tokens(extract_prompt("", start=0, end=720, part=9, total=9)) + EXTRACT_BUDGET \
+        + OUTPUT_RESERVE <= NUM_CTX
+    assert estimate_tokens(final_prompt("")) + EXTRACT_BUDGET + OUTPUT_RESERVE <= NUM_CTX
+    assert estimate_tokens(merge_prompt([""] * 20)) + MERGE_BUDGET + OUTPUT_RESERVE <= NUM_CTX
+
+
+def test_lines_that_fit_stay_one_part():
+    lines = parse_transcript("\n".join(line(s, text=GREEK) for s in range(0, 600, 60)))
+    assert split_to_fit(lines, budget=10_000) == [lines]
+
+
+def test_a_window_too_big_for_the_context_is_split_into_parts_that_fit_without_losing_a_line():
+    lines = parse_transcript("\n".join(line(s, text=GREEK * 3) for s in range(0, 720, 10)))
+    parts = split_to_fit(lines, budget=1000)
+    assert len(parts) > 1
+    assert all(estimate_tokens("\n".join(l.text for l in part)) <= 1000 for part in parts)
+    assert [l for part in parts for l in part] == lines
+
+
+def test_a_single_line_too_big_for_the_context_is_cut_between_words():
+    huge = parse_transcript(line(30, text=GREEK * 60))
+    parts = split_to_fit(huge, budget=500)
+    assert len(parts) > 1
+    assert all(estimate_tokens("\n".join(l.text for l in part)) <= 500 for part in parts)
+    assert " ".join(l.text for part in parts for l in part).split() == huge[0].text.split()
+    assert all(l.seconds == 30 for part in parts for l in part)
+
+
+# --- notes per window -----------------------------------------------------------------------------------------
+
+def test_a_window_is_extracted_once_and_its_notes_kept_on_disk(tmp_path):
+    lines = parse_transcript("\n".join([line(800, text="β"), line(900, text="γ")]))
+    generate = Recorder("σημειώσεις β")
+
+    assert extract_window(tmp_path, 1, lines, generate=generate, chunk_minutes=12) == "σημειώσεις β"
+
+    path = notes_path(tmp_path, 1, chunk_minutes=12)
+    assert path == tmp_path / "notes" / "12min" / "001.md"
+    assert path.read_text(encoding="utf-8") == "σημειώσεις β\n"
+    assert "από 00:12:00 έως 00:24:00" in generate.prompts[0] and "Μαρία: γ" in generate.prompts[0]
+    assert not list(path.parent.glob("*.tmp"))  # written atomically
+
+
+def test_a_window_split_in_parts_gives_one_notes_file(tmp_path):
+    lines = parse_transcript("\n".join(line(s, text=GREEK * 3) for s in range(720, 1440, 10)))
+    generate = Recorder("πρώτο μισό", "δεύτερο μισό", "τρίτο")
+
+    notes = extract_window(tmp_path, 1, lines, generate=generate, chunk_minutes=12, budget=3000)
+
+    assert len(generate.prompts) >= 2 and all(estimate_tokens(p) <= 3000 + 1000 for p in generate.prompts)
+    assert "μέρος 1 από" in generate.prompts[0]
+    assert notes.startswith("πρώτο μισό\n\nδεύτερο μισό")
+    assert notes_path(tmp_path, 1, chunk_minutes=12).read_text(encoding="utf-8") == notes + "\n"
+
+
+def test_a_failed_extraction_writes_no_notes(tmp_path):
+    lines = parse_transcript(line(800))
+    with pytest.raises(SummaryError):
+        extract_window(tmp_path, 1, lines, generate=Recorder(OllamaError("a"), OllamaError("b")), chunk_minutes=12)
+    assert not notes_path(tmp_path, 1, chunk_minutes=12).exists()
+
+
+def test_stored_notes_are_used_and_only_missing_windows_are_extracted(tmp_path):
+    write_transcript(tmp_path, [line(0, text="α"), line(800, text="β"), line(1600, text="γ")])
+    for k, text in [(0, "σημειώσεις α"), (2, "σημειώσεις γ")]:  # made during the call
+        notes_path(tmp_path, k, chunk_minutes=12).parent.mkdir(parents=True, exist_ok=True)
+        notes_path(tmp_path, k, chunk_minutes=12).write_text(text + "\n", encoding="utf-8")
+    generate = Recorder("σημειώσεις β", GOOD_SUMMARY)
+
+    assert summarize_meeting(tmp_path, generate=generate, chunk_minutes=12) == GOOD_SUMMARY
+
+    assert len(generate.prompts) == 2
+    assert "Μαρία: β" in generate.prompts[0] and "Μαρία: α" not in generate.prompts[0]
+    merge = generate.prompts[1]
+    assert merge.index("σημειώσεις α") < merge.index("σημειώσεις β") < merge.index("σημειώσεις γ")
+    assert notes_path(tmp_path, 1, chunk_minutes=12).read_text(encoding="utf-8") == "σημειώσεις β\n"
+
+
+def test_notes_made_with_another_window_size_are_ignored(tmp_path):
+    write_transcript(tmp_path, [line(0, text="α"), line(800, text="β")])
+    stale = tmp_path / "notes" / "20min" / "000.md"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("παλιές σημειώσεις\n", encoding="utf-8")
+    generate = Recorder("σημειώσεις α", "σημειώσεις β", GOOD_SUMMARY)
+
+    summarize_meeting(tmp_path, generate=generate, chunk_minutes=12)
+    assert len(generate.prompts) == 3 and "παλιές" not in generate.prompts[2]
+
+
+def test_speaker_ids_in_notes_made_during_the_call_get_the_names_known_after_it():
+    speakers = {123456789012345678: "Μαρία", 42: "Νίκος"}
+    text = "- Ο Ομιλητής 123456789012345678 ανέλαβε την αφίσα, ο ομιλητή 42 και ο 123456789012345678. 4242"
+    assert with_names(text, speakers) == "- Ο Μαρία ανέλαβε την αφίσα, ο Νίκος και ο Μαρία. 4242"
+
+
+def test_the_merge_pass_sees_names_instead_of_ids(tmp_path):
+    write_transcript(tmp_path, [line(0, text="α"), line(800, text="β")])
+    (tmp_path / "manifest.json").write_text(
+        '{"status": "summarizing", "speakers": {"123456789012345678": "Μαρία"}, "segments": []}', encoding="utf-8")
+    path = notes_path(tmp_path, 0, chunk_minutes=12)
+    path.parent.mkdir(parents=True)
+    path.write_text("- Ομιλητής 123456789012345678: αφίσα\n", encoding="utf-8")
+    generate = Recorder("σημειώσεις β", GOOD_SUMMARY)
+
+    summarize_meeting(tmp_path, generate=generate, chunk_minutes=12)
+    assert "- Μαρία: αφίσα" in generate.prompts[1] and "123456789012345678" not in generate.prompts[1]
+    assert "123456789012345678" in path.read_text(encoding="utf-8")  # the stored notes stay as they were
+
+
+def test_a_single_window_too_big_for_one_call_is_extracted_in_parts_then_merged(tmp_path):
+    write_transcript(tmp_path, [line(s, text=GREEK * 6) for s in range(0, 720, 6)])
+    generate = Recorder()
+
+    summarize_meeting(tmp_path, generate=generate, chunk_minutes=12)
+
+    assert len(generate.prompts) >= 3  # at least two parts and the merge pass
+    assert all(estimate_tokens(p) + OUTPUT_RESERVE <= NUM_CTX for p in generate.prompts)
+
+
+# --- hierarchical merge -----------------------------------------------------------------------------------------
+
+def test_notes_that_fit_are_merged_in_one_call():
+    generate = Recorder("τελική")
+    assert merge_notes(generate, ["α", "β", "γ"]) == "τελική"
+    assert len(generate.prompts) == 1
+
+
+def test_groups_respect_the_budget_keep_the_order_and_always_shrink():
+    notes = [f"σημειώσεις {i} " + GREEK * 4 for i in range(10)]
+    groups = group_notes(notes, budget=1500)
+    assert [n for g in groups for n in g] == notes
+    assert 1 < len(groups) < len(notes)
+    assert all(len(g) == 1 or sum(estimate_tokens(n) for n in g) <= 1500 for g in groups)
+    oversized = [GREEK * 40] * 5  # each alone is over the budget: paired anyway, so the merge still ends
+    assert [len(g) for g in group_notes(oversized, budget=100)] == [2, 2, 1]
+
+
+def test_many_notes_are_merged_in_groups_then_the_groups_are_merged():
+    notes = [f"σημειώσεις {i} " + GREEK * 4 for i in range(15)]  # a three-hour meeting
+    generate = Recorder()
+
+    assert merge_notes(generate, notes, budget=1500) == GOOD_SUMMARY
+
+    first_level = generate.prompts[:-1]
+    assert len(first_level) >= 2
+    for i in range(15):  # every note reaches exactly one first-level merge
+        assert sum(f"σημειώσεις {i} " in p for p in first_level) == 1
+    assert all(estimate_tokens(p) <= 1500 + 1000 for p in generate.prompts)
+    assert all(f"## {h}" in generate.prompts[-1] for h in HEADINGS)  # the last pass merges the group summaries
+    for prompt in generate.prompts:  # every level keeps the merge rules
+        assert "ΜΟΝΟ εργασίες που ανατέθηκαν ρητά" in prompt and "αποφασίστηκε σε επόμενο" in prompt
 
 
 # --- Discord splitting ------------------------------------------------------------------------------------------
