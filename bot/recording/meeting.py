@@ -105,6 +105,12 @@ class Meeting:
             self._data["status"] = status
             self._write()
 
+    def set_error(self, text: str) -> None:
+        """Set by the job before it marks the meeting failed, so the bot can say why."""
+        with self._lock:
+            self._data["error"] = text
+            self._write()
+
     def set_status_message(self, message_id: int, status: str) -> None:
         self._set_posting(status_message_id=message_id, status_shown=status)
 

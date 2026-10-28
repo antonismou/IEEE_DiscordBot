@@ -146,3 +146,12 @@ def test_the_job_s_error_message_is_readable(tmp_path):
     data.update(status="failed", error="Ollama 500")
     (meeting.directory / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
     assert Meeting.load(meeting.directory).error == "Ollama 500"
+
+
+def test_the_job_can_record_why_it_failed(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    meeting.set_error("Ollama 500")
+    meeting.set_status("failed")
+
+    assert manifest(meeting)["error"] == "Ollama 500"
+    assert Meeting.load(meeting.directory).error == "Ollama 500"
