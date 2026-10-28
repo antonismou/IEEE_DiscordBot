@@ -35,48 +35,33 @@ def test_nothing_pending_skips_the_run(tmp_path, statuses):
 RUN = "compose --profile job run --rm -T --name ieee-meeting-worker"
 
 
-def job(tmp_path, *statuses, live_exit=0, extract_exit=0, expect=0):
-    """Runs meeting-job.sh with a fake docker; the --live run exits with `live_exit`, the --extract one with
-    `extract_exit`, as the worker would."""
+def job(tmp_path, *statuses, exit_code=0):
+    """Runs meeting-job.sh with a fake docker that exits with `exit_code`, as the worker would."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = tmp_path / "docker.log"
     docker = bin_dir / "docker"
-    docker.write_text(
-        f'#!/bin/sh\necho "$@" >> {log}\n'
-        f'case "$*" in *--live*) exit {live_exit} ;; *--extract*) exit {extract_exit} ;; esac\n'
-    )
+    docker.write_text(f'#!/bin/sh\necho "$@" >> {log}\nexit {exit_code}\n')
     docker.chmod(0o755)
     root = tmp_path / "meetings"
     root.mkdir()
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
     result = sh("meeting-job.sh", meetings(root, *statuses), env=env)
-    assert result.returncode == expect, result.stderr
+    assert result.returncode == exit_code, result.stderr
     return log.read_text().splitlines()
 
 
-def test_during_a_call_the_job_runs_live_without_starting_ollama(tmp_path):
-    assert job(tmp_path, "done", "recording") == [f"{RUN} --no-deps worker python -m worker.run --live"]
+@pytest.mark.parametrize("statuses", [("recording",), ("done", "recording"), ("recording", "failed", "recording")])
+def test_during_a_call_the_job_runs_live_without_starting_ollama(tmp_path, statuses):
+    assert job(tmp_path, *statuses) == [f"{RUN} --no-deps worker python -m worker.run --live"]
 
 
-def test_a_window_ready_for_notes_gets_a_second_run_with_ollama_after_whisper_has_exited(tmp_path):
-    assert job(tmp_path, "recording", live_exit=3) == [
-        f"{RUN} --no-deps worker python -m worker.run --live",
-        f"{RUN} worker python -m worker.run --extract",  # no --no-deps: compose starts Ollama for this one
-    ]
-
-
-def test_the_extract_runs_result_is_the_jobs_result(tmp_path):
-    assert len(job(tmp_path, "recording", live_exit=3, extract_exit=1, expect=1)) == 2
-
-
-@pytest.mark.parametrize("code", [1, 75])
-def test_a_failed_or_locked_live_run_starts_nothing_else(tmp_path, code):
-    assert job(tmp_path, "recording", live_exit=code, expect=code) == [
-        f"{RUN} --no-deps worker python -m worker.run --live",
-    ]
+@pytest.mark.parametrize("code", [1, 3, 75])
+def test_whatever_the_live_run_returns_nothing_else_is_started(tmp_path, code):
+    # exit 3 once meant "start a notes run with Ollama"; summaries are only made after the call now
+    assert job(tmp_path, "recording", exit_code=code) == [f"{RUN} --no-deps worker python -m worker.run --live"]
 
 
 @pytest.mark.parametrize("statuses", [("queued",), ("transcribing",), ("summarizing",), ("queued", "recording")])
 def test_an_ended_meeting_gets_the_full_job_with_ollama(tmp_path, statuses):
-    assert job(tmp_path, *statuses) == ["compose --profile job run --rm -T --name ieee-meeting-worker worker"]
+    assert job(tmp_path, *statuses) == [f"{RUN} worker"]

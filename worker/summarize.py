@@ -1,11 +1,12 @@
 """Summary stage of the meeting job: transcript.txt in, a Greek summary.md out.
 
-The transcript (lines `[hh:mm:ss] Name: text`) is split into fixed windows of `chunk_minutes` by timestamp: window
-k holds the lines from k*chunk_minutes up to (k+1)*chunk_minutes, so a window means the same lines during the call
-and after it. Each window gets an extraction pass (topics, decisions, tasks, open questions) whose notes are kept in
-`notes/<minutes>min/<k>.md`, so notes made while the call was still going (see worker/notes.py) or before a crash
-are not made again. A merge pass then writes the summary, in groups when the notes are too long for one call. A
-transcript inside one window that fits one call is summarized directly.
+It runs only after the meeting has ended. The transcript (lines `[hh:mm:ss] Name: text`) is split into fixed
+windows of `chunk_minutes` by timestamp: window k holds the lines from k*chunk_minutes up to (k+1)*chunk_minutes, so
+a window means the same lines on every run. Each window gets an extraction pass (topics, decisions, tasks, open
+questions) whose notes are saved in `notes/<minutes>min/<k>.md` as soon as they are made, so a run killed during the
+long summary (or retried after a failure) only extracts the windows still missing. A merge pass then writes the
+summary, in groups when the notes are too long for one call. A transcript inside one window that fits one call is
+summarized directly.
 
 Everything sent to the model must fit its 8192-token context together with the answer, so text is measured with
 `estimate_tokens` and a window too long for one call is extracted in parts. Every model call goes through
@@ -99,7 +100,7 @@ def chunk_lines(lines: list[Line], chunk_minutes: int = DEFAULT_CHUNK_MINUTES) -
 
 def estimate_tokens(text: str) -> int:
     """A deliberately high guess at Gemma's token count: every digit is one token (Gemma splits numbers, and the
-    speaker labels made during the call carry 18-digit Discord ids), everything else 2.5 characters per token."""
+    labels of speakers with no name yet carry 18-digit Discord ids), everything else 2.5 characters per token."""
     digits = sum(c.isdigit() for c in text)
     return digits + math.ceil((len(text) - digits) / CHARS_PER_TOKEN)
 
@@ -156,8 +157,8 @@ FORMAT = (
 
 
 def extract_prompt(chunk_text: str, start: int, end: int, part: int = 1, total: int = 1) -> str:
-    """The notes for the window from `start` to `end` seconds (the meeting's length is not known during the
-    call); `part` of `total` when the window is too long for one call."""
+    """The notes for the window from `start` to `end` seconds; `part` of `total` when the window is too long for
+    one call."""
     piece = f", μέρος {part} από {total}" if total > 1 else ""
     return (
         f"Παρακάτω είναι ένα τμήμα της απομαγνητοφώνησης μιας συνάντησης, από {_clock(start)} έως {_clock(end)}"
@@ -336,7 +337,8 @@ def _speakers(directory: Path) -> dict[int, str]:
 
 
 def with_names(text: str, speakers: dict[int, str]) -> str:
-    """Names are only known after /record stop, so notes made during the call call people «Ομιλητής <id>»."""
+    """Notes saved before a speaker's name was known (a meeting named after a bot restart, notes kept from an
+    earlier run) call people «Ομιλητής <id>»; the merge pass gets the names from the manifest instead."""
     for user_id, name in speakers.items():
         text = re.sub(rf"ομιλητ\w*\s+{user_id}(?!\d)", name, text, flags=re.IGNORECASE)
         if len(str(user_id)) >= 15:  # a bare Discord id (17-20 digits) cannot be an amount or a date

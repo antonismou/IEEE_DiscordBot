@@ -9,10 +9,9 @@ from types import SimpleNamespace
 import pytest
 
 from bot.recording.meeting import Meeting, recover_interrupted
-from worker import notes as notes_stage
 from worker.summarize import summarize_meeting
 from worker.transcribe import transcribe_meeting
-from worker.run import (DEFAULT_MEETINGS_DIR, LOCK_BUSY, LOCK_FILE, NEEDS_OLLAMA, Config, WorkerError, main, process,
+from worker.run import (DEFAULT_MEETINGS_DIR, LOCK_BUSY, LOCK_FILE, Config, WorkerError, main, process,
                         run, wait_for_ollama)
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
@@ -43,28 +42,11 @@ def status_of(meeting):
 class Fakes:
     """Fake stages that write what the real ones would and record the order of events."""
 
-    def __init__(self, fail_segments=(), summary_error=None, ready=(), extract_error=None):
+    def __init__(self, fail_segments=(), summary_error=None):
         self.events = []
         self.fail_segments = set(fail_segments)  # files that never get a transcript
         self.summary_error = summary_error
         self.model = None
-        self.windows = list(ready)  # windows complete during the call that have no notes yet
-        self.extract_error = extract_error
-        self.freed_at_wait = []
-        self.ready_checks = 0
-
-    def whisper_freed(self):
-        return self.model is None or self.model() is None
-
-    def ready(self, directory):
-        self.ready_checks += 1
-        return list(self.windows)
-
-    def extract(self, directory, k):
-        self.events.append(("extract", Meeting.load(directory).id, k, self.whisper_freed()))
-        if self.extract_error:
-            raise self.extract_error
-        self.windows.remove(k)
 
     def transcribe(self, directory):
         meeting = Meeting.load(directory)
@@ -82,7 +64,6 @@ class Fakes:
 
     def wait(self):
         self.events.append(("wait",))
-        self.freed_at_wait.append(self.whisper_freed())
 
     def summarize(self, directory):
         meeting = Meeting.load(directory)
@@ -93,9 +74,9 @@ class Fakes:
         (directory / "summary.md").write_text(SUMMARY, encoding="utf-8")
         return SUMMARY
 
-    def run(self, root, live=False, extract=False):
-        return run(Config(meetings_dir=root, live=live, extract=extract), transcribe=self.transcribe,
-                   summarize=self.summarize, wait=self.wait, ready=self.ready, extract=self.extract)
+    def run(self, root, live=False):
+        return run(Config(meetings_dir=root, live=live), transcribe=self.transcribe, summarize=self.summarize,
+                   wait=self.wait)
 
 
 class Model:
@@ -322,7 +303,7 @@ def test_a_recording_meeting_with_nothing_new_does_not_load_whisper(tmp_path):
     transcribe = partial(transcribe_meeting, model_factory=factory)
 
     assert run(Config(meetings_dir=tmp_path, live=True), transcribe=transcribe, summarize=Fakes().summarize,
-               wait=Fakes().wait, ready=Fakes().ready) == 0
+               wait=Fakes().wait) == 0
     assert loads == [] and manifest_bytes(meeting) == before
 
 
@@ -410,147 +391,98 @@ def test_a_meeting_that_keeps_recording_gets_one_pass_per_run(tmp_path):
     assert fakes.run(tmp_path, live=True) == 0 and len(fakes.events) == 2
 
 
-# --- notes during the call ------------------------------------------------------------------------------------
-
-def test_a_run_with_ollama_makes_the_notes_of_complete_windows_after_freeing_whisper(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status="recording")
-    before = manifest_bytes(meeting)
-    fakes = Fakes(ready=[0, 1])
-    gc.disable()  # so only the worker's own collection can free the model
-    try:
-        assert fakes.run(tmp_path) == 0
-    finally:
-        gc.enable()
-
-    assert fakes.events == [
-        ("transcribe", meeting.id, "recording"), ("wait",),
-        ("extract", meeting.id, 0, True), ("extract", meeting.id, 1, True),
-    ]
-    assert fakes.freed_at_wait == [True]  # Whisper is gone before Ollama is even asked for
-    assert manifest_bytes(meeting) == before and fakes.windows == []
-
-
-def test_an_idle_tick_never_waits_for_or_calls_ollama(tmp_path):
-    meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
-    for live, extract in [(False, False), (True, False), (False, True)]:
-        fakes = Fakes()
-        assert fakes.run(tmp_path, live=live, extract=extract) == 0
-        assert [e[0] for e in fakes.events if e[0] in ("wait", "extract")] == []
-        assert fakes.ready_checks == 1
-
-
-def test_the_live_mode_reports_complete_windows_with_an_exit_code_and_never_extracts(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
-    before = manifest_bytes(meeting)
-    fakes = Fakes(ready=[0])
-
-    assert fakes.run(tmp_path, live=True) == NEEDS_OLLAMA
-
-    assert fakes.events == [("transcribe", meeting.id, "recording")]  # the next container brings Ollama
-    assert manifest_bytes(meeting) == before
-
-
-def test_the_extract_mode_makes_notes_without_loading_whisper_and_leaves_ended_meetings(tmp_path):
-    queued = meeting_with(tmp_path, [(7, 1, 0.0)], status="queued", minute=10)
-    recording = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording", minute=50)
-    fakes = Fakes(ready=[3])
-
-    assert fakes.run(tmp_path, extract=True) == 0
-
-    assert fakes.events == [("wait",), ("extract", recording.id, 3, True)]
-    assert status_of(queued) == "queued" and status_of(recording) == "recording"
-
-
-def test_a_failed_extraction_during_the_call_leaves_the_meeting_recording_and_the_window_for_later(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
-    before = manifest_bytes(meeting)
-    fakes = Fakes(ready=[0, 1], extract_error=RuntimeError("summary model failed twice on minutes 0-12"))
-
-    assert fakes.run(tmp_path, extract=True) == 1  # visible in the unit's state, retried on the next tick
-
-    assert [e[:3] for e in fakes.events if e[0] == "extract"] == [("extract", meeting.id, 0)]  # stops there
-    assert manifest_bytes(meeting) == before and Meeting.load(meeting.directory).error is None
-    assert fakes.windows == [0, 1]
-
-
-def test_notes_stop_when_the_meeting_is_stopped_meanwhile(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
-    fakes = Fakes(ready=[0, 1])
-    first = fakes.extract
-
-    def stopped_meanwhile(directory, k):
-        first(directory, k)
-        Meeting.load(directory).set_status("queued")  # /record stop while Gemma was busy
-    fakes.extract = stopped_meanwhile
-
-    assert fakes.run(tmp_path, extract=True) == 0
-    assert [e[:3] for e in fakes.events if e[0] == "extract"] == [("extract", meeting.id, 0)]
-    assert status_of(meeting) == "queued"  # the next tick's full job makes the rest
-
+# --- Ollama only after the call --------------------------------------------------------------------------------
 
 class Gemma:
-    """A fake Ollama generate that names the window it was asked about."""
+    """A fake Ollama generate that names the window it was asked about, and can be killed mid-summary."""
 
-    def __init__(self):
+    def __init__(self, die_on=None):
         self.prompts = []
+        self.die_on = die_on  # the extraction prompt (1-based) during which the job is killed
 
     def __call__(self, prompt):
-        self.prompts.append(prompt)
         if prompt.startswith("Παρακάτω είναι ένα τμήμα"):
+            if self.die_on == sum(p.startswith("Παρακάτω είναι ένα τμήμα") for p in self.prompts) + 1:
+                raise KeyboardInterrupt  # the container is killed: nothing marks the meeting failed
+            self.prompts.append(prompt)
             return f"σημειώσεις {prompt.split('από ')[1].split(' ')[0]}"
+        self.prompts.append(prompt)
         return "## Θέματα\n- όλα\n"
 
 
-def real_run(root, gemma, now, live=False, extract=False):
-    config = Config(meetings_dir=root, live=live, extract=extract)
-    fakes = Fakes()
-    return run(config, transcribe=fakes.transcribe, wait=lambda: None,
-               ready=partial(notes_stage.pending_windows, chunk_minutes=12, now=now),
-               extract=partial(notes_stage.extract, chunk_minutes=12, generate=gemma),
+def extractions(gemma):
+    return [p for p in gemma.prompts if p.startswith("Παρακάτω είναι ένα τμήμα")]
+
+
+def real_run(root, gemma, live=False, wait=lambda: None):
+    return run(Config(meetings_dir=root, live=live), transcribe=Fakes().transcribe, wait=wait,
                summarize=partial(summarize_meeting, generate=gemma, chunk_minutes=12))
 
 
+@pytest.mark.parametrize("live", [False, True])
+def test_a_recording_meeting_never_gets_ollama_or_a_summary_however_long_it_runs(tmp_path, live):
+    # days after it started by the clock, with speech in three windows, all of it already transcribed
+    meeting = meeting_with(tmp_path, [(7, 1, 5.0), (7, 2, 800.0), (7, 3, 1800.0)], status="recording",
+                           transcribed={(7, 1), (7, 2), (7, 3)})
+    before = manifest_bytes(meeting)
+    gemma = Gemma()
+
+    def no_ollama():
+        raise AssertionError("Ollama must not be asked for during the call")
+
+    for _ in range(3):
+        assert real_run(tmp_path, gemma, live=live, wait=no_ollama) == 0
+    assert gemma.prompts == []
+    assert not (meeting.directory / "notes").exists() and not (meeting.directory / "summary.md").exists()
+    assert manifest_bytes(meeting) == before
+
+
 @pytest.mark.parametrize("ended_by", ["stop", "bot restart"])
-def test_after_the_call_the_summary_uses_the_notes_made_during_it_and_extracts_only_the_rest(tmp_path, ended_by):
+def test_after_the_call_every_window_is_extracted_then_merged_in_order(tmp_path, ended_by):
     # segments at 0:00, 0:13 and 0:30: windows 0, 1 and 2 of 12 minutes; window 2 is the last, partial one
     meeting = meeting_with(tmp_path, [(7, 1, 5.0), (7, 2, 800.0), (7, 3, 1800.0)], status="recording", minute=0)
     gemma = Gemma()
-    started = NOW.replace(minute=0)
-
-    # 17 minutes in nothing is complete; window 0 is from 12 + 5 + 1 minutes on, window 1 only from 30.
-    assert real_run(tmp_path, gemma, now=started + timedelta(minutes=17), live=True) == 0
-    assert real_run(tmp_path, gemma, now=started + timedelta(minutes=25), live=True) == NEEDS_OLLAMA
-    assert real_run(tmp_path, gemma, now=started + timedelta(minutes=25), extract=True) == 0
-    assert gemma.prompts == [gemma.prompts[0]] and "από 00:00:00 έως 00:12:00" in gemma.prompts[0]
-    assert real_run(tmp_path, gemma, now=started + timedelta(minutes=26), live=True) == 0  # nothing new
-    assert len(gemma.prompts) == 1
+    assert real_run(tmp_path, gemma, live=True) == 0 and gemma.prompts == []  # transcription only
 
     if ended_by == "stop":
         Meeting.load(meeting.directory).set_status("queued")
     else:
         recover_interrupted(tmp_path)  # the bot restarted: the meeting is queued with what it has
-    assert real_run(tmp_path, gemma, now=started + timedelta(minutes=32)) == 0
+    assert real_run(tmp_path, gemma) == 0
 
-    extracted = [p for p in gemma.prompts[1:] if p.startswith("Παρακάτω είναι ένα τμήμα")]
-    assert len(extracted) == 2  # window 0 was not made again
-    assert "έως 00:24:00" in extracted[0] and "έως 00:36:00" in extracted[1]
+    assert [p.split("έως ")[1][:8] for p in extractions(gemma)] == ["00:12:00", "00:24:00", "00:36:00"]
     merge = gemma.prompts[-1]
     assert merge.index("σημειώσεις 00:00:00") < merge.index("σημειώσεις 00:12:00") \
         < merge.index("σημειώσεις 00:24:00")
+    assert sorted(p.name for p in (meeting.directory / "notes" / "12min").iterdir()) == ["000.md", "001.md", "002.md"]
     assert status_of(meeting) == "done" and (meeting.directory / "summary.md").exists()
+
+
+def test_a_job_killed_during_the_summary_resumes_with_only_the_missing_windows(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 5.0), (7, 2, 800.0), (7, 3, 1800.0)], minute=0)
+    killed = Gemma(die_on=2)
+
+    with pytest.raises(KeyboardInterrupt):
+        real_run(tmp_path, killed)
+    assert status_of(meeting) == "summarizing"  # left as it was, for the next tick
+    assert [p.name for p in (meeting.directory / "notes" / "12min").iterdir()] == ["000.md"]
+
+    gemma = Gemma()
+    assert real_run(tmp_path, gemma) == 0
+    assert [p.split("έως ")[1][:8] for p in extractions(gemma)] == ["00:24:00", "00:36:00"]  # window 0 kept
+    assert "σημειώσεις 00:00:00" in gemma.prompts[-1] and status_of(meeting) == "done"
 
 
 def test_main_live_flag_selects_the_live_mode():
     used = []
     assert main(["--live"], env={}, runner=lambda config: used.append(config) or 0) == 0
     main([], env={}, runner=lambda config: used.append(config) or 0)
-    main(["--extract"], env={}, runner=lambda config: used.append(config) or 0)
-    assert [(config.live, config.extract) for config in used] == [(True, False), (False, False), (False, True)]
+    assert [config.live for config in used] == [True, False]
 
 
-def test_live_and_extract_cannot_be_combined():
+def test_there_is_no_notes_mode_during_the_call():
     with pytest.raises(SystemExit):
-        main(["--live", "--extract"], env={}, runner=lambda config: 0)
+        main(["--extract"], env={}, runner=lambda config: 0)
 
 
 def test_process_handles_one_meeting(tmp_path):

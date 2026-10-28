@@ -1,26 +1,19 @@
-"""The processing job: `python -m worker.run [--live | --extract] [--meetings-dir DIR]`, started by the host's timer.
+"""The processing job: `python -m worker.run [--live] [--meetings-dir DIR]`, started by the host's timer.
 
 It loops until no meeting needs work, oldest first: `queued`, or `transcribing`/`summarizing` left by a crash. Each
 meeting is transcribed (Whisper), its transcript checked and written, then summarized (Ollama over HTTP), and only
 then marked `done`, so the bot finds transcript.txt and summary.md when it sees the status. A failure marks that
-meeting `failed` with an `error` in the manifest and the job moves on. The summary reuses the window notes already
-on disk and only extracts the missing windows (see worker/summarize.py).
+meeting `failed` with an `error` in the manifest and the job moves on. The summary saves its window notes as it goes
+and reuses them, so a job killed during the summary only extracts the missing windows next time (worker/summarize.py).
 
-A meeting still `recording` gets one live pass per run: the segments the bot has closed so far are transcribed,
-Whisper is freed, and then the windows that are complete (worker/notes.py) get their notes from Ollama. The bot owns
-the manifest during the call (it rewrites it from memory on every segment), so a live pass never writes it, never
-summarizes and never fails the meeting; whatever is left is retried next run or after the call. Whisper and Gemma
-are never loaded together, and Ollama is only asked for when a window is waiting for its notes.
-
-Modes, so that the host starts Ollama only when it is needed (deploy/meeting-job.sh):
-- default: everything above; Ollama runs (the compose `worker` depends on it).
-- `--live`: live passes only, transcription only, no Ollama. Exits 3 when a window is ready for its notes, so the
-  script starts an `--extract` run, with Ollama, right after this process (and Whisper with it) is gone.
-- `--extract`: live passes only, notes only, no Whisper.
-Both leave ended meetings for a default run.
+A meeting still `recording` gets one live pass per run: the segments the bot has closed so far are transcribed and
+nothing else happens. The bot owns the manifest during the call (it rewrites it from memory on every segment), so
+a live pass never writes it, never summarizes and never fails the meeting; whatever is left is retried next run.
+Ollama is never asked for during the call: summarizing starts only after the meeting has ended.
+With `--live` the job does only live passes and leaves ended meetings alone, because Ollama is not running then.
 
 Exit codes: 0 when everything finished or there was nothing to do, 1 when a meeting (or a live pass) failed, 2 for
-bad configuration, 3 (`--live` only) when notes are waiting for Ollama, 75 when another worker holds the lock.
+bad configuration, 75 when another worker holds the lock.
 """
 from __future__ import annotations
 
@@ -39,7 +32,6 @@ from typing import Callable, Mapping
 import requests
 
 from bot.recording.meeting import SUMMARY, TRANSCRIPT, Meeting, all_meetings
-from worker import notes as notes_stage
 from worker import summarize as summary_stage
 from worker import transcribe as transcribe_stage
 
@@ -47,15 +39,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_MEETINGS_DIR = "/app/data/meetings"
 WORK = ("queued", "transcribing", "summarizing")  # the full pipeline; done and failed are left alone
-LIVE = "recording"  # transcription and window notes only, while the call goes on
+LIVE = "recording"  # transcription only, while the call goes on
 LOCK_FILE = ".worker.lock"
 LOCK_BUSY = 75  # EX_TEMPFAIL: another worker is running and will pick up whatever is queued
-NEEDS_OLLAMA = 3  # --live found windows waiting for their notes; deploy/meeting-job.sh then runs --extract
 OLLAMA_WAIT = 120  # seconds; the ollama container starts with the job
 
 Stage = Callable[[Path], object]
-Ready = Callable[[Path], list]  # the windows of a recording meeting that are complete and have no notes yet
-Extract = Callable[[Path, int], object]  # makes and saves the notes of one window
 
 
 class WorkerError(Exception):
@@ -71,7 +60,6 @@ class Config:
     ollama_model: str = summary_stage.DEFAULT_MODEL
     chunk_minutes: int = summary_stage.DEFAULT_CHUNK_MINUTES
     live: bool = False  # only transcribe meetings still recording (set by --live, when Ollama is not started)
-    extract: bool = False  # only make window notes of meetings still recording (set by --extract, no Whisper)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> Config:
@@ -150,52 +138,22 @@ def process(directory: Path, transcribe: Stage, summarize: Stage, wait: Callable
         return False
 
 
-def live_pass(directory: Path, transcribe: Stage | None, ready: Ready, extract: Extract | None,
-              wait: Callable[[], None]) -> tuple[bool, bool]:
-    """Transcribe the segments a recording meeting has so far, then make the notes of its complete windows.
-
-    Returns (ok, needs_ollama): ok is False if a step raised; needs_ollama is True when windows are waiting but this
-    run has no Ollama (`extract` is None). With `transcribe` None (the --extract run) Whisper is never loaded.
+def live_pass(directory: Path, transcribe: Stage) -> bool:
+    """Transcribe the segments a recording meeting has so far. Returns False if the pass raised.
 
     Only closed segments are in the manifest (the bot adds each one after its WAV is complete), so all are safe to
     read. transcribe_meeting leaves the manifest alone while the status is `recording`; nothing here writes it
     either, since the bot's next save would overwrite it, or a write here could drop a segment the bot just added.
-    Notes go to their own files. A failed extraction is only logged: its window has no notes file, so the next run,
-    or the summary after the call, makes it again.
     """
-    name = Path(directory).name
-    ok = True
-    if transcribe is not None:
-        try:
-            done = transcribe(directory)
-            log.info("meeting %s: %s new segment(s) transcribed during the call", name, done)
-        except Exception:
-            log.exception("meeting %s: live transcription failed, retrying next run", name)
-            ok = False
-        finally:
-            gc.collect()  # the Whisper model is dropped with the call; free it before Gemma needs the memory
     try:
-        todo = ready(directory)
+        done = transcribe(directory)
+        log.info("meeting %s: %s new segment(s) transcribed during the call", Path(directory).name, done)
+        return True
     except Exception:
-        log.exception("meeting %s: could not check which windows are complete", name)
-        return False, False
-    if not todo:
-        return ok, False  # an idle tick: Ollama is neither started nor asked
-    if extract is None:
-        log.info("meeting %s: window(s) %s ready for notes, Ollama is needed", name, todo)
-        return ok, True
-    try:
-        wait()
-        for k in todo:
-            if Meeting.load(directory).status != LIVE:
-                log.info("meeting %s was stopped, the run after the call makes the remaining notes", name)
-                break
-            extract(directory, k)
-            log.info("meeting %s: notes for window %d made during the call", name, k)
-    except Exception:
-        log.exception("meeting %s: notes during the call failed, retrying next run or after the call", name)
-        return False, False
-    return ok, False
+        log.exception("meeting %s: live transcription failed, retrying next run", Path(directory).name)
+        return False
+    finally:
+        gc.collect()
 
 
 def _transcribe(directory: Path, transcribe: Stage) -> None:
@@ -222,19 +180,13 @@ def _missing(directory: Path) -> list[str]:
 # --- the job ------------------------------------------------------------------------------------------------------
 
 def run(config: Config, transcribe: Stage | None = None, summarize: Stage | None = None,
-        wait: Callable[[], None] | None = None, ready: Ready | None = None, extract: Extract | None = None) -> int:
+        wait: Callable[[], None] | None = None) -> int:
     root = Path(config.meetings_dir)
     transcribe = transcribe or partial(transcribe_stage.transcribe_meeting, model_name=config.whisper_model,
                                        threads=config.whisper_threads)
     summarize = summarize or partial(summary_stage.summarize_meeting, chunk_minutes=config.chunk_minutes,
                                      model=config.ollama_model, base_url=config.ollama_url)
     wait = wait or partial(wait_for_ollama, config.ollama_url)
-    ready = ready or partial(notes_stage.pending_windows, chunk_minutes=config.chunk_minutes)
-    extract = extract or partial(
-        notes_stage.extract, chunk_minutes=config.chunk_minutes,
-        generate=summary_stage.make_ollama_generate(model=config.ollama_model, base_url=config.ollama_url))
-    live_transcribe = None if config.extract else transcribe
-    live_extract = None if config.live else extract
 
     root.mkdir(parents=True, exist_ok=True)
     with open(root / LOCK_FILE, "a") as lock:
@@ -244,29 +196,25 @@ def run(config: Config, transcribe: Stage | None = None, summarize: Stage | None
             log.warning("another worker holds %s, not starting", root / LOCK_FILE)
             return LOCK_BUSY
         failed = 0
-        needs_ollama = False
         tried: set[tuple[str, str]] = set()
-        while (found := _next(root, tried, config.live or config.extract)) is not None:
+        while (found := _next(root, tried, config.live)) is not None:
             meeting, kind = found
             tried.add((meeting.id, kind))
             log.info("processing meeting %s (%s)", meeting.id, meeting.status)
             if kind == "live":
-                ok, needs = live_pass(meeting.directory, live_transcribe, ready, live_extract, wait)
-                needs_ollama = needs_ollama or needs
+                ok = live_pass(meeting.directory, transcribe)
             else:
                 ok = process(meeting.directory, transcribe, summarize, wait)
             if not ok:
                 failed += 1
-        # Notes waiting win over a failed live transcription: that is logged, and retried on every tick anyway.
-        return NEEDS_OLLAMA if needs_ollama else 1 if failed else 0
+        return 1 if failed else 0
 
 
 def _next(root: Path, tried: set[tuple[str, str]], live: bool) -> tuple[Meeting, str] | None:
     """Looked up again after each meeting, so one queued meanwhile is not missed. Ids are start times.
 
     Each meeting gets at most one live pass and one full run per job, so a call that goes on does not keep the job
-    looping. A meeting stopped during its live pass is finished by the same job, or, with `live` (--live or
-    --extract), by the next one.
+    looping. A meeting stopped during its live pass is finished by the same job, or, with `live`, by the next one.
     """
     for meeting in all_meetings(root):
         if meeting.status == LIVE:
@@ -284,12 +232,8 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
          runner: Callable[[Config], int] = run) -> int:
     parser = argparse.ArgumentParser(prog="python -m worker.run", description=__doc__.splitlines()[0])
     parser.add_argument("--meetings-dir", help=f"default: $MEETINGS_DIR or {DEFAULT_MEETINGS_DIR}")
-    mode = parser.add_mutually_exclusive_group()
-    mode.add_argument("--live", action="store_true",
-                      help="only transcribe meetings still recording (Ollama is not running); exit 3 when window "
-                           "notes are waiting for Ollama")
-    mode.add_argument("--extract", action="store_true",
-                      help="only make the notes of complete windows of meetings still recording (no Whisper)")
+    parser.add_argument("--live", action="store_true",
+                        help="only transcribe meetings still recording; never summarize (Ollama is not running)")
     args = parser.parse_args(argv)
     try:
         config = Config.from_env(os.environ if env is None else env)
@@ -298,8 +242,8 @@ def main(argv: list[str] | None = None, env: Mapping[str, str] | None = None,
         return 2
     if args.meetings_dir:
         config = replace(config, meetings_dir=args.meetings_dir)
-    if args.live or args.extract:
-        config = replace(config, live=args.live, extract=args.extract)
+    if args.live:
+        config = replace(config, live=True)
     return runner(config)
 
 

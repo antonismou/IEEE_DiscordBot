@@ -1,7 +1,6 @@
 # One processing run of the meeting job. Started every 2 minutes by ieee-meeting-worker.timer; when no meeting is
-# pending, ExecCondition skips it before any container starts. During a call the run transcribes the finished
-# segments (no Ollama) and, only when a summary window is complete, makes its notes in a second container with
-# Ollama; once the meeting has ended it transcribes the rest and summarizes (see meeting-job.sh).
+# pending, ExecCondition skips it before any container starts. During a call the run only transcribes the finished
+# segments (no Ollama); once the meeting has ended it transcribes the rest and summarizes (see meeting-job.sh).
 # Adjust the /home/docker/IEEE_DiscordBot paths to the folder that holds docker-compose.yml.
 [Unit]
 Description=IEEE bot meeting processing job (Whisper + Ollama, one shot)
@@ -21,9 +20,8 @@ ExecStart=/bin/sh /home/docker/IEEE_DiscordBot/deploy/meeting-job.sh /home/docke
 # (stopped, not removed, so `docker compose logs ollama` still works until the next run).
 ExecStopPost=-/usr/bin/docker rm -f ieee-meeting-worker
 ExecStopPost=-/usr/bin/docker compose --profile job stop ollama
-# (a no-op after a live run during a call that had no notes to make, which never starts Ollama)
-# A 1-hour meeting takes up to about 1-1.5 hours after it ends, and a run during a call can take 10-30 minutes when
-# it makes notes; give it plenty but not forever.
+# (a no-op after a live run during a call, which never starts Ollama)
+# A 1-hour meeting takes about 1 hour 5 minutes to process after it ends; give it plenty but not forever.
 TimeoutStartSec=8h
 TimeoutStopSec=2min
 # These apply to the docker client only; the containers get nice 19 / idle I/O from their own entrypoints.
