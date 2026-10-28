@@ -1,8 +1,4 @@
-"""REVIEW reproductions (adversarial review of the meeting recorder, 2026-10-28).
-
-Every test here FAILS on the current code, for the reason in its docstring. They are bug reports, not specs of the
-fix: a fix may change the assertions as long as the failure scenario is handled.
-"""
+"""Recovery after a bot kill: audio left open is not kept forever, and one broken manifest does not stop the rest."""
 from datetime import datetime
 from pathlib import Path
 
@@ -14,7 +10,7 @@ from worker.transcribe import transcribe_meeting
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
 
-def test_review_audio_of_a_segment_open_when_the_bot_died_is_never_deleted(tmp_path):
+def test_audio_of_a_segment_open_when_the_bot_died_is_recovered_or_deleted(tmp_path):
     """MEDIUM (privacy + lost speech). A segment is added to the manifest only when it is closed. If the bot is
     killed mid-call, every speaker's open WAV stays on disk, is not in the manifest, so the worker never
     transcribes or deletes it: raw audio is kept forever, against "audio is deleted after transcription"."""
@@ -34,7 +30,7 @@ def test_review_audio_of_a_segment_open_when_the_bot_died_is_never_deleted(tmp_p
     assert left == []
 
 
-def test_review_one_unreadable_manifest_stops_every_other_meeting(tmp_path):
+def test_one_unreadable_manifest_does_not_stop_the_other_meetings(tmp_path):
     """MEDIUM. all_meetings() does json.loads on every manifest with no error handling. One bad manifest (a hand
     edit per deploy/README.md's "set its status back to queued", a disk-full truncation) makes find_busy (so
     /record start), the bot's startup recovery in cog_load (so the whole recorder cog fails to load), the poster

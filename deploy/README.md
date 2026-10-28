@@ -175,7 +175,9 @@ cannot tell your container is still using Ollama. If a run was killed hard (Olla
 
 To reprocess a meeting: stop the timer as above, set `"status"` in `data/meetings/<id>/manifest.json` back to
 `queued`, and handle the bot's posted marker as described in the bot section of the [main README](../README.md) so
-the new summary is posted; then start the timer again. Segments that already have a `.txt` are not transcribed again
+the new summary is posted (the bot posts the result again once it sees the meeting processing again, or finished with a
+different result); then start the timer again. A meeting the worker marked `failed` has had its leftover audio deleted, so
+requeueing it only redoes what is missing, usually the summary from the saved texts, not the transcription. Segments that already have a `.txt` are not transcribed again
 and windows that have a notes file are not extracted again; to make the summary from scratch, delete the meeting's
 `notes/` folder as well. The check reads the manifest with `grep`, so keep `"status": "<value>"` a plain JSON string
 (any spacing and indentation is fine).
