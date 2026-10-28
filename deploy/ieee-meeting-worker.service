@@ -14,13 +14,14 @@ WorkingDirectory=/home/docker/IEEE_DiscordBot
 # Exit 1 = nothing pending: the run is skipped and the unit is not marked failed.
 ExecCondition=/bin/sh /home/docker/IEEE_DiscordBot/deploy/meeting-pending.sh /home/docker/IEEE_DiscordBot/data/meetings
 # The fixed container name also makes a second run (for example a manual one) fail fast instead of overlapping;
-# the worker additionally holds a flock in the meetings folder.
+# the worker additionally holds a flock in the meetings folder. The script stops Ollama itself after a full run.
 ExecStart=/bin/sh /home/docker/IEEE_DiscordBot/deploy/meeting-job.sh /home/docker/IEEE_DiscordBot/data/meetings
-# Always clean up, even after a failure or a timeout: remove the job container if it is still there and stop Ollama
-# (stopped, not removed, so `docker compose logs ollama` still works until the next run).
-ExecStopPost=-/usr/bin/docker rm -f ieee-meeting-worker
-ExecStopPost=-/usr/bin/docker compose --profile job stop ollama
-# (a no-op after a live run during a call, which never starts Ollama)
+# 75: another worker was busy; the queued meeting is left to it, which is not a failure.
+SuccessExitStatus=75
+# No ExecStopPost: systemd runs ExecStopPost after an ExecCondition skip too, which would cost docker commands on
+# every idle tick. On a stop or a timeout only the script gets SIGTERM; it removes the job container and stops
+# Ollama itself (its children get SIGKILL only if it has not finished within TimeoutStopSec).
+KillMode=mixed
 # A 1-hour meeting takes about 1 hour 5 minutes to process after it ends; give it plenty but not forever.
 TimeoutStartSec=8h
 TimeoutStopSec=2min

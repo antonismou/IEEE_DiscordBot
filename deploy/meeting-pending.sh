@@ -7,5 +7,7 @@
 # meeting-job.sh reuses this with PENDING_STATUSES to decide whether the run needs Ollama.
 dir="${1:?usage: meeting-pending.sh MEETINGS_DIR}"
 statuses="${PENDING_STATUSES:-recording|queued|transcribing|summarizing}"
-# manifest.json is written by json.dumps(indent=2), so the status is on its own line as "status": "<value>".
-exec grep -lqsE "^  \"status\": \"($statuses)\"" "$dir"/*/manifest.json
+# Matches a "status" key with any spacing around the colon, so indented and compact JSON both work. The top-level
+# status is the only "status" key in a manifest (segments and speakers have none; tests/test_deploy_scripts.py
+# checks this), and a quote inside a string value is escaped (\"status\"), which the [^\] guard skips.
+exec grep -lqsE '(^|[^\])"status"[[:space:]]*:[[:space:]]*"('"$statuses"')"' "$dir"/*/manifest.json
