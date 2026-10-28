@@ -2,7 +2,7 @@ services:
   bot:
     build: .
     restart: unless-stopped
-    logging:
+    logging: &logging
       driver: json-file
       options:
         max-size: "10m"
@@ -14,6 +14,71 @@ services:
     volumes:
       - ./config.toml:/app/config.toml:ro
       - bot-data:/app/data   # a Docker-managed volume: no folder or owner to set up
+      # Meeting recordings, transcripts and summaries live in a host folder instead, so the processing job can share
+      # them and the host can check for queued meetings. Create it once, owned by uid 1000 (see deploy/README.md).
+      - ${MEETINGS_HOST_DIR:-./data/meetings}:/app/data/meetings
+
+  # The meeting processing job. Profile-gated: `docker compose up` never starts it; the systemd timer in deploy/
+  # runs it with `docker compose --profile job run --rm worker` and it exits when there is nothing left to do.
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    profiles: ["job"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    logging: *logging
+    environment:
+      TZ: Europe/Athens
+      MEETINGS_DIR: /app/data/meetings
+      WHISPER_MODEL: large-v3-turbo
+      WHISPER_THREADS: "8"
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: gemma3:12b
+      CHUNK_MINUTES: "12"
+    volumes:
+      - ${MEETINGS_HOST_DIR:-./data/meetings}:/app/data/meetings
+      - whisper-models:/home/worker/.cache/huggingface   # downloaded once (about 1.6 GB)
+    # Other services come first: a CPU ceiling below the 8 threads, a low weight when the CPU is contended (the
+    # image also runs the job under nice 19 and idle I/O), and a memory ceiling with no swap so a runaway job is
+    # killed instead of pushing the rest of the server into swap. Whisper turbo int8 needs about 3-4 GB.
+    cpus: 6
+    cpu_shares: 128
+    mem_limit: 6g
+    memswap_limit: 6g
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+
+  # The summary model server. Profile-gated and started only as the worker's dependency; the systemd unit stops it
+  # again when the job ends. OLLAMA_KEEP_ALIVE=0 unloads the model right after each request. No port is published:
+  # only the worker reaches it, over the compose network.
+  ollama:
+    image: ollama/ollama:latest
+    profiles: ["job"]
+    logging: *logging
+    environment:
+      OLLAMA_KEEP_ALIVE: "0"
+      OLLAMA_NUM_PARALLEL: "1"
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - ollama-models:/root/.ollama   # gemma3:12b, about 8 GB, pulled once by hand (see deploy/README.md)
+    entrypoint: ["nice", "-n", "19", "ionice", "-c", "3", "/bin/ollama"]
+    command: ["serve"]
+    healthcheck:
+      test: ["CMD", "/bin/ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+    cpus: 6
+    cpu_shares: 128
+    mem_limit: 12g
+    memswap_limit: 12g
 
 volumes:
   bot-data:
+  whisper-models:
+  ollama-models:
