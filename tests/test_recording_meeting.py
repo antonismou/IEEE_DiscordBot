@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from bot.recording.meeting import Meeting, find_busy, latest, recover_interrupted
+from bot.recording.meeting import Meeting, end_interrupted, find_busy, latest, recover_interrupted
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
@@ -118,6 +118,41 @@ def test_recovery_run_twice_changes_nothing_the_second_time(tmp_path):
 
     assert recover_interrupted(tmp_path) == []
     assert {p: p.read_bytes() for p in sorted(tmp_path.glob("*/*.json"))} == before
+
+
+def test_a_meeting_knows_which_speakers_it_has_no_name_for(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    meeting.add_segment(SEGMENT)
+    meeting.add_segment({**SEGMENT, "speaker": 8, "file": "8/000001.wav"})
+    meeting.set_speaker(8, "Νίκος")
+    assert meeting.channel_id == 11 and meeting.unnamed_speakers() == [7]
+
+
+def test_recovery_can_hold_a_meeting_whose_speakers_have_no_names_until_they_are_looked_up(tmp_path):
+    unnamed = Meeting.create(tmp_path, 11, 22, NOW)
+    unnamed.add_segment(SEGMENT)
+    old = Meeting.create(tmp_path, 11, 22, NOW.replace(second=7))
+    old.add_segment(SEGMENT)
+    old.set_status("interrupted")
+    named = Meeting.create(tmp_path, 11, 22, NOW.replace(second=8))
+    named.add_segment(SEGMENT)
+    named.set_speaker(7, "Μαρία")
+    empty = Meeting.create(tmp_path, 11, 22, NOW.replace(second=9))
+
+    held = {m.id: m for m in recover_interrupted(tmp_path, hold_unnamed=True)}
+
+    for meeting in (unnamed, old):                    # held as `recording`: blocks a new recording, the job waits
+        loaded = Meeting.load(meeting.directory)
+        assert loaded.status == "recording" and loaded.interrupted
+    assert find_busy(tmp_path).id == unnamed.id
+    assert Meeting.load(named.directory).status == "queued"            # names already saved during the call
+    assert Meeting.load(named.directory).speakers == {7: "Μαρία"}
+    assert Meeting.load(empty.directory).status == "failed"
+
+    held[unnamed.id].set_speaker(7, "Μαρία")
+    end_interrupted(held[unnamed.id])
+    loaded = Meeting.load(unnamed.directory)
+    assert loaded.status == "queued" and loaded.interrupted and loaded.speakers == {7: "Μαρία"}
 
 
 def test_saving_from_two_threads_at_once_never_corrupts_or_loses_the_manifest(tmp_path):

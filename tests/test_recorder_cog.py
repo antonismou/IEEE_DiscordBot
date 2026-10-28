@@ -179,6 +179,115 @@ def test_stop_saves_the_speakers_names_closes_the_recording_and_reports_what_was
     assert "1 speaker" in text and "1 segment" in text
 
 
+def without_decoding(vc):
+    vc.sink._pipeline = SimpleNamespace(handle=lambda user_id, opus: None)  # libopus is not needed to test names
+
+
+def opus_frame(ssrc=99):
+    return SimpleNamespace(packet=SimpleNamespace(decrypted_data=b"\xf8\xff\xfe", ssrc=ssrc))
+
+
+async def settle():
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def speakers_saved(app):
+    return json.loads((meeting_dirs(app)[0] / "manifest.json").read_text(encoding="utf-8"))["speakers"]
+
+
+def test_a_speakers_name_is_saved_as_soon_as_they_first_speak(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        channel, vc = make_channel([])
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        without_decoding(vc)
+        speaker = fake_member(7)
+        speaker.display_name = "Μαρία"
+        vc.sink.write(speaker, opus_frame())                       # what the voice thread hands the sink
+        await settle()
+        saved = speakers_saved(app)
+        await cog.cog_unload()
+        return saved, cog.active.meeting.status
+
+    saved, status = asyncio.run(scenario())
+    assert status == "recording" and saved == {"7": "Μαρία"}       # already safe if the bot dies now
+
+
+def test_a_speaker_known_only_by_id_is_named_from_the_guild_on_the_event_loop(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        channel, vc = make_channel([])
+        speaker = fake_member(7)
+        speaker.display_name = "Νίκος"
+        channel.guild = fake_guild(cached=speaker)
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        without_decoding(vc)
+        vc.sink._id_from_ssrc = {99: 7}.get
+        await asyncio.to_thread(vc.sink.write, None, opus_frame(99))   # from another thread, like the voice thread
+        await settle()
+        saved = speakers_saved(app)
+        await cog.cog_unload()
+        return saved
+
+    assert asyncio.run(scenario()) == {"7": "Νίκος"}
+
+
+def test_stop_refreshes_names_but_never_replaces_a_known_name_with_nothing(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        channel, vc = make_channel([])
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        without_decoding(vc)
+        maria, nikos = fake_member(7), fake_member(8)
+        maria.display_name, nikos.display_name = "Μαρία", "Νίκος"
+        vc.sink.write(maria, opus_frame())
+        vc.sink.write(nikos, opus_frame())
+        await settle()
+        cog.active.writer.add(7, FRAME, 1.0)
+        cog.active.writer.add(8, FRAME, 1.0)
+        cog.active.writer.add(9, FRAME, 1.0)                        # never identified by name
+        renamed = fake_member(8)
+        renamed.display_name = "Νίκος Π."
+        guild = fake_guild()
+        guild.fetch_member = AsyncMock(side_effect=lambda user_id: renamed if user_id == 8 else None)
+        await cog.stop.callback(cog, fake_interaction(officer_in(channel), guild))  # Μαρία left before the stop
+        return speakers_saved(app)
+
+    assert asyncio.run(scenario()) == {"7": "Μαρία", "8": "Νίκος Π."}
+
+
+def test_a_name_found_after_the_stop_is_not_written_once_the_job_may_own_the_manifest(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        channel, vc = make_channel([])
+        release = asyncio.Event()
+        late = fake_member(7)
+        late.display_name = "Μαρία"
+        calls = []
+
+        async def fetch(user_id):
+            calls.append(user_id)
+            if len(calls) == 1:                                     # the lookup started when they spoke is slow
+                await release.wait()
+                return late
+            return None
+
+        channel.guild = fake_guild()
+        channel.guild.fetch_member = fetch
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        without_decoding(vc)
+        vc.sink.write(SimpleNamespace(id=7), opus_frame())
+        await settle()
+        cog.active.writer.add(7, FRAME, 1.0)
+        await cog.stop.callback(cog, fake_interaction(officer_in(channel), channel.guild))
+        release.set()
+        await settle()
+        return speakers_saved(app)
+
+    assert asyncio.run(scenario()) == {}
+
+
 def test_stop_warns_when_no_audio_could_be_decoded(conn, tmp_path):
     async def scenario():
         cog, app = make_cog(conn, tmp_path)
@@ -197,6 +306,7 @@ def test_after_a_restart_a_leftover_recording_is_queued_so_its_audio_is_still_pr
         cog, app = make_cog(conn, tmp_path)
         left = Meeting.create(app.settings.meetings_dir, 1, 1, datetime(2026, 10, 1, 10, 0, 0))
         left.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 0.0, "duration": 2.0})
+        left.set_speaker(7, "Μαρία")                               # saved when they first spoke
         await cog.cog_load()
         await cog.cog_unload()
         interaction = fake_interaction(officer_in(None), fake_guild())
@@ -205,7 +315,45 @@ def test_after_a_restart_a_leftover_recording_is_queued_so_its_audio_is_still_pr
 
     meeting, status = asyncio.run(scenario())
     assert meeting.status == "queued" and meeting.interrupted
+    assert meeting.speakers == {7: "Μαρία"}                        # recovery keeps the names
     assert "restart" in status.lower()
+
+
+def test_a_recovered_meeting_without_names_gets_them_once_the_bot_is_ready_and_only_then_is_queued(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        ready = asyncio.Event()
+        cog.bot.wait_until_ready = ready.wait
+        speaker = fake_member(7)
+        speaker.display_name = "Μαρία"
+        voice_channel = SimpleNamespace(guild=fake_guild(cached=speaker))
+        cog.bot.get_channel = lambda channel_id: voice_channel if channel_id == 55 else None
+        left = Meeting.create(app.settings.meetings_dir, 55, 1, datetime(2026, 10, 1, 10, 0, 0))
+        left.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 0.0, "duration": 2.0})  # by an older version
+        await cog.cog_load()
+        before = Meeting.load(left.directory)
+        ready.set()
+        await cog._recovery
+        await cog.cog_unload()
+        return before, Meeting.load(left.directory)
+
+    before, after = asyncio.run(scenario())
+    assert before.status == "recording" and before.interrupted     # the job cannot pick it up yet
+    assert after.status == "queued" and after.speakers == {7: "Μαρία"}
+
+
+def test_a_recovered_meeting_is_queued_even_if_its_names_cannot_be_found(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)                          # the meeting's channel is gone
+        left = Meeting.create(app.settings.meetings_dir, 55, 1, datetime(2026, 10, 1, 10, 0, 0))
+        left.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 0.0, "duration": 2.0})
+        await cog.cog_load()
+        await cog._recovery
+        await cog.cog_unload()
+        return Meeting.load(left.directory)
+
+    meeting = asyncio.run(scenario())
+    assert meeting.status == "queued" and meeting.speakers == {}     # the transcript falls back to the id
 
 
 def test_a_new_recording_waits_for_a_recovered_meeting_but_not_for_an_empty_one(conn, tmp_path):

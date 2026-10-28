@@ -43,3 +43,14 @@ def test_a_lost_packet_has_no_audio_and_is_skipped():
     sink.write(SimpleNamespace(id=5), SimpleNamespace(packet=SimpleNamespace(ssrc=99)))  # no decrypted_data at all
     sink.write(SimpleNamespace(id=5), data(opus=b""))
     assert pipeline.frames == []
+
+
+def test_each_speaker_is_reported_once_with_whatever_the_library_knows_about_them():
+    heard = []
+    member = SimpleNamespace(id=5, display_name="Μαρία")
+    sink = MeetingSink(FakePipeline(), {99: 7}.get, on_new_speaker=lambda user_id, user: heard.append((user_id, user)))
+    sink.write(member, data())
+    sink.write(member, data())
+    sink.write(None, data(ssrc=99))           # known only by their audio stream
+    sink.write(None, data(ssrc=1))            # cannot be identified: not reported
+    assert heard == [(5, member), (7, None)]

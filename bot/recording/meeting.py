@@ -53,6 +53,10 @@ class Meeting:
         return self._data["status"]
 
     @property
+    def channel_id(self) -> int:
+        return self._data["channel_id"]
+
+    @property
     def started_at(self) -> datetime:
         return datetime.fromisoformat(self._data["started_at"])
 
@@ -96,6 +100,12 @@ class Meeting:
     @property
     def speakers(self) -> dict[int, str]:
         return {int(user_id): name for user_id, name in self._data["speakers"].items()}
+
+    def unnamed_speakers(self) -> list[int]:
+        """Who has audio in the meeting but no saved name (meetings recorded before names were saved live)."""
+        with self._lock:
+            named = self._data["speakers"]
+            return sorted({s["speaker"] for s in self._data["segments"] if str(s["speaker"]) not in named})
 
     def add_segment(self, segment: dict) -> None:
         with self._lock:
@@ -168,20 +178,34 @@ def find_busy(root: Path) -> Meeting | None:
     return next((m for m in all_meetings(root) if m.status in BUSY), None)
 
 
-def recover_interrupted(root: Path) -> list[Meeting]:
+def recover_interrupted(root: Path, hold_unnamed: bool = False) -> list[Meeting]:
     """After a bot restart a recording cannot continue (the voice session is gone), so end it as /record stop would.
 
     Called once at startup, before any recording begins, so the bot is the only writer of these manifests: the job
     never writes a `recording` manifest (a live pass only adds segment texts) and never touches `interrupted` ones.
     A meeting with audio is queued for the job; one without fails, so nothing waits for it. The flag goes to
     posting.json first, so it is there before the job can pick the meeting up, and a crash in between only repeats it.
+
+    With `hold_unnamed`, a meeting with audio from speakers it has no name for is only flagged and left `recording`,
+    which still blocks a new recording and keeps the job from transcribing it for good, so the caller can save the
+    names once it can look them up and then finish it with end_interrupted.
     """
     stale = [m for m in all_meetings(root) if m.status in STALE]
     for meeting in stale:
-        meeting.mark_interrupted()
-        if meeting._data["segments"]:
-            meeting.set_status("queued")
+        if hold_unnamed and meeting.unnamed_speakers():
+            meeting.mark_interrupted()
+            if meeting.status != "recording":  # an older version's `interrupted` would not block a new recording
+                meeting.set_status("recording")
         else:
-            meeting.set_error(NO_AUDIO)
-            meeting.set_status("failed")
+            end_interrupted(meeting)
     return stale
+
+
+def end_interrupted(meeting: Meeting) -> None:
+    """Finish a recording cut short by a restart: queued with the audio it has, or failed with none."""
+    meeting.mark_interrupted()
+    if meeting._data["segments"]:
+        meeting.set_status("queued")
+    else:
+        meeting.set_error(NO_AUDIO)
+        meeting.set_status("failed")

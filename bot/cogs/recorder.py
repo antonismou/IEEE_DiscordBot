@@ -16,7 +16,9 @@ from bot.audit import audit
 from bot.channels import MEETING_SUMMARIES
 from bot.checks import officer_only
 from bot.recording.dave import DaveDecryptor
-from bot.recording.meeting import Meeting, all_meetings, find_busy, latest, recover_interrupted
+from bot.recording.meeting import (
+    STALE, Meeting, all_meetings, end_interrupted, find_busy, latest, recover_interrupted,
+)
 from bot.recording.pipeline import SpeakerPipeline
 from bot.recording.posting import FINAL, STATUS_TEXT, post_update
 from bot.recording.segments import SegmentWriter
@@ -75,6 +77,8 @@ class RecorderCog(commands.Cog):
         self.active: ActiveRecording | None = None
         self._warned_no_channel = False
         self._post_problems: set[tuple[str, str]] = set()  # (meeting id, error) already logged
+        self._naming: set[asyncio.Task] = set()  # name lookups in flight (kept so they are not garbage collected)
+        self._recovery: asyncio.Task | None = None
 
     @property
     def app(self):
@@ -82,14 +86,43 @@ class RecorderCog(commands.Cog):
 
     async def cog_load(self) -> None:
         # A recording cannot survive a restart: the voice session is gone, so what was captured is processed as is.
-        for meeting in recover_interrupted(self.app.settings.meetings_dir):
-            log.warning("Meeting %s was recording when the bot stopped; now %s", meeting.id, meeting.status)
+        # Names are saved as people first speak, so a meeting usually has them all and is queued right away. One
+        # missing some (recorded by an older version) waits, still `recording`, until the guild is known after login.
+        held = []
+        for meeting in recover_interrupted(self.app.settings.meetings_dir, hold_unnamed=True):
+            if meeting.status in STALE:
+                held.append(meeting)
+                log.warning("Meeting %s was recording when the bot stopped; queued once its speakers are named",
+                            meeting.id)
+            else:
+                log.warning("Meeting %s was recording when the bot stopped; now %s", meeting.id, meeting.status)
+        if held:
+            self._recovery = asyncio.create_task(self._finish_recovery(held))
         self.poster.start()
 
     async def cog_unload(self) -> None:
         self.poster.cancel()
+        if self._recovery:
+            self._recovery.cancel()  # a meeting not finished yet is held again at the next start
         if self.active:
             self.active.flusher.cancel()
+
+    async def _finish_recovery(self, held: list[Meeting]) -> None:
+        """Name the speakers of meetings recovered without names, then queue them. Only the bot writes a `recording`
+        manifest, so nothing races with this; whatever happens to the lookup, the meeting is queued."""
+        await self.bot.wait_until_ready()
+        for meeting in held:
+            try:
+                channel = self.bot.get_channel(meeting.channel_id)
+                guild = getattr(channel, "guild", None)
+                for user_id in meeting.unnamed_speakers() if guild else []:
+                    name = await self._display_name(guild, user_id)
+                    if name:
+                        meeting.set_speaker(user_id, name)
+            except Exception:
+                log.exception("Could not name the speakers of recovered meeting %s", meeting.id)
+            end_interrupted(meeting)
+            log.info("Recovered meeting %s is now %s", meeting.id, meeting.status)
 
     record_group = app_commands.Group(name="record", description="Record a voice meeting", guild_only=True)
 
@@ -137,7 +170,28 @@ class RecorderCog(commands.Cog):
         pipeline = SpeakerPipeline(decryptor, discord.opus.Decoder, writer, clock)
         flusher = asyncio.create_task(self._flush_idle_segments(writer, clock))
         self.active = ActiveRecording(meeting, channel, voice_client, writer, decryptor, pipeline, clock, flusher)
-        voice_client.listen(MeetingSink(pipeline, voice_client._get_id_from_ssrc))
+        active = self.active
+        loop = asyncio.get_running_loop()
+
+        def heard(user_id, user) -> None:  # on the voice thread: hand over to the loop and return at once
+            try:
+                loop.call_soon_threadsafe(self._learn_name, active, user_id, user)
+            except RuntimeError:  # the loop is shutting down
+                pass
+
+        voice_client.listen(MeetingSink(pipeline, voice_client._get_id_from_ssrc, on_new_speaker=heard))
+
+    def _learn_name(self, active: ActiveRecording, user_id: int, user) -> None:
+        """Save a speaker's name as soon as they first speak, so a crash or restart does not lose it."""
+        task = asyncio.create_task(self._save_name(active, user_id, user))
+        self._naming.add(task)
+        task.add_done_callback(self._naming.discard)
+
+    async def _save_name(self, active: ActiveRecording, user_id: int, user) -> None:
+        name = await self._display_name(active.channel.guild, user_id, user)
+        # Once the recording has ended the job may own the manifest; the stop saved the names itself.
+        if name and self.active is active:
+            active.meeting.set_speaker(user_id, name)
 
     @staticmethod
     async def _flush_idle_segments(writer: SegmentWriter, clock: Callable[[], float]) -> None:
@@ -262,14 +316,25 @@ class RecorderCog(commands.Cog):
     async def before_poster(self) -> None:
         await self.bot.wait_until_ready()
 
-    @staticmethod
-    async def _save_speaker_names(guild, active: ActiveRecording) -> None:
+    @classmethod
+    async def _save_speaker_names(cls, guild, active: ActiveRecording) -> None:
+        """Refresh every speaker's name (it may have changed during the call). One that cannot be looked up now keeps
+        the name saved when they first spoke, or stays unnamed for the job to show by id."""
         for user_id in sorted({segment["speaker"] for segment in active.writer.segments}):
-            try:
-                member = await resolve_member(guild, SimpleNamespace(id=user_id))
-            except discord.HTTPException:
-                member = None
-            active.meeting.set_speaker(user_id, member.display_name if member else str(user_id))
+            name = await cls._display_name(guild, user_id)
+            if name:
+                active.meeting.set_speaker(user_id, name)
+
+    @staticmethod
+    async def _display_name(guild, user_id: int, user=None) -> str | None:
+        """The speaker's name in the guild, from the Member the library gave, the member cache, or the API."""
+        try:
+            member = await resolve_member(guild, user or SimpleNamespace(id=user_id))
+        except discord.HTTPException:
+            member = None
+        if member is not None:
+            return member.display_name
+        return getattr(user, "display_name", None)  # a User the library found outside the guild's cache
 
     @staticmethod
     def _report(active: ActiveRecording) -> str:
