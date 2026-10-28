@@ -34,7 +34,9 @@ and IEEE Xplore RSS items.
    contains emails, names or PINs. Without it, nothing is recorded; `/setup status` flags that. Discord keeps
    the messages until someone deletes them.
    Set `meeting-summaries` to the channel where recorded meetings (`/record`) get their Greek summary and
-   transcript. Until it is set, finished meetings wait on disk and are posted once you set it.
+   transcript, also **visible only to the Officer role**: it carries the full transcript of every meeting, and
+   `/channel set` warns if @everyone can see it. Until it is set, finished meetings wait on disk and are posted
+   once you set it.
 
 10. **Branch roles:** create a role per branch and add each with `/setup branch-add name:"CS" role:@..`
     (optionally `description:` and `pin:`). Add as many as you like (up to 25) and use `/setup branch-remove` to
@@ -81,7 +83,7 @@ Administrators can always use the officer commands, even before the officer role
 | `/member lookup / export / delete` | officers | inspect, export CSV, delete stored data |
 | `/channel set / clear / list` | officers | choose the channel each feed topic (and the officer log) posts to |
 | `/feed list / add / remove` | officers | manage feeds without restarting |
-| `/record start / stop / status` | officers | record the voice channel you are in (announced in its chat); it also stops if the bot is disconnected or everyone leaves. The summary and transcript are posted in `meeting-summaries`, with a status message updated while it is processed |
+| `/record start / stop / status` | officers | record the voice channel you are in (announced in its chat); it also stops at once if the bot is disconnected, and when nobody but bots has been in the call for 45 seconds (a dropped connection can rejoin). The summary and transcript are posted in `meeting-summaries`, with a status message updated while it is processed; a meeting reprocessed later is posted again. A recording stopped with no audio is marked failed and posted as such |
 | `/stats verification` | officers | codes sent vs members verified (24 h / 7 days), to spot emails that don't arrive |
 | `/forget-me` | everyone | delete your own stored data |
 
@@ -108,6 +110,14 @@ Meeting recordings, transcripts and summaries are the exception: they live in th
 (bind-mounted into the bot and the processing job; create it once with
 `sudo install -d -m 700 -o 1000 -g 1000 data/meetings`). Processing runs in separate one-shot containers started by
 a systemd timer on the host; see [`deploy/README.md`](deploy/README.md) for the install steps and the models.
+If the folder is not writable, `/record start` leaves the call again and says why. A meeting folder whose
+`manifest.json` cannot be read (for example after a bad hand edit) is skipped and logged once; fix the file and
+it is picked up again. When a meeting is reprocessed (its status set back to `queued`), the bot posts the new
+status and result again (only if the job finished before the bot saw it processing and the result is exactly the
+one already posted is nothing repeated). Audio left open when the bot stopped is recovered into the meeting (or
+deleted if unusable) at the next start, so a failed meeting has no audio waiting outside its manifest: every
+segment that was transcribed has its text saved and its audio deleted, and setting it back to `queued` only
+redoes what is missing, usually just the summary from the saved texts.
 
 `docker compose down` and updates keep the data. **`docker compose down -v` deletes the volume, and with it all
 stored members**, so never add `-v` unless you mean it.

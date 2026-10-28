@@ -1,7 +1,7 @@
 import wave
 from array import array
 
-from bot.recording.pipeline import SpeakerPipeline
+from bot.recording.pipeline import FAILING_AFTER, SpeakerPipeline
 from bot.recording.segments import SegmentWriter
 
 
@@ -75,3 +75,24 @@ def test_a_corrupt_frame_is_counted_and_does_not_stop_the_recording(tmp_path):
     writer.close()
 
     assert pipeline.decode_errors == 2 and writer.segments == []
+
+
+class FullDisk:
+    segments = []
+
+    def add(self, *args):
+        raise OSError(28, "No space left on device")
+
+
+def test_a_write_error_is_counted_per_speaker_logged_once_and_never_raised(caplog):
+    failing = []
+    pipeline = SpeakerPipeline(FakeDecryptor(), lambda: FakeDecoder(), FullDisk(), lambda: 1.0,
+                               on_failing=failing.append)
+    for _ in range(FAILING_AFTER + 5):
+        pipeline.handle(7, b"opus")
+    pipeline.handle(8, b"opus")
+
+    assert pipeline.write_errors == {7: FAILING_AFTER + 5, 8: 1} and pipeline.write_error_count == FAILING_AFTER + 6
+    assert sum("Could not save" in record.message for record in caplog.records) == 1
+    [error] = failing                                                   # reported once, not on every frame
+    assert error.errno == 28
