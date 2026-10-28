@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from bot.channels import PRIVATE_TOPICS
+from bot.channels import RESERVED_TOPICS
 
 REQUIRED_ENV = ("DISCORD_TOKEN", "GMAIL_ADDRESS", "GMAIL_APP_PASSWORD")
 
@@ -63,8 +63,8 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             feed_id, title, url, topic = entry["id"], entry["title"], entry["url"], entry["channel"]
         except KeyError as exc:
             raise ConfigError(f"Feed entry is missing key {exc}: {entry}") from None
-        if topic in PRIVATE_TOPICS:
-            raise ConfigError(f"Feed '{feed_id}' cannot use '{topic}': that topic is reserved for the officers' logs")
+        if topic in RESERVED_TOPICS:
+            raise ConfigError(f"Feed '{feed_id}' cannot use '{topic}': that topic is reserved for the bot's own posts")
         if feed_id in seen_ids:
             raise ConfigError(f"Duplicate feed id '{feed_id}'")
         seen_ids.add(feed_id)

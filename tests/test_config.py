@@ -71,6 +71,11 @@ def test_officer_log_is_a_reserved_topic(tmp_path):
         load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "officer-log"')), ENV)
 
 
+def test_meeting_summaries_is_a_reserved_topic(tmp_path):
+    with pytest.raises(ConfigError, match="reserved"):
+        load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "meeting-summaries"')), ENV)
+
+
 def test_old_id_keys_are_ignored_not_errors(tmp_path):
     old = "guild_id = 1\nverified_role_id = 2\nofficer_role_id = 3\n" + GOOD
     assert load_settings(write(tmp_path, old), ENV).feeds[0].id == "tpami"

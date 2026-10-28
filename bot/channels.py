@@ -4,7 +4,9 @@ import sqlite3
 
 OFFICER_LOG = "officer-log"  # reserved topic: where the bot reports problems to officers
 AUDIT_LOG = "audit-log"  # reserved topic: one line per officer/admin action
+MEETING_SUMMARIES = "meeting-summaries"  # reserved topic: recorded meetings' summaries and transcripts
 PRIVATE_TOPICS = (OFFICER_LOG, AUDIT_LOG)  # channels that must not be visible to @everyone
+RESERVED_TOPICS = (*PRIVATE_TOPICS, MEETING_SUMMARIES)  # topics a feed cannot use
 
 
 class ChannelRepo:
@@ -36,7 +38,7 @@ class ChannelRepo:
 
 
 def topics_for(feeds) -> list[str]:
-    """Every topic a channel can be chosen for: the feeds' topics plus the officer and audit logs."""
+    """Every topic a channel can be chosen for: the feeds' topics plus the reserved ones."""
     names = {feed.topic for feed in feeds if feed.topic}
-    names.update(PRIVATE_TOPICS)
+    names.update(RESERVED_TOPICS)
     return sorted(names)
