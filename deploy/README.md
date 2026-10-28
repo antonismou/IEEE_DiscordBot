@@ -15,7 +15,8 @@ runs. The bot gets no Docker access.
   is speech to transcribe.
 - **After the call** (a meeting is `queued`, or `transcribing`/`summarizing` after a crash): the full job, which
   starts Ollama through `depends_on`. It transcribes what is left, frees Whisper, summarizes, then marks the
-  meeting `done`.
+  meeting `done`. When the container exits (done, failed or killed by its memory limit), `meeting-job.sh` stops
+  Ollama again.
 
 The summary is made only after the call, in fixed windows of `CHUNK_MINUTES` (12) minutes of the meeting: window k
 holds what was said from minute 12k to 12(k+1). Each window gets its notes (topics, decisions, tasks, open
@@ -73,9 +74,9 @@ Files:
 | `Dockerfile.worker` | The job image (faster-whisper, requests, `worker/`, `bot/recording/meeting.py`), uid 1000, runs under `nice -n 19 ionice -c 3` |
 | `docker-compose.yml` | `worker` and `ollama` services (profile `job`), CPU/memory limits, model volumes; the meetings bind mount |
 | `deploy/ieee-meeting-worker.timer` | Starts the service 1 minute after boot, then 2 minutes after each run ends |
-| `deploy/ieee-meeting-worker.service` | Oneshot: skips unless a meeting is pending, runs the job, then stops Ollama |
+| `deploy/ieee-meeting-worker.service` | Oneshot: skips unless a meeting is pending, then runs `meeting-job.sh` |
 | `deploy/meeting-pending.sh` | The cheap check: exit 0 if a manifest has status `recording`, `queued`, `transcribing` or `summarizing` |
-| `deploy/meeting-job.sh` | The run itself: the full job (with Ollama) if a meeting has ended, otherwise a live transcription run without Ollama |
+| `deploy/meeting-job.sh` | The run itself: the full job (with Ollama, stopped again afterwards) if a meeting has ended, otherwise a live transcription run without Ollama. Also the way to run the job by hand |
 
 ## Why a timer and not a path unit
 
@@ -148,30 +149,68 @@ systemctl status ieee-meeting-worker.timer        # when the next check runs
 docker compose --profile job logs ollama          # Ollama's log from the last run
 ```
 
-Run a pending meeting by hand, without waiting for the timer:
+Run a pending meeting now, without waiting for the timer (the same run as a tick, skipped if nothing is pending,
+and never a second one next to a run already going):
 
 ```bash
-sudo systemctl start ieee-meeting-worker.service              # same as the timer: skipped if nothing is pending
-docker compose --profile job run --rm worker                  # directly, in the foreground
-docker compose --profile job stop ollama                      # afterwards, when run directly
-docker compose --profile job run --rm --no-deps worker python -m worker.run --live   # a live pass, no Ollama
+sudo systemctl start ieee-meeting-worker.service
+journalctl -u ieee-meeting-worker -f              # to watch it
 ```
 
-To reprocess a meeting, set its `status` in `data/meetings/<id>/manifest.json` back to `queued` (segments that
-already have a `.txt` are not transcribed again, windows that have a notes file are not extracted again). To make
-the summary from scratch, delete the meeting's `notes/` folder as well. To pause processing: `sudo systemctl stop ieee-meeting-worker.timer`.
+To run the job in the foreground instead (for example to debug it), stop the timer first and wait for a run in
+progress to finish, then use the same script the service runs, which also stops Ollama afterwards:
+
+```bash
+sudo systemctl stop ieee-meeting-worker.timer
+systemctl is-active ieee-meeting-worker.service   # wait until this says "inactive"
+sh deploy/meeting-job.sh data/meetings            # Ctrl+C removes the container and stops Ollama
+sudo systemctl start ieee-meeting-worker.timer
+```
+
+Do not use a bare `docker compose --profile job run worker` or `docker compose --profile job stop ollama` while the
+timer is enabled: the stop would kill the Ollama of a run the timer started, and a run started by the timer meanwhile
+cannot tell your container is still using Ollama. If a run was killed hard (Ollama still listed by
+`docker compose --profile job ps`), the next full run stops it; to stop it sooner, stop the timer as above, then
+`docker compose --profile job stop ollama`.
+
+To reprocess a meeting: stop the timer as above, set `"status"` in `data/meetings/<id>/manifest.json` back to
+`queued`, and handle the bot's posted marker as described in the bot section of the [main README](../README.md) so
+the new summary is posted; then start the timer again. Segments that already have a `.txt` are not transcribed again
+and windows that have a notes file are not extracted again; to make the summary from scratch, delete the meeting's
+`notes/` folder as well. The check reads the manifest with `grep`, so keep `"status": "<value>"` a plain JSON string
+(any spacing and indentation is fine).
+
+To pause processing: `sudo systemctl stop ieee-meeting-worker.timer` (a run in progress finishes;
+`sudo systemctl stop ieee-meeting-worker.service` cancels it, removing the container and stopping Ollama).
 
 ## Limits
 
 | Container | CPU | Memory (no swap) | Priority |
 | --- | --- | --- | --- |
-| `worker` | 6 of 8 threads, weight 128 (default 1024) | 6 GB | `nice 19`, idle I/O |
-| `ollama` | 6 of 8 threads, weight 128 | 12 GB | `nice 19`, idle I/O |
+| `worker` | 6 of 8 threads, weight 128 (default 1024) | 5 GB | `nice 19`, idle I/O |
+| `ollama` (`ollama/ollama:0.40.12`) | 6 of 8 threads, weight 128 | 12 GB | `nice 19`, idle I/O (nice only if the image has no `ionice`) |
 
-The two never hold a model at the same time. During a call only `worker` runs (Ollama is not started); after the
-call the full job transcribes, frees Whisper, then summarizes. `OLLAMA_KEEP_ALIVE=0` unloads Gemma right after each
-request, and nothing stays running between ticks. Memory limits are ceilings: a run that exceeds one is killed (the unit then
-shows as failed and the timer retries 2 minutes later) instead of pushing the bot and other services into swap.
-The service times out after 8 hours; `ExecStopPost` always removes the job container and stops Ollama.
+The limits add up to 17 GB, more than the 16 GB box (about 12 GB free), and that is safe only because the two never
+hold a model at the same time; the limits are ceilings against a runaway, not reservations:
+
+- During a call only `worker` runs, with `--no-deps`: Ollama is not started.
+- In the full job both containers are up, but Ollama holds no model until the first summary request: models load on
+  demand and `OLLAMA_KEEP_ALIVE=0` unloads Gemma right after each request, so idle Ollama is a few hundred MB at most.
+  The worker transcribes first, drops the Whisper model and runs `gc.collect()` (`worker/run.py`, `_transcribe`),
+  and only then waits for Ollama and sends the first request. While Gemma runs (about 8 GB plus the 8192-token
+  context), the worker is a Python process waiting on HTTP. A second meeting in the same job is transcribed only
+  after the previous summary's last request has returned, when Gemma is being unloaded.
+- So the peak is about 4 GB while transcribing and about 9-10 GB while summarizing, never both.
+
+The worker limit (5 GB) leaves about 1 GB above Whisper turbo int8's 3-4 GB. Ollama's 12 GB is kept: the model file
+alone is about 8 GB, Ollama maps it into memory (counted against the limit), and a limit too tight would kill or
+thrash the summary rather than protect anything. A run that exceeds a limit is killed (the unit then shows as
+failed and the timer retries 2 minutes later) instead of pushing the bot and other services into swap.
+
+The service times out after 8 hours. On a timeout or a `systemctl stop`, systemd sends SIGTERM to `meeting-job.sh`
+only (`KillMode=mixed`), which removes the job container and stops Ollama. The unit has no `ExecStopPost`, because
+systemd runs it after a skipped tick too and an idle tick must stay a single `grep`. Exit code 75 (another worker
+holds the lock) counts as success. After a full run whose worker exits 75, Ollama is left running only if it was
+already running before the run started (it belongs to the other worker).
 
 `docker compose down -v` deletes the model volumes as well as `bot-data`; never add `-v` unless you mean it.

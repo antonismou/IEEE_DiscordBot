@@ -65,7 +65,7 @@ The bot only captures audio and writes it to disk; all heavy work happens in the
 
 ## Processing job
 
-One-shot containers do transcription and summarization, then exit. Only one model is in memory at a time: Whisper and Gemma never run together (the worker's 6 GB and Ollama's 12 GB limits would not fit next to the other services in 16 GB, and both use all the CPU). A host timer starts a run every 2 minutes while a meeting needs work (`deploy/meeting-job.sh`):
+One-shot containers do transcription and summarization, then exit. Only one model is in memory at a time: Whisper and Gemma never run together (the worker's 5 GB and Ollama's 12 GB limits would not fit next to the other services in 16 GB, and both use all the CPU). A host timer starts a run every 2 minutes while a meeting needs work (`deploy/meeting-job.sh`):
 
 - **During the call** (`recording`): a live run (`worker.run --live`, `--no-deps`, so Ollama is not started) transcribes the chunks the bot has closed so far and exits. It never summarizes, never fails the meeting and never writes the manifest, which the bot owns until `/record stop`. A run with no new chunks exits without loading Whisper; otherwise Whisper is loaded fresh each run, which keeps the job stateless at the cost of a few seconds per run.
 - **After the call** (`queued`): the full run starts Ollama, transcribes the remaining chunks, unloads Whisper, summarizes (all windows, then the merge) and marks the meeting `done`. A meeting stopped while a live run is busy is picked up by the next tick. A meeting recovered after a bot restart is queued the same way.
@@ -124,16 +124,16 @@ Between meetings the feature uses no CPU or RAM; its only permanent cost is abou
 | Transcribing | up to 6 of 8 threads, lowest priority | 3-4 GB |
 | Summarizing (after the call only) | up to 6 of 8 threads, lowest priority | about 8 GB |
 
-Transcribing and summarizing never overlap: during the call Ollama is never started, and after it the full run frees Whisper before the summary starts.
+Transcribing and summarizing never overlap: during the call Ollama is never started, and after it the full run frees Whisper before the summary starts. Ollama is up during the full run's transcription but holds no model until the first summary request (models load on demand, `keep_alive` 0). That is what makes the container limits (worker 5 GB, Ollama 12 GB, 17 GB together on a 16 GB box) safe: they are ceilings against a runaway, and the real peak is one model at a time.
 
 Containers:
 
 - A `worker` image (Python, `faster-whisper`) runs once per tick and exits.
-- `ollama` starts only for the full run after a meeting has ended, and stops afterwards; `keep_alive` is 0 so the model leaves memory immediately.
+- `ollama` (pinned, `ollama/ollama:0.40.12`) starts only for the full run after a meeting has ended, and `deploy/meeting-job.sh` stops it afterwards, unless the worker found another worker busy that is using it; `keep_alive` is 0 so the model leaves memory immediately.
 - Models live in named volumes (about 1.6 GB for Whisper, about 8 GB for Gemma), so they download once.
 - The job runs at `nice 19` with a container CPU and memory limit, so other services on the server always win.
 
-How the job is launched (decided): a systemd path unit on the host that watches the meetings directory and starts a oneshot `docker compose run` when a meeting is queued. Nothing runs while idle, and the bot does not need access to the Docker socket. The alternative, mounting the Docker socket into the bot, is simpler but gives the bot control over every container on the server.
+How the job is launched (decided): a systemd timer on the host checks every 2 minutes with one `grep` over the manifests (a path unit cannot see the status change one folder down; see `deploy/README.md`) and, only when a meeting needs work, starts a oneshot `docker compose run`. Nothing runs while idle, and the bot does not need access to the Docker socket. The alternative, mounting the Docker socket into the bot, is simpler but gives the bot control over every container on the server.
 
 ## Benchmark results
 

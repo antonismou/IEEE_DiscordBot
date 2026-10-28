@@ -19,7 +19,7 @@ services:
       - ${MEETINGS_HOST_DIR:-./data/meetings}:/app/data/meetings
 
   # The meeting processing job. Profile-gated: `docker compose up` never starts it; the systemd timer in deploy/
-  # runs it with `docker compose --profile job run --rm worker` and it exits when there is nothing left to do.
+  # runs it through deploy/meeting-job.sh (`docker compose --profile job run --rm worker`) and it exits when there is nothing left to do.
   # During a call it runs `--no-deps worker python -m worker.run --live` instead (transcription only), so Ollama
   # is not started then; depends_on below applies only to the full run after the meeting ends.
   worker:
@@ -45,21 +45,23 @@ services:
     # Other services come first: a CPU ceiling below the 8 threads, a low weight when the CPU is contended (the
     # image also runs the job under nice 19 and idle I/O), and a memory ceiling with no swap so a runaway job is
     # killed instead of pushing the rest of the server into swap. Whisper turbo int8 needs about 3-4 GB.
+    # The worker and Ollama limits add up to more than the box has free, which is safe only because they never hold a
+    # model at the same time (see "Limits" in deploy/README.md): Whisper is freed before the first Gemma request.
     cpus: 6
     cpu_shares: 128
-    mem_limit: 6g
-    memswap_limit: 6g
+    mem_limit: 5g
+    memswap_limit: 5g
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
 
   # The summary model server. Profile-gated and started only as the worker's dependency (full runs after a meeting
-  # ends, never the live transcription runs during a call); the systemd unit stops it again when the job ends.
+  # ends, never the live transcription runs during a call); deploy/meeting-job.sh stops it again when the job ends.
   # OLLAMA_KEEP_ALIVE=0 unloads the model right after each request. No port is published:
   # only the worker reaches it, over the compose network.
   ollama:
-    image: ollama/ollama:latest
+    image: ollama/ollama:0.40.12   # pinned; update deliberately (pull, then time one meeting)
     profiles: ["job"]
     logging: *logging
     environment:
@@ -68,7 +70,12 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "1"
     volumes:
       - ollama-models:/root/.ollama   # gemma3:12b, about 8 GB, pulled once by hand (see deploy/README.md)
-    entrypoint: ["nice", "-n", "19", "ionice", "-c", "3", "/bin/ollama"]
+    # Lowest CPU priority, and idle I/O when the image has ionice (util-linux); without it, nice alone.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - if command -v ionice >/dev/null 2>&1; then exec nice -n 19 ionice -c 3 /bin/ollama "$$@"; fi; exec nice -n 19 /bin/ollama "$$@"
+      - ollama
     command: ["serve"]
     healthcheck:
       test: ["CMD", "/bin/ollama", "list"]
