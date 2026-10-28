@@ -1,7 +1,7 @@
 import json
 from datetime import datetime
 
-from bot.recording.meeting import Meeting, find_busy, interrupt_stale
+from bot.recording.meeting import Meeting, find_busy, interrupt_stale, latest
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
@@ -98,3 +98,51 @@ def test_saving_from_two_threads_at_once_never_corrupts_or_loses_the_manifest(tm
 
     saved = manifest(meeting)
     assert errors == [] and len(saved["segments"]) == 150 and len(saved["speakers"]) == 150
+
+
+def test_latest_is_the_most_recent_meeting(tmp_path):
+    assert latest(tmp_path / "nope") is None
+    Meeting.create(tmp_path, 11, 22, NOW)
+    newer = Meeting.create(tmp_path, 11, 22, NOW.replace(minute=45))
+    assert latest(tmp_path).id == newer.id
+
+
+def test_a_new_meeting_has_nothing_posted_yet(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    assert meeting.posted is False and meeting.status_message_id is None
+    assert meeting.status_shown is None and meeting.parts_sent == 0
+    assert meeting.started_at == NOW and meeting.error is None
+    assert meeting.summary_path == meeting.directory / "summary.md"
+    assert meeting.transcript_path == meeting.directory / "transcript.txt"
+
+
+def test_what_the_bot_posted_survives_a_reload(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    meeting.set_status_message(555, "queued")
+    meeting.set_parts_sent(2)
+    meeting.mark_posted()
+
+    loaded = Meeting.load(meeting.directory)
+    assert loaded.status_message_id == 555 and loaded.status_shown == "queued"
+    assert loaded.parts_sent == 2 and loaded.posted is True
+
+
+def test_the_job_rewriting_the_manifest_cannot_erase_what_the_bot_posted(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    meeting.set_status_message(555, "queued")
+    meeting.mark_posted()
+    job_copy = manifest(meeting)                     # the job writes its own copy of the manifest back
+    job_copy["status"] = "done"
+    (meeting.directory / "manifest.json").write_text(json.dumps(job_copy), encoding="utf-8")
+
+    loaded = Meeting.load(meeting.directory)
+    assert loaded.status == "done" and loaded.posted is True and loaded.status_message_id == 555
+    assert "posted" not in job_copy                 # the bot's own state is kept out of the shared manifest
+
+
+def test_the_job_s_error_message_is_readable(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    data = manifest(meeting)
+    data.update(status="failed", error="Ollama 500")
+    (meeting.directory / "manifest.json").write_text(json.dumps(data), encoding="utf-8")
+    assert Meeting.load(meeting.directory).error == "Ollama 500"
