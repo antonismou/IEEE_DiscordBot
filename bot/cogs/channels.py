@@ -5,7 +5,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.audit import audit
-from bot.channels import AUDIT_LOG, OFFICER_LOG, PRIVATE_TOPICS, topics_for
+from bot.channels import AUDIT_LOG, MEETING_SUMMARIES, OFFICER_LOG, PRIVATE_TOPICS, topics_for
 from bot.checks import officer_only
 
 
@@ -91,6 +91,8 @@ class ChannelsCog(commands.Cog):
                 lines.append(f"`{topic}` -> **not set** (optional: problems are only logged)")
             elif topic == AUDIT_LOG:
                 lines.append(f"`{topic}` -> **not set** (officer actions are not being recorded)")
+            elif topic == MEETING_SUMMARIES:
+                lines.append(f"`{topic}` -> **not set** (summaries wait until you set one)")
             else:
                 lines.append(f"`{topic}` -> **not set** (its feeds are paused until you set one)")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)

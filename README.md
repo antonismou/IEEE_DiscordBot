@@ -32,6 +32,8 @@ and IEEE Xplore RSS items.
    officer/admin action (manual verify, unverify, data delete/export, role/branch/channel changes). It never
    contains emails, names or PINs. Without it, nothing is recorded; `/setup status` flags that. Discord keeps
    the messages until someone deletes them.
+   Set `meeting-summaries` to the channel where recorded meetings (`/record`) get their Greek summary and
+   transcript. Until it is set, finished meetings wait on disk and are posted once you set it.
 
 10. **Branch roles:** create a role per branch and add each with `/setup branch-add name:"CS" role:@..`
     (optionally `description:` and `pin:`). Add as many as you like (up to 25) and use `/setup branch-remove` to
@@ -78,6 +80,7 @@ Administrators can always use the officer commands, even before the officer role
 | `/member lookup / export / delete` | officers | inspect, export CSV, delete stored data |
 | `/channel set / clear / list` | officers | choose the channel each feed topic (and the officer log) posts to |
 | `/feed list / add / remove` | officers | manage feeds without restarting |
+| `/record start / stop / status` | officers | record the voice channel you are in (announced in its chat); it also stops if the bot is disconnected or everyone leaves. The summary and transcript are posted in `meeting-summaries`, with a status message updated while it is processed |
 | `/stats verification` | officers | codes sent vs members verified (24 h / 7 days), to spot emails that don't arrive |
 | `/forget-me` | everyone | delete your own stored data |
 
