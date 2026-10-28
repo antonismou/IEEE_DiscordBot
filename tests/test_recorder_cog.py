@@ -145,6 +145,144 @@ def test_if_the_announcement_cannot_be_posted_nothing_is_recorded(conn, tmp_path
     assert "announce" in reply_text(interaction).lower()
 
 
+def test_if_the_meeting_cannot_be_saved_the_bot_leaves_says_why_and_can_start_again_later(conn, tmp_path):
+    """A meetings folder the bot cannot write (a root-owned bind mount, a full disk): it must not stay in the call
+    claiming to record, the command must get an answer, and a later start must work once it is fixed."""
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        meetings = app.settings.meetings_dir
+        blocker = tmp_path / "not-a-folder"
+        blocker.write_text("x")
+        app.settings.meetings_dir = blocker / "meetings"         # mkdir fails like a root-owned folder would
+        events = []
+        channel, vc = make_channel(events)
+        interaction = fake_interaction(officer_in(channel), fake_guild())
+        await cog.start.callback(cog, interaction)
+        failed = cog.active
+        app.settings.meetings_dir = meetings                     # fixed
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        again = cog.active is not None
+        await cog.cog_unload()
+        return events, interaction, channel, failed, again
+
+    events, interaction, channel, failed, again = asyncio.run(scenario())
+    assert events[:4] == ["connect", "announce", "disconnect", "announce"] and failed is None and again
+    assert "cancelled" in channel.send.await_args_list[1].args[0].lower()   # the call is told nothing is recorded
+    assert interaction.followup.send.await_count == 1 and "could not start" in reply_text(interaction)
+
+
+def test_a_failure_after_the_meeting_was_created_leaves_no_folder_behind(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events)
+        vc.listen = MagicMock(side_effect=discord.ClientException("Already listening."))
+        interaction = fake_interaction(officer_in(channel), fake_guild())
+        await cog.start.callback(cog, interaction)
+        return app, events, cog, interaction
+
+    app, events, cog, interaction = asyncio.run(scenario())
+    assert cog.active is None and meeting_dirs(app) == [] and "disconnect" in events
+    assert "Already listening" in reply_text(interaction)
+
+
+def test_an_error_finishing_the_last_audio_files_still_ends_the_recording(conn, tmp_path):
+    """Closing a WAV can fail (disk full: wave patches the header on close). The bot must still leave, and the
+    meeting must leave `recording`, or it would block every later /record start. The file that was open is
+    recovered from disk."""
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events)
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        cog.active.writer.add(7, FRAME * 10, 1.0)
+
+        def disk_full():
+            raise OSError(28, "No space left on device")
+        cog.active.writer.close = disk_full
+        stop = fake_interaction(officer_in(channel), fake_guild())
+        await cog.stop.callback(cog, stop)
+        return app, events, cog, stop
+
+    app, events, cog, stop = asyncio.run(scenario())
+    assert "disconnect" in events and cog.active is None and "stopped" in reply_text(stop)
+    meeting = Meeting.load(meeting_dirs(app)[0])
+    assert meeting.status == "queued" and [s["file"] for s in meeting.segments] == ["7/000001.wav"]
+
+
+def test_an_error_saving_the_stop_still_leaves_the_call_and_replies(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events)
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        cog.active.meeting.set_status = MagicMock(side_effect=OSError(28, "No space left on device"))
+        stop = fake_interaction(officer_in(channel), fake_guild())
+        await cog.stop.callback(cog, stop)
+        return events, cog, stop
+
+    events, cog, stop = asyncio.run(scenario())
+    assert "disconnect" in events and cog.active is None and stop.followup.send.await_count == 1
+
+
+def test_a_recording_stopped_with_no_audio_fails_and_posts_one_notice(conn, tmp_path):
+    summaries = FakeChannel()
+
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path, summaries)
+        app.channels.set(MEETING_SUMMARIES, 77)
+        channel, vc = make_channel([])
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        await cog.stop.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        await cog.post_updates()
+        await cog.post_updates()
+        return Meeting.load(meeting_dirs(app)[0])
+
+    meeting = asyncio.run(scenario())
+    assert meeting.status == "failed" and meeting.error == "no audio was captured" and meeting.posted
+    [notice] = summaries.sent
+    assert "απέτυχε" in notice.content and "no audio was captured" in notice.content
+
+
+class Passthrough:
+    stats = {"decrypted": 0, "passthrough": 0, "dropped": 0, "errors": 0}
+
+    def decrypt(self, user_id, payload):
+        return payload
+
+
+class SilentDecoder:
+    def decode(self, payload, fec=False):
+        return b"\x01\x00" * 1920                                  # 20 ms of 48 kHz stereo
+
+
+def test_audio_that_cannot_be_saved_is_counted_reported_and_announced_once_in_the_call(conn, tmp_path):
+    from bot.recording.pipeline import FAILING_AFTER
+
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        channel, vc = make_channel([])
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        channel.send.reset_mock()
+        pipeline = cog.active.pipeline
+        pipeline._decryptor, pipeline._decoder_factory = Passthrough(), SilentDecoder
+        cog.active.writer.add = MagicMock(side_effect=OSError(28, "No space left on device"))
+        for _ in range(FAILING_AFTER + 10):
+            await asyncio.to_thread(vc.sink.write, SimpleNamespace(id=7), opus_frame())   # never raises
+        await settle()
+        status = fake_interaction(officer_in(None), fake_guild())
+        await cog.status.callback(cog, status)
+        stop = fake_interaction(officer_in(channel), fake_guild())
+        await cog.stop.callback(cog, stop)
+        return channel, reply_text(status), reply_text(stop)
+
+    channel, status, stop = asyncio.run(scenario())
+    [warning] = channel.send.await_args_list
+    assert "not being saved" in warning.args[0] and "No space left" in warning.args[0]
+    assert f"{FAILING_AFTER + 10} audio frames could not be saved" in status
+    assert f"{FAILING_AFTER + 10} not saved" in stop
+
+
 def test_stop_with_no_recording_says_so(conn, tmp_path):
     async def scenario():
         cog, app = make_cog(conn, tmp_path)
@@ -465,16 +603,27 @@ def test_a_post_that_fails_is_kept_and_retried_on_the_next_turn(conn, tmp_path):
     assert unposted and meeting.posted and len(summaries.sent) == 2
 
 
-def test_the_poster_survives_a_broken_manifest(conn, tmp_path):
+def test_a_broken_manifest_does_not_stop_the_other_meetings(conn, tmp_path):
+    summaries = FakeChannel()
+
     async def scenario():
-        cog, app = make_cog(conn, tmp_path, FakeChannel())
+        cog, app = make_cog(conn, tmp_path, summaries)
         app.channels.set(MEETING_SUMMARIES, 77)
         broken = app.settings.meetings_dir / "20261001-100000"
         broken.mkdir(parents=True)
         (broken / "manifest.json").write_text("{not json", encoding="utf-8")
+        meeting = meeting_with(app.settings.meetings_dir, "done")
+        await cog.cog_load()                                         # startup recovery reads every manifest
+        await cog.cog_unload()
         await cog.poster.coro(cog)                                   # one turn of the loop, as it runs
+        channel, _ = make_channel([])
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        started = cog.active is not None
+        await cog.cog_unload()
+        return Meeting.load(meeting.directory), started
 
-    asyncio.run(scenario())
+    meeting, started = asyncio.run(scenario())
+    assert meeting.posted and len(summaries.sent) == 2 and started
 
 
 def test_status_with_no_meetings_says_so(conn, tmp_path):
@@ -544,22 +693,101 @@ def test_if_the_bot_is_kicked_from_the_call_the_recording_stops_and_is_queued(co
     assert "σταμάτησε" in channel.send.await_args.args[0]
 
 
-def test_when_everyone_leaves_the_call_the_recording_stops(conn, tmp_path):
+class Gate:
+    """Stands in for asyncio.sleep: the wait before an empty call stops ends only when the test opens it."""
+
+    def __init__(self):
+        self.waits = []
+        self._open = asyncio.Event()
+
+    async def sleep(self, seconds):
+        self.waits.append(seconds)
+        await self._open.wait()
+
+    async def open(self):
+        self._open.set()
+        await settle()
+
+
+def test_when_everyone_leaves_the_call_the_recording_stops_after_a_grace_period(conn, tmp_path):
+    from bot.cogs.recorder import EMPTY_GRACE
+
     async def scenario():
         cog, app = make_cog(conn, tmp_path)
+        gate = Gate()
+        cog._sleep = gate.sleep
         channel, _ = make_channel([])
         await recording(cog, channel)
         channel.voice_states = {4: object(), BOT_ID: object()}
         await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
-        still_recording = cog.active is not None
+        await settle()
+        someone_left = cog.active is not None and gate.waits == []      # someone is still there: no wait at all
         channel.voice_states = {BOT_ID: object()}
         await cog.on_voice_state_update(SimpleNamespace(id=4), voice_state(channel), voice_state(None))
-        return app, channel, cog, still_recording
+        await settle()
+        waiting = cog.active is not None                                # not instantly
+        await gate.open()
+        return app, channel, cog, someone_left, waiting, gate.waits
 
-    app, channel, cog, still_recording = asyncio.run(scenario())
-    assert still_recording and cog.active is None
+    app, channel, cog, someone_left, waiting, waits = asyncio.run(scenario())
+    assert someone_left and waiting and waits == [EMPTY_GRACE] and cog.active is None
     assert Meeting.load(meeting_dirs(app)[0]).status == "queued"
-    assert channel.send.await_count == 1
+    assert channel.send.await_count == 1 and "σταμάτησε" in channel.send.await_args.args[0]
+
+
+def test_someone_whose_connection_drops_and_who_rejoins_in_time_keeps_the_recording_going(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        gate = Gate()
+        cog._sleep = gate.sleep
+        channel, _ = make_channel([])
+        await recording(cog, channel)
+        channel.voice_states = {BOT_ID: object()}
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))  # repeated
+        await settle()
+        channel.voice_states = {3: object(), BOT_ID: object()}         # back before the wait is over
+        await gate.open()
+        active = cog.active
+        await cog.cog_unload()
+        return active, gate.waits, channel
+
+    active, waits, channel = asyncio.run(scenario())
+    assert active is not None and len(waits) == 1 and channel.send.await_count == 0
+
+
+def test_other_bots_left_in_the_call_do_not_keep_it_recording(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        cog._sleep = AsyncMock()
+        channel, _ = make_channel([])
+        channel.guild = fake_guild(cached=fake_member(5, bot=True))  # a music bot stays in the call
+        await recording(cog, channel)
+        channel.voice_states = {5: object(), BOT_ID: object()}
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await settle()
+        return cog
+
+    assert asyncio.run(scenario()).active is None
+
+
+def test_a_stop_during_the_grace_period_is_not_repeated_when_it_ends(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        gate = Gate()
+        cog._sleep = gate.sleep
+        events = []
+        channel, vc = make_channel(events)
+        await recording(cog, channel)
+        channel.voice_states = {BOT_ID: object()}
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await settle()
+        await cog.stop.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        await gate.open()
+        return events, channel
+
+    events, channel = asyncio.run(scenario())
+    assert events.count("disconnect") == 1 and channel.send.await_count == 0
 
 
 def test_an_automatic_stop_still_finishes_if_the_chat_cannot_be_posted_in(conn, tmp_path):

@@ -127,6 +127,9 @@ def test_private_channels_warn_when_everyone_can_see_them(conn):
     assert "@everyone can see" in run("officer-log", True)
     assert "Warning" not in run("audit-log", False)
     assert "Warning" not in run("ai-ml", True)               # feed channels are meant to be public
+    summaries = run("meeting-summaries", True)                 # it carries every meeting's full transcript
+    assert "@everyone can see" in summaries and "transcript" in summaries
+    assert "Warning" not in run("meeting-summaries", False)
 
 
 def test_setting_a_channel_is_written_to_the_audit_log(conn):

@@ -1,6 +1,7 @@
 """Posting a processed meeting to the summaries channel: a status message, then the summary and the transcript."""
 from __future__ import annotations
 
+import hashlib
 import re
 
 import discord
@@ -62,14 +63,54 @@ def _when(meeting: Meeting) -> str:
     return f"{meeting.started_at:%d/%m/%Y %H:%M}"
 
 
+def _token(status: str, text: str) -> str:
+    return f"{status}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+
+
+def result_token(meeting: Meeting) -> str | None:
+    """What the final post of a meeting in its current state shows: its status and a hash of the summary (`done`)
+    or of the failure reason (`failed`). None if the summary cannot be read (the post will fail and retry).
+
+    By content, not by file times, so moving or restoring the meetings folder never reposts anything.
+    """
+    if meeting.status == "done":
+        try:
+            return _token("done", meeting.summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    return _token(meeting.status, meeting.error or "")
+
+
+def needs_update(meeting: Meeting) -> bool:
+    """Something about the meeting is not in the summaries channel yet.
+
+    A meeting already posted is posted again when it was processed again (deploy/README.md: set the status back to
+    `queued`; or a failed meeting retried): when the bot sees it processing again, or, if the job finished before the
+    bot looked, when its result differs from the one posted. A reprocess that produces the very same result (or
+    fails again for the same reason) without the bot seeing it in between is not posted again; that is already in
+    the channel.
+    """
+    if meeting.status not in STATUS_TEXT:
+        return False
+    if not meeting.posted:
+        return True
+    if meeting.status not in FINAL:
+        return True  # posted, yet processing again: a reprocess was started
+    # Posted by an older version, which kept no token: that post is taken as showing the current result.
+    return meeting.posted_for is not None and meeting.posted_for != result_token(meeting)
+
+
 async def post_update(channel, meeting: Meeting) -> None:
     """Bring the summaries channel up to date with the meeting.
 
     Safe to call again after an error (discord.HTTPException, or OSError for a missing result file): what was
-    already posted is recorded in the meeting, so nothing is posted twice.
+    already posted is recorded in the meeting, so nothing is posted twice, also across a bot restart. A meeting
+    already posted is posted again, with a new status message, once it is processed again (see needs_update).
     """
-    if meeting.posted or meeting.status not in STATUS_TEXT:
+    if not needs_update(meeting):
         return
+    if meeting.posted:
+        meeting.restart_posting()
     await _show_status(channel, meeting)
     if meeting.status == "done":
         await _post_result(channel, meeting)
@@ -81,7 +122,7 @@ async def post_update(channel, meeting: Meeting) -> None:
             f"Δείτε το log της επεξεργασίας στον server.{note}",
             allowed_mentions=NO_MENTIONS,
         )
-        meeting.mark_posted()
+        meeting.mark_posted(_token("failed", meeting.error or ""))
 
 
 async def _show_status(channel, meeting: Meeting) -> None:
@@ -103,6 +144,7 @@ async def _show_status(channel, meeting: Meeting) -> None:
 
 async def _post_result(channel, meeting: Meeting) -> None:
     summary = meeting.summary_path.read_text(encoding="utf-8")
+    token = _token("done", summary)  # of exactly what is posted, so a summary changed meanwhile is posted later
     if not meeting.transcript_path.is_file():
         raise FileNotFoundError(meeting.transcript_path)  # check before posting anything
     header = f"**Σύνοψη συνάντησης {_when(meeting)}**"
@@ -117,4 +159,4 @@ async def _post_result(channel, meeting: Meeting) -> None:
         file=discord.File(meeting.transcript_path, filename=f"transcript-{meeting.id}.txt"),
         allowed_mentions=NO_MENTIONS,
     )
-    meeting.mark_posted()
+    meeting.mark_posted(token)

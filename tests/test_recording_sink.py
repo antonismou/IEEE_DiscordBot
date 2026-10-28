@@ -54,3 +54,37 @@ def test_each_speaker_is_reported_once_with_whatever_the_library_knows_about_the
     sink.write(None, data(ssrc=99))           # known only by their audio stream
     sink.write(None, data(ssrc=1))            # cannot be identified: not reported
     assert heard == [(5, member), (7, None)]
+
+
+def test_the_sink_never_raises_because_that_would_end_receiving_for_everyone():
+    """The library calls write() with no error handling: an exception ends its receiving thread, silently ending
+    the recording for the rest of the meeting while the bot stays in the call."""
+    class Broken:
+        def handle(self, user_id, opus):
+            raise OSError(5, "Input/output error")
+
+    sink = MeetingSink(Broken(), lambda ssrc: None)
+    sink.write(SimpleNamespace(id=7), data())
+    sink.write(SimpleNamespace(id=7), data())
+    assert sink.errors == 2
+
+
+def test_a_write_error_in_the_real_pipeline_does_not_escape_the_sink(tmp_path):
+    from bot.recording.pipeline import SpeakerPipeline
+
+    class Passthrough:
+        def decrypt(self, user_id, payload):
+            return payload
+
+    class Decoder:
+        def decode(self, payload, fec=False):
+            return b"\x01\x00" * 1920
+
+    class FullDisk:
+        def add(self, *args):
+            raise OSError(28, "No space left on device")
+
+    pipeline = SpeakerPipeline(Passthrough(), Decoder, FullDisk(), lambda: 1.0)
+    sink = MeetingSink(pipeline, lambda ssrc: None)
+    sink.write(SimpleNamespace(id=7), data(opus=b"\xfc\x00"))
+    assert pipeline.write_errors == {7: 1} and sink.errors == 0     # counted where it happened

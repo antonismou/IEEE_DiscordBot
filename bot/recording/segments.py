@@ -51,9 +51,12 @@ class SegmentWriter:
         self._open: dict[int, _Open] = {}
         self._counts: dict[int, int] = {}
         self.segments: list[dict] = []
+        self.closed = False
 
     def add(self, speaker: int, pcm: bytes, at: float) -> None:
         with self._lock:
+            if self.closed:
+                return  # a frame the voice thread had already taken when the recording stopped
             self._add(speaker, pcm, at)
 
     def _add(self, speaker: int, pcm: bytes, at: float) -> None:
@@ -70,13 +73,24 @@ class SegmentWriter:
     def flush_idle(self, now: float) -> None:
         """Close the segments of speakers who have been quiet for longer than the gap."""
         with self._lock:
-            for speaker in [s for s, o in self._open.items() if now - o.last_end > self._gap]:
-                self._close(speaker)
+            self._close_all([s for s, o in self._open.items() if now - o.last_end > self._gap])
 
     def close(self) -> None:
+        """Finish every open file. Afterwards nothing more is written, so no file is opened that nobody closes.
+        If a file cannot be finished (disk full) the others still are, and the first error is raised at the end."""
         with self._lock:
-            for speaker in list(self._open):
+            self.closed = True
+            self._close_all(list(self._open))
+
+    def _close_all(self, speakers: list[int]) -> None:
+        error = None
+        for speaker in speakers:
+            try:
                 self._close(speaker)
+            except Exception as exc:  # that file is left out of the manifest; recovery adds or deletes it
+                error = error or exc
+        if error is not None:
+            raise error
 
     def _start(self, speaker: int, at: float) -> _Open:
         self._counts[speaker] = self._counts.get(speaker, 0) + 1
@@ -90,7 +104,7 @@ class SegmentWriter:
         return _Open(wav=wav, file=relative, start=at)
 
     def _close(self, speaker: int) -> None:
-        current = self._open.pop(speaker)
+        current = self._open.pop(speaker)  # first: a file that fails to close is not written to again
         current.wav.close()
         segment = {"speaker": speaker, "file": current.file, "start": current.start, "duration": current.duration}
         self.segments.append(segment)

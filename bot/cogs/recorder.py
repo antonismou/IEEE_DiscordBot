@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Callable
@@ -17,10 +18,11 @@ from bot.channels import MEETING_SUMMARIES
 from bot.checks import officer_only
 from bot.recording.dave import DaveDecryptor
 from bot.recording.meeting import (
-    STALE, Meeting, all_meetings, end_interrupted, find_busy, latest, recover_interrupted,
+    NO_AUDIO_STOPPED, STALE, Meeting, adopt_orphans, all_meetings, end_interrupted, find_busy, latest,
+    recover_interrupted,
 )
 from bot.recording.pipeline import SpeakerPipeline
-from bot.recording.posting import FINAL, STATUS_TEXT, post_update
+from bot.recording.posting import FINAL, STATUS_TEXT, needs_update, post_update
 from bot.recording.segments import SegmentWriter
 from bot.recording.sink import MeetingSink
 from bot.roles import resolve_member
@@ -44,7 +46,22 @@ STOPPED = {  # posted in the same chat when the recording ends without /record s
         "⏹️ **Η ηχογράφηση σταμάτησε:** όλοι αποχώρησαν από την κλήση. Η συνάντηση θα συνοψιστεί."
     ),
 }
+CANCELLED = (  # posted in the same chat when the recording was announced but could not start
+    "⏹️ **Recording cancelled:** it could not start, so nothing was recorded.\n"
+    "⏹️ **Η ηχογράφηση ακυρώθηκε:** δεν μπόρεσε να ξεκινήσει, οπότε δεν ηχογραφήθηκε τίποτα."
+)
+START_FAILED = (
+    "The recording could not start ({error}), so I left the call and nothing was recorded. Check that the bot can "
+    "write to the meetings folder (`meetings_dir`); the bot's log has the details.\n"
+    "Η ηχογράφηση δεν ξεκίνησε ({error}): αποχώρησα από την κλήση και δεν ηχογραφήθηκε τίποτα."
+)
+WRITE_FAILING = (  # posted once in the call's chat when received audio keeps failing to be saved
+    "⚠️ **Audio is not being saved** ({error}). The recording may be incomplete: tell an officer to check the "
+    "server's disk.\n"
+    "⚠️ **Ο ήχος δεν αποθηκεύεται** ({error}). Η ηχογράφηση μπορεί να είναι ελλιπής."
+)
 STATUS_AFTER_STOP = "queued"  # the host's path unit starts the processing job when it sees this
+EMPTY_GRACE = 45  # seconds a call may look empty (someone's connection dropped) before the recording stops
 STAGES = {  # how /record status names each status
     "recording": "recording",
     "queued": "waiting for the processing job to start",
@@ -65,10 +82,21 @@ class ActiveRecording:
     pipeline: SpeakerPipeline
     clock: Callable[[], float]
     flusher: asyncio.Task
+    sink: MeetingSink | None = None
+    empty_check: asyncio.Task | None = None  # the wait before stopping a call that looks empty
+
+    @property
+    def write_errors(self) -> int:
+        """Received frames that could not be saved (and, as a backstop, frames whose handling failed at all)."""
+        return self.pipeline.write_error_count + (self.sink.errors if self.sink else 0)
 
 
 def plural(count: int, word: str) -> str:
     return f"{count} {word}" + ("" if count == 1 else "s")
+
+
+def short(exc: BaseException) -> str:
+    return (str(exc) or type(exc).__name__)[:200]
 
 
 class RecorderCog(commands.Cog):
@@ -77,8 +105,9 @@ class RecorderCog(commands.Cog):
         self.active: ActiveRecording | None = None
         self._warned_no_channel = False
         self._post_problems: set[tuple[str, str]] = set()  # (meeting id, error) already logged
-        self._naming: set[asyncio.Task] = set()  # name lookups in flight (kept so they are not garbage collected)
+        self._naming: set[asyncio.Task] = set()  # name lookups and chat warnings in flight (kept from the GC)
         self._recovery: asyncio.Task | None = None
+        self._sleep = asyncio.sleep  # replaced in tests, so the wait before an empty call stops takes no time
 
     @property
     def app(self):
@@ -106,6 +135,8 @@ class RecorderCog(commands.Cog):
             self._recovery.cancel()  # a meeting not finished yet is held again at the next start
         if self.active:
             self.active.flusher.cancel()
+            if self.active.empty_check:
+                self.active.empty_check.cancel()
 
     async def _finish_recovery(self, held: list[Meeting]) -> None:
         """Name the speakers of meetings recovered without names, then queue them. Only the bot writes a `recording`
@@ -155,31 +186,92 @@ class RecorderCog(commands.Cog):
                 "Give me permission to send messages there.", ephemeral=True,
             )
             return
-        self._begin(voice_client, channel, interaction.user.id)
+        try:
+            self._begin(voice_client, channel, interaction.user.id)
+        except Exception as exc:  # the meetings folder is not writable, the disk is full...
+            log.exception("Could not start recording in channel %s", channel.id)
+            await self._abort_start(voice_client, channel)
+            await interaction.followup.send(START_FAILED.format(error=short(exc)), ephemeral=True)
+            return
         await audit(self.app, interaction, f"started a recording in <#{channel.id}>")
         await interaction.followup.send(
             f"Recording {channel.mention}. Use `/record stop` when the meeting is over.", ephemeral=True
         )
 
     def _begin(self, voice_client, channel, started_by: int) -> None:
+        """Create the meeting and start receiving. On any error nothing is left behind (no active recording, no
+        meeting folder), so the caller only has to leave the call and say why."""
         meeting = Meeting.create(self.app.settings.meetings_dir, channel.id, started_by, datetime.now())
-        began = time.monotonic()
-        clock = lambda: time.monotonic() - began  # noqa: E731
-        writer = SegmentWriter(meeting.directory, on_close=meeting.add_segment)
-        decryptor = DaveDecryptor(lambda: voice_client._connection)
-        pipeline = SpeakerPipeline(decryptor, discord.opus.Decoder, writer, clock)
-        flusher = asyncio.create_task(self._flush_idle_segments(writer, clock))
-        self.active = ActiveRecording(meeting, channel, voice_client, writer, decryptor, pipeline, clock, flusher)
-        active = self.active
-        loop = asyncio.get_running_loop()
+        flusher = None
+        try:
+            began = time.monotonic()
+            clock = lambda: time.monotonic() - began  # noqa: E731
+            loop = asyncio.get_running_loop()
 
-        def heard(user_id, user) -> None:  # on the voice thread: hand over to the loop and return at once
+            def later(callback, *args) -> None:  # on the voice thread: hand over to the loop and return at once
+                try:
+                    loop.call_soon_threadsafe(callback, *args)
+                except RuntimeError:  # the loop is shutting down
+                    pass
+
+            writer = SegmentWriter(meeting.directory, on_close=meeting.add_segment)
+            decryptor = DaveDecryptor(lambda: voice_client._connection)
+            pipeline = SpeakerPipeline(decryptor, discord.opus.Decoder, writer, clock,
+                                       on_failing=lambda exc: later(self._warn_write_failing, meeting, exc))
+            flusher = asyncio.create_task(self._flush_idle_segments(writer, clock))
+            active = ActiveRecording(meeting, channel, voice_client, writer, decryptor, pipeline, clock, flusher)
+            active.sink = MeetingSink(
+                pipeline, voice_client._get_id_from_ssrc,
+                on_new_speaker=lambda user_id, user: later(self._learn_name, active, user_id, user),
+            )
+            self.active = active
+            voice_client.listen(active.sink)
+        except BaseException:
+            self.active = None
+            if flusher:
+                flusher.cancel()
+            self._discard(meeting)
+            raise
+
+    @staticmethod
+    def _discard(meeting: Meeting) -> None:
+        """Remove the folder of a meeting that never started; if that fails, fail it so it blocks nothing."""
+        try:
+            shutil.rmtree(meeting.directory)
+        except OSError:
+            log.exception("Could not remove the folder of meeting %s, which did not start", meeting.id)
             try:
-                loop.call_soon_threadsafe(self._learn_name, active, user_id, user)
-            except RuntimeError:  # the loop is shutting down
-                pass
+                meeting.set_error("the recording could not start")
+                meeting.set_status("failed")
+            except OSError:
+                log.exception("Could not mark meeting %s failed", meeting.id)
 
-        voice_client.listen(MeetingSink(pipeline, voice_client._get_id_from_ssrc, on_new_speaker=heard))
+    async def _abort_start(self, voice_client, channel) -> None:
+        try:
+            await voice_client.disconnect(force=True)
+        except Exception:
+            log.exception("Could not leave the voice channel after a failed start")
+        try:
+            await channel.send(CANCELLED)  # the announcement already said it is recording
+        except discord.HTTPException:
+            log.warning("Could not tell channel %s that the recording was cancelled", channel.id)
+
+    def _warn_write_failing(self, meeting: Meeting, exc: BaseException) -> None:
+        """Received audio keeps failing to be saved: say so once in the call's chat, as people are relying on it."""
+        active = self.active
+        if active is None or active.meeting is not meeting:
+            return
+        log.error("Saving the audio of meeting %s keeps failing: %s", meeting.id, exc)
+
+        async def warn() -> None:
+            try:
+                await active.channel.send(WRITE_FAILING.format(error=short(exc)))
+            except discord.HTTPException:
+                log.warning("Could not warn channel %s that audio is not being saved", active.channel.id)
+
+        task = asyncio.create_task(warn())
+        self._naming.add(task)
+        task.add_done_callback(self._naming.discard)
 
     def _learn_name(self, active: ActiveRecording, user_id: int, user) -> None:
         """Save a speaker's name as soon as they first speak, so a crash or restart does not lose it."""
@@ -195,10 +287,17 @@ class RecorderCog(commands.Cog):
 
     @staticmethod
     async def _flush_idle_segments(writer: SegmentWriter, clock: Callable[[], float]) -> None:
-        """Finish a speaker's file soon after they go quiet, so the processing job can pick it up."""
+        """Finish a speaker's file soon after they go quiet, so the processing job can pick it up. A file that cannot
+        be finished is left to the stop, which adds or deletes it (adopt_orphans); the loop keeps going."""
+        failed = False
         while True:
             await asyncio.sleep(1)
-            writer.flush_idle(clock())
+            try:
+                writer.flush_idle(clock())
+            except Exception:
+                if not failed:
+                    log.exception("Could not finish an audio file")
+                failed = True
 
     @record_group.command(name="stop", description="Stop the recording")
     @officer_only()
@@ -213,18 +312,50 @@ class RecorderCog(commands.Cog):
         await interaction.followup.send(self._report(active), ephemeral=True)
 
     async def _end(self, active: ActiveRecording, guild) -> None:
+        """Leave the call and hand the meeting to the job. Never raises, so the caller always replies: every step
+        runs even if one before it failed, and the meeting always leaves `recording` (queued with the audio it has,
+        or failed with none), unless the manifest itself cannot be written, in which case the next bot start
+        recovers it."""
         active.flusher.cancel()
-        active.voice_client.stop_listening()
-        active.writer.close()
+        if active.empty_check and active.empty_check is not asyncio.current_task():
+            active.empty_check.cancel()
+        meeting = active.meeting
+        try:
+            active.voice_client.stop_listening()
+        except Exception:
+            log.exception("Could not stop receiving audio for meeting %s", meeting.id)
+        problem = None
+        try:
+            active.writer.close()
+        except Exception as exc:  # disk full: wave patches the header on close, then the manifest is rewritten
+            problem = exc
+            log.exception("Could not finish the last audio files of meeting %s", meeting.id)
+        try:
+            adopt_orphans(meeting)  # files whose close or manifest entry failed: kept if usable, else deleted
+        except Exception:
+            log.exception("Could not check meeting %s for unfinished audio files", meeting.id)
         try:
             await self._save_speaker_names(guild, active)
-        finally:
+        except Exception:
+            log.exception("Could not save the speakers' names of meeting %s", meeting.id)
+        try:
             await active.voice_client.disconnect(force=True)  # force: after a kick the connection is already gone
-            active.meeting.set_status(STATUS_AFTER_STOP)
+        except Exception:
+            log.exception("Could not leave the voice channel of meeting %s", meeting.id)
+        try:
+            if meeting.has_audio:
+                meeting.set_status(STATUS_AFTER_STOP)
+            else:  # as after a restart with no audio: failed, so one notice is posted and nothing waits for it
+                reason = f"{NO_AUDIO_STOPPED} (saving it failed: {short(problem)})" if problem else NO_AUDIO_STOPPED
+                meeting.set_error(reason)
+                meeting.set_status("failed")
+        except Exception:
+            log.exception("Could not save the end of meeting %s; the next bot start finishes it", meeting.id)
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after) -> None:
-        """Stop like /record stop would when the bot is kicked (or moved) out of the call, or the call empties."""
+        """Stop like /record stop would when the bot is kicked (or moved) out of the call, at once, or when the call
+        has had nobody in it (other bots do not count) for EMPTY_GRACE seconds: a dropped connection rejoins."""
         active = self.active
         if active is None:
             return
@@ -232,13 +363,33 @@ class RecorderCog(commands.Cog):
         if member.id == self.bot.user.id:
             if after.channel is not None and after.channel.id == recorded:
                 return
-            reason = "kicked"
+            await self._stop_automatically(active, "kicked")
         elif before.channel is not None and before.channel.id == recorded:
-            # voice_states, not members: without the members intent the member cache is mostly empty
-            if any(user_id != self.bot.user.id for user_id in active.channel.voice_states):
+            if self._has_people(active.channel):
                 return
-            reason = "empty"
-        else:
+            if active.empty_check is None or active.empty_check.done():
+                active.empty_check = asyncio.create_task(self._stop_if_still_empty(active))
+
+    def _has_people(self, channel) -> bool:
+        """Anyone in the call but bots. voice_states, not members: without the members intent the member cache is
+        mostly empty, so someone the cache does not know counts as a person."""
+        guild = getattr(channel, "guild", None)
+        for user_id in channel.voice_states:
+            if user_id == self.bot.user.id:
+                continue
+            member = guild.get_member(user_id) if guild is not None else None
+            if member is not None and getattr(member, "bot", False) is True:
+                continue
+            return True
+        return False
+
+    async def _stop_if_still_empty(self, active: ActiveRecording) -> None:
+        await self._sleep(EMPTY_GRACE)
+        if self.active is active and not self._has_people(active.channel):
+            await self._stop_automatically(active, "empty")
+
+    async def _stop_automatically(self, active: ActiveRecording, reason: str) -> None:
+        if self.active is not active:  # stopped meanwhile, by /record stop or the other reason
             return
         self.active = None
         log.info("Recording %s stopped automatically (%s)", active.meeting.id, reason)
@@ -256,10 +407,13 @@ class RecorderCog(commands.Cog):
     def _status_text(self) -> str:
         active = self.active
         if active:
-            return (
+            text = (
                 f"Recording `{active.meeting.id}` in {active.channel.mention} for {active.clock() / 60:.0f} min, "
                 f"{plural(len(active.writer.segments), 'segment')} finished so far. Use `/record stop` to end it."
             )
+            if active.write_errors:
+                text += f"\n**{active.write_errors} audio frames could not be saved** (see the bot's log)."
+            return text
         meeting = latest(self.app.settings.meetings_dir)
         if meeting is None:
             return "No meetings have been recorded yet."
@@ -288,7 +442,7 @@ class RecorderCog(commands.Cog):
     async def post_updates(self) -> None:
         """Post status changes and finished meetings to the summaries channel. Anything not posted stays pending."""
         root = self.app.settings.meetings_dir
-        pending = [m for m in all_meetings(root) if m.status in STATUS_TEXT and not m.posted]
+        pending = [m for m in all_meetings(root) if needs_update(m)]
         if not pending:
             return
         channel_id = self.app.channels.get(MEETING_SUMMARIES)
@@ -320,7 +474,7 @@ class RecorderCog(commands.Cog):
     async def _save_speaker_names(cls, guild, active: ActiveRecording) -> None:
         """Refresh every speaker's name (it may have changed during the call). One that cannot be looked up now keeps
         the name saved when they first spoke, or stays unnamed for the job to show by id."""
-        for user_id in sorted({segment["speaker"] for segment in active.writer.segments}):
+        for user_id in sorted({segment["speaker"] for segment in active.meeting.segments}):
             name = await cls._display_name(guild, user_id)
             if name:
                 active.meeting.set_speaker(user_id, name)
@@ -338,13 +492,16 @@ class RecorderCog(commands.Cog):
 
     @staticmethod
     def _report(active: ActiveRecording) -> str:
-        segments = active.writer.segments
+        segments = active.meeting.segments  # with the files recovered at the stop
         speakers = {segment["speaker"] for segment in segments}
         stats = active.decryptor.stats
         audio = (
             f"Audio frames: {stats['decrypted']} decrypted, {stats['passthrough']} plain, "
-            f"{stats['dropped']} dropped, {stats['errors']} decrypt errors, {active.pipeline.decode_errors} decode errors."
+            f"{stats['dropped']} dropped, {stats['errors']} decrypt errors, "
+            f"{active.pipeline.decode_errors} decode errors, {active.write_errors} not saved."
         )
+        if active.write_errors:
+            audio += "\n**Some audio could not be saved** (disk full or not writable?): see the bot's log."
         if not segments:
             return (
                 f"Recording `{active.meeting.id}` stopped. **No audio was captured.** {audio}\n"

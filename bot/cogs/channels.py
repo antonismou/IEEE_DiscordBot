@@ -55,8 +55,11 @@ class ChannelsCog(commands.Cog):
         await audit(self.app, interaction, f"set `{topic}` to post to <#{channel.id}>")
         text = f"`{topic}` now posts to {channel.mention}."
         if topic in PRIVATE_TOPICS and channel.permissions_for(interaction.guild.default_role).view_channel:
+            shows = (
+                "the full transcript of every recorded meeting" if topic == MEETING_SUMMARIES else "officer activity"
+            )
             text += (
-                f"\n\n**Warning:** @everyone can see {channel.mention}. This channel shows officer activity: "
+                f"\n\n**Warning:** @everyone can see {channel.mention}. This channel shows {shows}: "
                 "make it visible to the Officer role only (channel settings -> Permissions)."
             )
         await interaction.response.send_message(text, ephemeral=True)

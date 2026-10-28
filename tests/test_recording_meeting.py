@@ -1,7 +1,14 @@
 import json
+import os
+import struct
+import wave
 from datetime import datetime
 
-from bot.recording.meeting import Meeting, end_interrupted, find_busy, latest, recover_interrupted
+import pytest
+
+from bot.recording.meeting import (
+    Meeting, adopt_orphans, all_meetings, end_interrupted, find_busy, latest, recover_interrupted,
+)
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
@@ -240,3 +247,123 @@ def test_the_job_can_record_why_it_failed(tmp_path):
 
     assert manifest(meeting)["error"] == "Ollama 500"
     assert Meeting.load(meeting.directory).error == "Ollama 500"
+
+
+def test_two_meetings_started_in_the_same_second_get_different_folders(tmp_path):
+    """Also the autumn clock change, when the same local hour happens twice."""
+    first = Meeting.create(tmp_path, 11, 22, NOW)
+    second = Meeting.create(tmp_path, 11, 22, NOW)
+
+    assert (first.id, second.id) == ("20261025-183005", "20261025-183005-2")
+    assert manifest(second)["id"] == second.id and latest(tmp_path).id == second.id
+
+
+def test_a_meeting_whose_manifest_cannot_be_written_leaves_no_folder(tmp_path, monkeypatch):
+    def disk_full(self):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(Meeting, "save", disk_full)
+    with pytest.raises(OSError):
+        Meeting.create(tmp_path, 11, 22, NOW)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_unreadable_manifest_is_skipped_and_logged_once(tmp_path, caplog):
+    good = Meeting.create(tmp_path, 11, 22, NOW)
+    good.set_status("queued")
+    for name, text in (("20261026-100000", '{"id": "20261026-100000", "status": "queued",'),   # truncated
+                       ("20261026-110000", "[1, 2]"),                                           # not a meeting
+                       ("20261026-120000", '{"id": "x"}')):                                     # fields missing
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "manifest.json").write_text(text, encoding="utf-8")
+
+    assert find_busy(tmp_path).id == good.id
+    assert [m.id for m in all_meetings(tmp_path)] == [good.id]
+    assert recover_interrupted(tmp_path) == []
+    assert latest(tmp_path).id == good.id
+    assert sum("cannot be read" in record.message for record in caplog.records) == 3   # once per folder
+
+
+def write_wav(path, seconds, *, close=True):
+    """A WAV as SegmentWriter writes it; with close=False it is left as the bot leaves it when it dies."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wav = wave.open(str(path), "wb")
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(16000)
+    wav.writeframes(b"\x01\x00" * int(16000 * seconds))
+    if close:
+        wav.close()
+    return wav
+
+
+def written_at(meeting, path, seconds_after_start):
+    moment = meeting.started_at.timestamp() + seconds_after_start
+    os.utime(path, (moment, moment))
+
+
+def test_recovery_adds_the_audio_that_was_still_being_written_when_the_bot_died(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    write_wav(meeting.directory / "7/000001.wav", 2.0)
+    meeting.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 1.0, "duration": 2.0})
+    left_open = write_wav(meeting.directory / "7/000002.wav", 3.0, close=False)     # the bot is killed here
+    written_at(meeting, meeting.directory / "7/000002.wav", 60.0)
+
+    recover_interrupted(tmp_path)
+    left_open.close()
+
+    loaded = Meeting.load(meeting.directory)
+    assert loaded.status == "queued"
+    assert loaded.segments[1] == {"speaker": 7, "file": "7/000002.wav", "start": 57.0, "duration": 3.0}
+
+
+def test_a_recovered_file_whose_header_was_not_patched_is_repaired(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    path = meeting.directory / "8/000001.wav"
+    write_wav(path, 1.0)
+    data = bytearray(path.read_bytes())
+    data[4:8] = data[40:44] = struct.pack("<I", 0)                  # the header still says it is empty
+    path.write_bytes(bytes(data) + b"\x01")                          # and the last sample is only half written
+    written_at(meeting, path, 10.0)
+
+    [segment] = adopt_orphans(meeting)
+
+    assert segment == {"speaker": 8, "file": "8/000001.wav", "start": 9.0, "duration": 1.0}
+    with wave.open(str(path), "rb") as wav:
+        assert wav.getnframes() == 16000 and len(wav.readframes(16000)) == 32000
+    assert Meeting.load(meeting.directory).segments == [segment]
+
+
+def test_a_recovered_file_never_starts_before_the_same_speakers_previous_one_ends(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    meeting.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 100.0, "duration": 5.0})
+    write_wav(meeting.directory / "7/000002.wav", 2.0)
+    written_at(meeting, meeting.directory / "7/000002.wav", 50.0)            # a clock that does not fit
+
+    [segment] = adopt_orphans(meeting)
+    assert segment["start"] == 105.0
+
+
+def test_recovery_deletes_audio_files_that_hold_nothing_usable(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    (meeting.directory / "7").mkdir()
+    (meeting.directory / "7/000001.wav").write_bytes(b"")                      # killed before the first frame
+    (meeting.directory / "7/000002.wav").write_bytes(b"RIFF\x00\x00")          # header cut short
+    write_wav(meeting.directory / "7/000003.wav", 0.0)                          # a header and no audio
+    (meeting.directory / "7/000004.wav").write_bytes(b"not a wav at all" * 10)
+
+    recover_interrupted(tmp_path)
+
+    assert list(meeting.directory.rglob("*.wav")) == []
+    loaded = Meeting.load(meeting.directory)
+    assert loaded.status == "failed" and loaded.segments == []
+
+
+def test_recovery_leaves_listed_files_and_files_outside_speaker_folders_alone(tmp_path):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    write_wav(meeting.directory / "7/000001.wav", 1.0)
+    meeting.add_segment({"speaker": 7, "file": "7/000001.wav", "start": 4.0, "duration": 1.0})
+    write_wav(meeting.directory / "notes/x.wav", 1.0)
+
+    assert adopt_orphans(meeting) == []
+    assert (meeting.directory / "notes/x.wav").exists()
