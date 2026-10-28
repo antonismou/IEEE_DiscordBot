@@ -16,7 +16,8 @@ and IEEE Xplore RSS items.
 5. **Run:** `docker compose up -d --build`, then watch `docker compose logs -f`.
    `config.toml` must exist **before** the first `up`; otherwise Docker creates an empty folder with that name
    (the bot tells you so and how to fix it). The database lives in a Docker volume, so there is no data folder
-   to create and no file owner to set.
+   to create for it; only meeting recordings need a host folder, created before the first `up` with
+   `sudo install -d -m 700 -o 1000 -g 1000 data/meetings` (see [`deploy/README.md`](deploy/README.md)).
 6. **Check the feeds from the server's own network:**
    `docker compose run --rm bot python -m scripts.check_feeds /app/config.toml` (all lines should say `OK`;
    IEEE may block some addresses, which is why this runs on the server).
@@ -102,6 +103,11 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
 
 The data lives in the Docker volume `bot-data`, not in the project folder. Copy the backups out with
 `docker compose cp bot:/app/data/backups ./backups-copy`.
+
+Meeting recordings, transcripts and summaries are the exception: they live in the host folder `data/meetings`
+(bind-mounted into the bot and the processing job; create it once with
+`sudo install -d -m 700 -o 1000 -g 1000 data/meetings`). Processing runs in separate one-shot containers started by
+a systemd timer on the host; see [`deploy/README.md`](deploy/README.md) for the install steps and the models.
 
 `docker compose down` and updates keep the data. **`docker compose down -v` deletes the volume, and with it all
 stored members**, so never add `-v` unless you mean it.

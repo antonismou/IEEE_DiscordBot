@@ -1,0 +1,12 @@
+# Keep secrets, recordings and other checkouts out of the build context.
+.git
+.claude
+.superpowers
+.venv
+.pytest_cache
+**/__pycache__
+*.pyc
+.env
+config.toml
+data
+benchmark-results-*.txt
