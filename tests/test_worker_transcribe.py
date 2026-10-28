@@ -1,8 +1,15 @@
+import logging
+import wave
 from datetime import datetime
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
+
 from bot.recording.meeting import Meeting
-from worker.transcribe import format_offset, transcribe_meeting, write_transcript
+from bot.recording.segments import SegmentWriter
+from worker import transcribe as stage
+from worker.transcribe import AudioError, format_offset, read_wav, write_transcript
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
 
@@ -35,6 +42,12 @@ def meeting_with(tmp_path, segments, speakers=None, status="recording"):
         meeting.add_segment({"speaker": speaker, "file": relative, "start": start, "duration": 1.0})
     meeting.set_status(status)
     return meeting
+
+
+def transcribe_meeting(directory, **options):
+    """The real stage, with each file's path given to the fake model instead of its samples, so the fake knows which
+    file it got. The tests at the end read real WAVs."""
+    return stage.transcribe_meeting(directory, **{"load_audio": str, **options})
 
 
 def factory(model):
@@ -198,3 +211,94 @@ def test_write_transcript_uses_only_finished_segments(tmp_path):
     assert path == meeting.directory / "transcript.txt"
     assert transcript(meeting) == "[00:00:03] Μαρία: Μόνο αυτό.\n"
 
+
+# --- reading the audio ------------------------------------------------------------------------------------------
+
+def write_wav(path, samples, channels=1, width=2, rate=16000):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(np.asarray(samples, dtype="<i2").tobytes())
+
+
+class SamplesModel:
+    """A faster-whisper stand-in that records what it was given."""
+
+    def __init__(self, text="Γεια."):
+        self.text = text
+        self.given = []
+
+    def transcribe(self, audio, **options):
+        self.given.append(audio)
+        return iter([SimpleNamespace(text=self.text)]), SimpleNamespace(language="el")
+
+
+def test_a_wav_the_bot_writes_is_read_as_float_samples_between_minus_one_and_one(tmp_path):
+    writer = SegmentWriter(tmp_path)
+    writer.add(7, np.array([0, 16384, -32768, 32767] * 4000, dtype="<i2").tobytes(), 0.0)
+    writer.close()
+
+    samples = read_wav(tmp_path / "7" / "000001.wav")
+
+    assert isinstance(samples, np.ndarray) and samples.dtype == np.float32 and samples.shape == (16000,)
+    assert samples[:4].tolist() == [0.0, 0.5, -1.0, 32767 / 32768]
+
+
+def test_whisper_gets_the_samples_not_the_path_so_its_own_decoder_is_never_used(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    write_wav(meeting.directory / "7/000001.wav", [1000] * 16000)
+    model = SamplesModel()
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(model)) == 1
+
+    [audio] = model.given
+    assert isinstance(audio, np.ndarray) and audio.dtype == np.float32 and len(audio) == 16000
+    assert transcript(meeting) == "[00:00:00] Μαρία: Γεια.\n"
+    assert not (meeting.directory / "7/000001.wav").exists()
+
+
+@pytest.mark.parametrize("content", [b"", "header only", "too short"])
+def test_a_segment_with_nothing_to_hear_is_done_with_no_text_and_no_model(tmp_path, content):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    audio = meeting.directory / "7/000001.wav"
+    if content == "header only":
+        write_wav(audio, [])
+    elif content == "too short":
+        write_wav(audio, [500] * 100)
+    else:
+        audio.write_bytes(content)
+    make = factory(SamplesModel())
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=make) == 1
+
+    assert make.created == []
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
+    assert not audio.exists()
+    assert transcript(meeting) == ""
+
+
+@pytest.mark.parametrize("write, reason", [
+    (lambda path: path.write_bytes(b"RIFF"), "not a readable WAV"),
+    (lambda path: path.write_bytes(b"not a wav file at all, just some bytes"), "not a readable WAV"),
+    (lambda path: write_wav(path, [0] * 32000, channels=2), "expected mono 16-bit at 16000 Hz"),
+    (lambda path: write_wav(path, [0] * 16000, rate=48000), "48000 Hz"),
+])
+def test_a_corrupt_segment_fails_with_a_clear_error_and_keeps_its_audio(tmp_path, caplog, write, reason):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    write(meeting.directory / "7/000001.wav")
+    write_wav(meeting.directory / "8/000001.wav", [1000] * 16000)
+    caplog.set_level(logging.ERROR)
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel("Εντάξει."))) == 1
+
+    assert (meeting.directory / "7/000001.wav").exists() and not (meeting.directory / "7/000001.txt").exists()
+    assert transcript(meeting) == "[00:00:02] Νίκος: Εντάξει.\n"
+    assert "7/000001.wav" in caplog.text and reason in caplog.text
+
+
+def test_read_wav_raises_audio_error_for_a_file_that_is_not_a_wav(tmp_path):
+    (tmp_path / "x.wav").write_bytes(b"RIFF")
+    with pytest.raises(AudioError, match="x.wav"):
+        read_wav(tmp_path / "x.wav")

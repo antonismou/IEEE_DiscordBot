@@ -1,6 +1,7 @@
 import fcntl
 import gc
 import json
+import wave
 import weakref
 from datetime import datetime, timedelta
 from functools import partial
@@ -18,6 +19,15 @@ NOW = datetime(2026, 10, 25, 18, 30, 5)
 SUMMARY = "## Θέματα\n- Workshop\n"
 
 
+def write_wav(path, seconds=1.0):
+    """A segment as the bot writes it: 16 kHz, mono, 16-bit."""
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\x10\x00" * int(16000 * seconds))
+
+
 def meeting_with(root, segments, status="queued", minute=30, transcribed=()):
     """A meeting with WAV segments `(speaker, number, start)`; those in `transcribed` already have their text."""
     meeting = Meeting.create(root, 11, 22, NOW.replace(minute=minute))
@@ -29,7 +39,7 @@ def meeting_with(root, segments, status="queued", minute=30, transcribed=()):
         if (speaker, number) in transcribed:
             audio.with_suffix(".txt").write_text(f"ήδη {number}", encoding="utf-8")
         else:
-            audio.write_bytes(b"RIFF")
+            write_wav(audio)
         meeting.add_segment({"speaker": speaker, "file": relative, "start": start, "duration": 1.0})
     meeting.set_status(status)
     return meeting
@@ -315,7 +325,7 @@ class GrowingModel:
 
     def transcribe(self, path, **options):
         if not (self.bot_meeting.directory / "7/000002.wav").exists():
-            (self.bot_meeting.directory / "7/000002.wav").write_bytes(b"RIFF")
+            write_wav(self.bot_meeting.directory / "7/000002.wav")
             self.bot_meeting.add_segment({"speaker": 7, "file": "7/000002.wav", "start": 9.0, "duration": 1.0})
         return iter([SimpleNamespace(text="Γεια.")]), SimpleNamespace(language="el")
 

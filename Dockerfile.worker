@@ -6,12 +6,12 @@ ENV TZ=Europe/Athens \
     PYTHONUNBUFFERED=1 \
     HF_HOME=/home/worker/.cache/huggingface
 # tzdata for local timestamps; nice (coreutils) and ionice (util-linux) are already in the base image.
-# faster-whisper decodes audio with PyAV, so no ffmpeg is needed.
+# The worker reads the WAVs with Python's wave module (worker/transcribe.py), so no ffmpeg is needed.
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY worker/requirements.txt worker-requirements.txt
-RUN pip install --no-cache-dir -r worker-requirements.txt requests
+RUN pip install --no-cache-dir -r worker-requirements.txt "requests>=2.31,<3"
 # The worker shares only the manifest code with the bot; the rest of bot/ (discord, voice) is not needed.
 COPY bot/__init__.py bot/__init__.py
 COPY bot/recording/__init__.py bot/recording/meeting.py bot/recording/

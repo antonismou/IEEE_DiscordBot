@@ -6,8 +6,6 @@ fix: a fix may change the assertions as long as the failure scenario is handled.
 from datetime import datetime
 from pathlib import Path
 
-import pytest
-
 from bot.recording.meeting import Meeting, find_busy, recover_interrupted
 from bot.recording.segments import SegmentWriter
 from worker.run import Config, run
