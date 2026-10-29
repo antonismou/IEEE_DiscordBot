@@ -23,7 +23,7 @@ def test_audio_of_a_segment_open_when_the_bot_died_is_recovered_or_deleted(tmp_p
 
     class Model:
         def transcribe(self, path, **options):
-            return iter([type("P", (), {"text": "λόγια"})()]), None
+            return iter([type("P", (), {"text": "λόγια", "start": 0.0})()]), None
 
     transcribe_meeting(meeting.directory, model_factory=lambda name, threads: Model())
     left = sorted(p.relative_to(meeting.directory).as_posix() for p in meeting.directory.rglob("*.wav"))

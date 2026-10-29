@@ -31,10 +31,12 @@ meetings folder and the fixed container name also prevent overlap.
 
 ### How long after `/record stop`
 
-Rough numbers for the server's CPU (Whisper turbo about 1.2 s per second of speech; Gemma 3 12B reads about 7
-tokens/s and writes about 2.7 tokens/s), for a 1-hour meeting:
+Rough numbers for the server's CPU (Whisper turbo about 1.2 s per second of speech at beam 1; Gemma 3 12B reads
+about 7 tokens/s and writes about 2.7 tokens/s), for a 1-hour meeting:
 
-- transcription runs during the call and leaves a tail of about 10-15 minutes after it ends;
+- transcription runs during the call and leaves a tail of about 10-15 minutes after it ends. The worker now uses
+  beam 3 (`worker/transcribe.py`), estimated at 10-25% slower and not yet measured, so expect a somewhat longer
+  tail; on long meetings it grows, as the live runs fall behind the call;
 - the summary takes about 53 minutes: five 12-minute windows at about 10 minutes each, plus the merge pass;
 - so the summary is posted about **1 hour 5 minutes** after `/record stop`.
 

@@ -613,7 +613,7 @@ class GrowingModel:
         if not (self.bot_meeting.directory / "7/000002.wav").exists():
             write_wav(self.bot_meeting.directory / "7/000002.wav")
             self.bot_meeting.add_segment({"speaker": 7, "file": "7/000002.wav", "start": 9.0, "duration": 1.0})
-        return iter([SimpleNamespace(text="Γεια.")]), SimpleNamespace(language="el")
+        return iter([SimpleNamespace(text="Γεια.", start=0.0)]), SimpleNamespace(language="el")
 
 
 def test_a_segment_the_bot_adds_during_a_pass_is_never_lost(tmp_path):

@@ -15,7 +15,8 @@ NOW = datetime(2026, 10, 25, 18, 30, 5)
 
 
 class FakeModel:
-    """Stands in for a faster-whisper WhisperModel: the text for each file comes from `texts`."""
+    """Stands in for a faster-whisper WhisperModel: the text for each file comes from `texts`, its pieces split at
+    "|" and starting 4 seconds apart."""
 
     def __init__(self, texts, fail=()):
         self.texts = texts
@@ -27,7 +28,8 @@ class FakeModel:
         name = "/".join(path.split("/")[-2:])
         if name in self.fail:
             raise RuntimeError("decode failed")
-        pieces = [SimpleNamespace(text=t) for t in self.texts.get(name, "").split("|")]
+        texts = self.texts.get(name, "").split("|")
+        pieces = [SimpleNamespace(text=t, start=4.0 * n) for n, t in enumerate(texts)]
         return iter(pieces), SimpleNamespace(language="el")
 
 
@@ -85,13 +87,50 @@ def test_speakers_are_merged_by_start_offset(tmp_path):
     )
 
 
-def test_the_pieces_of_a_segment_are_joined_into_one_line(tmp_path):
+def test_each_piece_of_a_segment_gets_its_own_line_and_time(tmp_path):
     meeting = meeting_with(tmp_path, [(7, 1, 3725.0)], {7: "Μαρία"})
     model = FakeModel({"7/000001.wav": " Πρώτα αυτό.| Μετά εκείνο. "})
 
     transcribe_meeting(meeting.directory, model_factory=factory(model))
 
-    assert transcript(meeting) == "[01:02:05] Μαρία: Πρώτα αυτό. Μετά εκείνο.\n"
+    assert transcript(meeting) == "[01:02:05] Μαρία: Πρώτα αυτό.\n[01:02:09] Μαρία: Μετά εκείνο.\n"
+
+
+def test_pieces_of_different_speakers_are_interleaved_by_time(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    model = FakeModel({"7/000001.wav": "Ένα.|Τρία.", "8/000001.wav": "Δύο."})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == (
+        "[00:00:00] Μαρία: Ένα.\n[00:00:02] Νίκος: Δύο.\n[00:00:04] Μαρία: Τρία.\n"
+    )
+
+
+@pytest.mark.parametrize("invented", [
+    "Υπότιτλοι AUTHORWAVE", "Υπότιτλοι από την κοινότητα Amara.org", "Subtitles by the Amara.org community",
+    "Ευχαριστώ που παρακολουθήσατε!", "Ευχαριστούμε πολύ για την παρακολούθηση.", "Μην ξεχάσετε να εγγραφείτε!",
+])
+def test_text_whisper_invents_on_silence_is_dropped(tmp_path, invented):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    model = FakeModel({"7/000001.wav": f"Ας κάνουμε ένα διάλειμμα.|{invented}"})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == "[00:00:00] Μαρία: Ας κάνουμε ένα διάλειμμα.\n"
+
+
+@pytest.mark.parametrize("real", [
+    "Πρέπει να βάλουμε υπότιτλοι στο βίντεο του workshop, γιατί πολλοί το βλέπουν χωρίς ήχο.",
+    "Ευχαριστώ για την προσοχή σας.",
+    "Οι υπότιτλοι είναι έτοιμοι.",
+])
+def test_the_same_words_in_real_speech_are_kept(tmp_path, real):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": real})))
+
+    assert transcript(meeting) == f"[00:00:00] Μαρία: {real}\n"
 
 
 def test_the_whisper_settings_are_passed_to_the_model(tmp_path):
@@ -104,17 +143,29 @@ def test_the_whisper_settings_are_passed_to_the_model(tmp_path):
     assert make.created == [("large-v3-turbo", 8)]
     [(path, options)] = model.calls
     assert path == str(meeting.directory / "7/000001.wav")
-    assert options["language"] == "el" and options["beam_size"] == 1 and options["vad_filter"] is True
-    assert "IEEE Student Branch" in options["initial_prompt"] and "workshop" in options["initial_prompt"]
+    assert options["language"] == "el" and options["beam_size"] == 3 and options["vad_filter"] is True
+    assert options["condition_on_previous_text"] is False and "initial_prompt" not in options
+    assert "IEEE Student Branch" in options["hotwords"] and "Discord" in options["hotwords"]
 
 
 def test_each_transcript_is_saved_next_to_its_audio_and_the_audio_deleted(tmp_path):
     meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
 
-    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Γεια."})))
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Γεια.|Τι κάνετε;"})))
 
-    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == "Γεια."
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == "0.00\tΓεια.\n4.00\tΤι κάνετε;\n"
     assert not (meeting.directory / "7/000001.wav").exists()
+
+
+def test_a_plain_text_saved_by_an_older_worker_is_one_line_at_the_segment_start(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 5.0)], {7: "Μαρία"})
+    (meeting.directory / "7/000001.txt").write_text("Από πριν. Και άλλο.", encoding="utf-8")
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000002.wav": "Νέο.|Κι άλλο."})))
+
+    assert transcript(meeting) == (
+        "[00:00:00] Μαρία: Από πριν. Και άλλο.\n[00:00:05] Μαρία: Νέο.\n[00:00:09] Μαρία: Κι άλλο.\n"
+    )
 
 
 def test_segments_that_already_have_a_transcript_are_skipped(tmp_path):
@@ -232,7 +283,7 @@ class SamplesModel:
 
     def transcribe(self, audio, **options):
         self.given.append(audio)
-        return iter([SimpleNamespace(text=self.text)]), SimpleNamespace(language="el")
+        return iter([SimpleNamespace(text=self.text, start=0.0)]), SimpleNamespace(language="el")
 
 
 def test_a_wav_the_bot_writes_is_read_as_float_samples_between_minus_one_and_one(tmp_path):

@@ -76,6 +76,7 @@ def attempts(meeting):
 class Piece:
     def __init__(self, text):
         self.text = text
+        self.start = 0.0
 
 
 class FakeWhisper:
