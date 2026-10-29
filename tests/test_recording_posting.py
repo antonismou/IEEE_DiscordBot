@@ -236,6 +236,20 @@ def test_a_meeting_posted_by_an_older_version_is_not_posted_again(tmp_path):
     assert channel.sent == []
 
 
+def test_a_posted_summary_that_cannot_be_read_is_left_as_posted_until_it_can(tmp_path):
+    """Unreadable is not a new result: the posted record must not be wiped every turn, nor the summary reposted."""
+    channel = FakeChannel()
+    meeting = run(channel, meeting_with(tmp_path, "done"))
+    meeting.summary_path.unlink()                                         # restored from a partial backup, say
+
+    meeting = run(channel, Meeting.load(meeting.directory))
+    meeting = run(channel, Meeting.load(meeting.directory))
+    assert len(channel.sent) == 2 and meeting.posted
+
+    meeting.summary_path.write_text(SUMMARY, encoding="utf-8")            # back as it was: nothing new to post
+    assert run(channel, Meeting.load(meeting.directory)).posted and len(channel.sent) == 2
+
+
 @pytest.mark.parametrize("status", ["recording", "interrupted"])
 def test_meetings_that_are_not_being_processed_are_left_alone(tmp_path, status):
     channel = FakeChannel()

@@ -285,17 +285,40 @@ def test_a_segment_with_nothing_to_hear_is_done_with_no_text_and_no_model(tmp_pa
     (lambda path: write_wav(path, [0] * 32000, channels=2), "expected mono 16-bit at 16000 Hz"),
     (lambda path: write_wav(path, [0] * 16000, rate=48000), "48000 Hz"),
 ])
-def test_a_corrupt_segment_fails_with_a_clear_error_and_keeps_its_audio(tmp_path, caplog, write, reason):
+def test_a_corrupt_segment_is_recorded_as_lost_with_a_clear_warning(tmp_path, caplog, write, reason):
+    """It can never be read, so retrying it would only keep the meeting from finishing."""
     meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
     write(meeting.directory / "7/000001.wav")
     write_wav(meeting.directory / "8/000001.wav", [1000] * 16000)
-    caplog.set_level(logging.ERROR)
+    caplog.set_level(logging.WARNING)
 
-    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel("Εντάξει."))) == 1
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel("Εντάξει."))) == 2
 
-    assert (meeting.directory / "7/000001.wav").exists() and not (meeting.directory / "7/000001.txt").exists()
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
     assert transcript(meeting) == "[00:00:02] Νίκος: Εντάξει.\n"
-    assert "7/000001.wav" in caplog.text and reason in caplog.text
+    assert "7/000001.wav" in caplog.text and reason in caplog.text and "lost" in caplog.text
+
+
+def test_a_segment_whose_file_cannot_be_opened_keeps_its_audio_for_a_retry(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel()),
+                                    load_audio=unreadable) == 0
+    assert (meeting.directory / "7/000001.wav").exists() and not (meeting.directory / "7/000001.txt").exists()
+
+
+def test_a_segment_with_no_audio_and_no_text_is_recorded_as_lost(tmp_path, caplog):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    (meeting.directory / "7/000001.wav").unlink()  # deleted by an older worker when the meeting failed
+
+    assert transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"8/000001.wav": "Ναι."}))) == 2
+
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
+    assert transcript(meeting) == "[00:00:02] Νίκος: Ναι.\n"
+    assert "7/000001.wav" in caplog.text and "lost" in caplog.text
 
 
 def test_read_wav_raises_audio_error_for_a_file_that_is_not_a_wav(tmp_path):

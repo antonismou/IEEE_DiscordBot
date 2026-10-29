@@ -145,6 +145,23 @@ def test_if_the_announcement_cannot_be_posted_nothing_is_recorded(conn, tmp_path
     assert "announce" in reply_text(interaction).lower()
 
 
+def test_any_error_posting_the_announcement_still_makes_the_bot_leave_and_answer(conn, tmp_path):
+    """Not only an HTTPException: the bot must never stay in the call, even if leaving fails as well."""
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events, send_error=RuntimeError("session closed"))
+        vc.disconnect.side_effect = RuntimeError("not connected")
+        interaction = fake_interaction(officer_in(channel), fake_guild())
+        await cog.start.callback(cog, interaction)
+        return app, cog, vc, interaction
+
+    app, cog, vc, interaction = asyncio.run(scenario())
+    vc.disconnect.assert_awaited_once_with(force=True)
+    assert cog.active is None and not cog._starting and meeting_dirs(app) == []
+    assert "announce" in reply_text(interaction).lower()
+
+
 def test_if_the_meeting_cannot_be_saved_the_bot_leaves_says_why_and_can_start_again_later(conn, tmp_path):
     """A meetings folder the bot cannot write (a root-owned bind mount, a full disk): it must not stay in the call
     claiming to record, the command must get an answer, and a later start must work once it is fixed."""
@@ -761,14 +778,42 @@ def test_other_bots_left_in_the_call_do_not_keep_it_recording(conn, tmp_path):
         cog, app = make_cog(conn, tmp_path)
         cog._sleep = AsyncMock()
         channel, _ = make_channel([])
-        channel.guild = fake_guild(cached=fake_member(5, bot=True))  # a music bot stays in the call
+        music_bot = fake_member(5, bot=True)                             # a music bot stays in the call
+        channel.guild.get_member = lambda user_id: music_bot if user_id == 5 else None  # only 5 is a bot
+        channel.voice_states = {3: object(), 5: object(), BOT_ID: object()}
         await recording(cog, channel)
+        await settle()
+        before = cog.active is not None                                  # the officer still counts as a person
         channel.voice_states = {5: object(), BOT_ID: object()}
         await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
         await settle()
-        return cog
+        return before, cog
 
-    assert asyncio.run(scenario()).active is None
+    before, cog = asyncio.run(scenario())
+    assert before and cog.active is None
+
+
+def test_another_bot_joining_an_empty_call_does_not_cancel_the_grace_period(conn, tmp_path):
+    """Other bots do not count as people, so one joining must not reset the wait (spec: Automatic stop)."""
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        gate = Gate()
+        cog._sleep = gate.sleep
+        channel, _ = make_channel([])
+        music_bot = fake_member(5, bot=True)
+        channel.guild.get_member = lambda user_id: music_bot if user_id == 5 else None  # only 5 is a bot
+        await recording(cog, channel)
+        channel.voice_states = {BOT_ID: object()}
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await settle()
+        channel.voice_states = {5: object(), BOT_ID: object()}                 # a music bot joins meanwhile
+        await cog.on_voice_state_update(SimpleNamespace(id=5), voice_state(None), voice_state(channel))
+        await settle()
+        await gate.open()
+        return app, cog
+
+    app, cog = asyncio.run(scenario())
+    assert cog.active is None and Meeting.load(meeting_dirs(app)[0]).status == "queued"
 
 
 def test_a_stop_during_the_grace_period_is_not_repeated_when_it_ends(conn, tmp_path):
@@ -817,3 +862,139 @@ def test_voice_changes_elsewhere_do_not_stop_the_recording(conn, tmp_path):
         return active
 
     assert asyncio.run(scenario()) is not None
+
+
+class Gates:
+    """Like Gate, but each wait has its own gate, so one grace period can end while a later one goes on."""
+
+    def __init__(self):
+        self.waits = []
+        self._gates = []
+
+    async def sleep(self, seconds):
+        self.waits.append(seconds)
+        gate = asyncio.Event()
+        self._gates.append(gate)
+        await gate.wait()
+
+    async def open(self, number):
+        self._gates[number].set()
+        await settle()
+
+
+def test_someone_who_rejoins_and_leaves_again_gets_a_whole_new_grace_period(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        gates = Gates()
+        cog._sleep = gates.sleep
+        channel, _ = make_channel([])
+        await recording(cog, channel)
+        channel.voice_states = {BOT_ID: object()}
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await settle()
+        channel.voice_states = {3: object(), BOT_ID: object()}                 # back in time
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(None), voice_state(channel))
+        await settle()
+        channel.voice_states = {BOT_ID: object()}                              # and gone again, a while later
+        await cog.on_voice_state_update(SimpleNamespace(id=3), voice_state(channel), voice_state(None))
+        await settle()
+        await gates.open(0)                                                    # when the first wait would end
+        kept = cog.active is not None
+        await gates.open(1)
+        return kept, cog, gates.waits
+
+    kept, cog, waits = asyncio.run(scenario())
+    assert kept and cog.active is None and len(waits) == 2
+
+
+def test_two_starts_at_once_record_only_once(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events)
+        joined = asyncio.Event()
+
+        async def slow_connect(**kw):
+            events.append("connect")
+            await joined.wait()
+            return vc
+        channel.connect.side_effect = slow_connect
+        first = fake_interaction(officer_in(channel), fake_guild())
+        second = fake_interaction(officer_in(channel), fake_guild())
+        task = asyncio.create_task(cog.start.callback(cog, first))
+        await settle()
+        again = asyncio.create_task(cog.start.callback(cog, second))           # while the first is still joining
+        await settle()
+        joined.set()
+        await asyncio.gather(task, again)
+        await cog.cog_unload()
+        return app, events, second
+
+    app, events, second = asyncio.run(scenario())
+    assert events.count("connect") == 1 and len(meeting_dirs(app)) == 1
+    assert "already" in reply_text(second).lower()
+
+
+def test_a_join_that_fails_unexpectedly_leaves_no_voice_client_behind(conn, tmp_path):
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        events = []
+        channel, vc = make_channel(events)
+        leftover = FakeVoiceClient(events)                                     # registered before the handshake
+        channel.guild.voice_client = leftover
+        channel.connect.side_effect = RuntimeError("voice handshake failed")
+        interaction = fake_interaction(officer_in(channel), fake_guild())
+        await cog.start.callback(cog, interaction)
+        channel.guild.voice_client = None
+        channel.connect.side_effect = lambda **kw: events.append("connect") or vc
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        again = cog.active is not None
+        await cog.cog_unload()
+        return app, leftover, interaction, again
+
+    app, leftover, interaction, again = asyncio.run(scenario())
+    leftover.disconnect.assert_awaited_once_with(force=True)
+    assert "couldn't join" in reply_text(interaction) and again and len(meeting_dirs(app)) == 1
+
+
+def test_an_officer_who_leaves_while_the_bot_joins_still_gets_the_empty_call_stop(conn, tmp_path):
+    from bot.cogs.recorder import EMPTY_GRACE
+
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path)
+        gate = Gate()
+        cog._sleep = gate.sleep
+        events = []
+        channel, vc = make_channel(events)
+
+        def connect(**kw):
+            channel.voice_states = {BOT_ID: object()}                          # left before the recording began
+            return vc
+        channel.connect.side_effect = connect
+        await cog.start.callback(cog, fake_interaction(officer_in(channel), fake_guild()))
+        await settle()
+        waits = list(gate.waits)
+        await gate.open()
+        return app, cog, waits
+
+    app, cog, waits = asyncio.run(scenario())
+    assert waits == [EMPTY_GRACE] and cog.active is None
+    assert Meeting.load(meeting_dirs(app)[0]).status == "failed"               # stopped with no audio
+
+
+def test_a_malformed_manifest_does_not_stop_the_later_meetings_from_being_posted(conn, tmp_path):
+    summaries = FakeChannel()
+
+    async def scenario():
+        cog, app = make_cog(conn, tmp_path, summaries)
+        app.channels.set(MEETING_SUMMARIES, 77)
+        broken = meeting_with(app.settings.meetings_dir, "done")
+        manifest = json.loads((broken.directory / "manifest.json").read_text(encoding="utf-8"))
+        del manifest["started_at"]                                             # edited by hand
+        (broken.directory / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        meeting = meeting_with(app.settings.meetings_dir, "done")
+        await cog.post_updates()
+        return Meeting.load(meeting.directory)
+
+    meeting = asyncio.run(scenario())
+    assert meeting.posted and len(summaries.sent) == 2

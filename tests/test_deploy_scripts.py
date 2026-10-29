@@ -76,6 +76,8 @@ LIVE = f"{RUN} --no-deps worker python -m worker.run --live"
 INSPECT = "container inspect ieee-meeting-worker"
 PS = "compose --profile job ps -q --status running ollama"
 STOP = "compose --profile job stop ollama"
+# SIGTERM to the worker first, so it ends its run without counting it as a crash (worker/run.py), then remove it
+END = ["stop --time 60 ieee-meeting-worker", "rm -f ieee-meeting-worker"]
 
 
 def fake_docker(tmp_path, body):
@@ -159,7 +161,7 @@ def test_an_idle_tick_is_one_grep_and_no_docker(tmp_path):
     assert log.read_text() == ""
 
 
-def test_a_stopped_full_job_removes_its_container_and_stops_ollama(tmp_path):
+def test_a_stopped_full_job_stops_its_container_and_ollama(tmp_path):
     started = tmp_path / "started"
     # `compose run` stays in the foreground like the real one
     env, log = fake_docker(tmp_path, f'    *" run "*) touch {started}; exec sleep 5 ;;\n    "container inspect"*) exit 1 ;;')
@@ -175,10 +177,10 @@ def test_a_stopped_full_job_removes_its_container_and_stops_ollama(tmp_path):
         assert process.wait(timeout=10) == 143
     finally:
         process.kill()
-    assert log.read_text().splitlines()[-2:] == ["rm -f ieee-meeting-worker", STOP]
+    assert log.read_text().splitlines()[-3:] == [*END, STOP]
 
 
-def test_a_stopped_live_run_removes_its_container_and_leaves_ollama_alone(tmp_path):
+def test_a_stopped_live_run_stops_its_container_and_leaves_ollama_alone(tmp_path):
     started = tmp_path / "started"
     env, log = fake_docker(tmp_path, f'    *" run "*) touch {started}; exec sleep 5 ;;')
     root = tmp_path / "meetings"
@@ -193,4 +195,4 @@ def test_a_stopped_live_run_removes_its_container_and_leaves_ollama_alone(tmp_pa
         assert process.wait(timeout=10) == 143
     finally:
         process.kill()
-    assert log.read_text().splitlines() == [LIVE, "rm -f ieee-meeting-worker"]
+    assert log.read_text().splitlines() == [LIVE, *END]

@@ -76,6 +76,8 @@ def transcribe_meeting(
     """Transcribe every segment that has no transcript yet, then rewrite transcript.txt. Returns how many were done.
 
     A segment that fails keeps its audio and is retried on the next run. One with nothing to hear gets an empty text.
+    So does a lost one, with a warning: its WAV cannot be read (AudioError, which no retry fixes), or it has neither
+    audio nor text (deleted by an older worker when the meeting failed). The rest of the meeting can then finish.
     """
     meeting = Meeting.load(meeting_dir)
     if meeting.status != "recording":  # during the call the bot owns the manifest, so leave it alone
@@ -89,11 +91,16 @@ def transcribe_meeting(
             audio.unlink(missing_ok=True)  # a crash between saving the text and deleting the audio
             continue
         if not audio.exists():
-            log.warning("segment %s has no audio and no transcript", segment["file"])
+            log.warning("segment %s has no audio and no transcript, so it is lost", segment["file"])
+            _write_atomic(text_path, "")
+            done += 1
             continue
         try:
             samples = load_audio(audio)
-        except Exception as exc:
+        except AudioError as exc:
+            log.warning("segment %s cannot be read, so it is lost: %s", segment["file"], exc)
+            samples = None
+        except Exception as exc:  # not opened at all (permissions, I/O): kept for the next run
             log.error("could not read %s: %s", segment["file"], exc)
             continue
         if samples is None:

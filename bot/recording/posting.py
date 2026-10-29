@@ -47,11 +47,17 @@ def _blocks(text: str):
 
 
 def _cut(block: str, limit: int) -> list[str]:
-    """A block too long for one message: split it between lines, and cut lines that are longer than a message."""
+    """A block too long for one message: split it between lines, and cut lines that are longer than a message.
+
+    A cut can leave only whitespace (spaces after exactly `limit` characters); that is dropped, since Discord refuses
+    a message that is blank, and a part that can never be sent would keep the rest of the summary from being posted.
+    """
     pieces: list[str] = []
     for line in block.split("\n"):
         for start in range(0, max(len(line), 1), limit):
             chunk = line[start:start + limit]
+            if not chunk.strip():
+                continue
             if pieces and len(pieces[-1]) + 1 + len(chunk) <= limit:
                 pieces[-1] += "\n" + chunk
             else:
@@ -69,7 +75,7 @@ def _token(status: str, text: str) -> str:
 
 def result_token(meeting: Meeting) -> str | None:
     """What the final post of a meeting in its current state shows: its status and a hash of the summary (`done`)
-    or of the failure reason (`failed`). None if the summary cannot be read (the post will fail and retry).
+    or of the failure reason (`failed`). None if the summary cannot be read (then nothing is reposted yet).
 
     By content, not by file times, so moving or restoring the meetings folder never reposts anything.
     """
@@ -96,8 +102,13 @@ def needs_update(meeting: Meeting) -> bool:
         return True
     if meeting.status not in FINAL:
         return True  # posted, yet processing again: a reprocess was started
-    # Posted by an older version, which kept no token: that post is taken as showing the current result.
-    return meeting.posted_for is not None and meeting.posted_for != result_token(meeting)
+    # Posted by an older version, which kept no token: that post is taken as showing the current result. A summary
+    # that cannot be read is no new result either: the post stays as it is until it can be read and differs, so
+    # restart_posting never wipes the record of a post that could not be replaced.
+    if meeting.posted_for is None:
+        return False
+    token = result_token(meeting)
+    return token is not None and meeting.posted_for != token
 
 
 async def post_update(channel, meeting: Meeting) -> None:

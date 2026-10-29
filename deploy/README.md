@@ -176,14 +176,24 @@ cannot tell your container is still using Ollama. If a run was killed hard (Olla
 To reprocess a meeting: stop the timer as above, set `"status"` in `data/meetings/<id>/manifest.json` back to
 `queued`, and handle the bot's posted marker as described in the bot section of the [main README](../README.md) so
 the new summary is posted (the bot posts the result again once it sees the meeting processing again, or finished with a
-different result); then start the timer again. A meeting the worker marked `failed` has had its leftover audio deleted, so
-requeueing it only redoes what is missing, usually the summary from the saved texts, not the transcription. Segments that already have a `.txt` are not transcribed again
-and windows that have a notes file are not extracted again; to make the summary from scratch, delete the meeting's
-`notes/` folder as well. The check reads the manifest with `grep`, so keep `"status": "<value>"` a plain JSON string
+different result); then start the timer again. Requeueing only redoes what is missing. A meeting whose summary
+failed keeps its segment texts and notes only (the audio left over is deleted, as a requeue never uses it), so its
+summary is made again from them. One the worker failed after
+`MAX_ATTEMPTS` runs that got nowhere has had its leftover audio deleted: a segment with neither audio nor a `.txt`
+is then recorded as lost (an empty `.txt` and a warning in the job's log) and the meeting is finished without it.
+Segments that already have a `.txt` are not transcribed again and windows that have a notes file are not extracted
+again; to make the summary from scratch, delete the meeting's `notes/` folder as well. The check reads the manifest with `grep`, so keep `"status": "<value>"` a plain JSON string
 (any spacing and indentation is fine).
 
 To pause processing: `sudo systemctl stop ieee-meeting-worker.timer` (a run in progress finishes;
-`sudo systemctl stop ieee-meeting-worker.service` cancels it, removing the container and stopping Ollama).
+`sudo systemctl stop ieee-meeting-worker.service` cancels it: the worker gets SIGTERM, its container is removed and
+Ollama stopped, and the meeting is picked up where it was by the next run).
+
+A transcription that fails (Whisper cannot be loaded, a segment fails twice) does not fail the meeting: it stays
+`transcribing`, with its audio, and the next run tries again. A WAV that can never be read is recorded as lost
+instead. Runs that end like this, or die (the memory limit, a crash inside Whisper), are counted in the meeting's
+`attempts.json`; after `MAX_ATTEMPTS` (3) in a row that saved no new segment text or notes, the meeting is marked
+`failed` with the last error and its audio is deleted. A run stopped by SIGTERM is not counted.
 
 ## Limits
 
@@ -210,7 +220,10 @@ thrash the summary rather than protect anything. A run that exceeds a limit is k
 failed and the timer retries 2 minutes later) instead of pushing the bot and other services into swap.
 
 The service times out after 8 hours. On a timeout or a `systemctl stop`, systemd sends SIGTERM to `meeting-job.sh`
-only (`KillMode=mixed`), which removes the job container and stops Ollama. The unit has no `ExecStopPost`, because
+only (`KillMode=mixed`), which stops the job container (`docker stop --time 60`: SIGTERM to the worker, which ends
+its run without counting it against the meeting, then SIGKILL if it has not exited), removes it and stops Ollama.
+A `docker stop` or a reboot also ends the worker with SIGTERM, which is not counted either; only a run killed
+outright (SIGKILL after the grace period, the memory limit) counts. The unit has no `ExecStopPost`, because
 systemd runs it after a skipped tick too and an idle tick must stay a single `grep`. Exit code 75 (another worker
 holds the lock) counts as success. After a full run whose worker exits 75, Ollama is left running only if it was
 already running before the run started (it belongs to the other worker).

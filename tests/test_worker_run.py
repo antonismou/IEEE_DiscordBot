@@ -1,6 +1,8 @@
 import fcntl
 import gc
 import json
+import os
+import signal
 import wave
 import weakref
 from datetime import datetime, timedelta
@@ -12,7 +14,8 @@ import pytest
 from bot.recording.meeting import Meeting, recover_interrupted
 from worker.summarize import summarize_meeting
 from worker.transcribe import transcribe_meeting
-from worker.run import (DEFAULT_MEETINGS_DIR, LOCK_BUSY, LOCK_FILE, Config, WorkerError, main, process,
+from worker import run as worker_run
+from worker.run import (DEFAULT_MEETINGS_DIR, LOCK_BUSY, LOCK_FILE, STOPPED, Config, WorkerError, main, process,
                         run, wait_for_ollama)
 
 NOW = datetime(2026, 10, 25, 18, 30, 5)
@@ -186,7 +189,7 @@ def test_a_segment_still_missing_its_text_is_retried_once(tmp_path):
     assert len(calls) == 2 and status_of(meeting) == "done"
 
 
-def test_a_segment_that_fails_twice_fails_the_meeting(tmp_path):
+def test_a_segment_that_fails_twice_is_left_with_its_audio_for_the_next_run(tmp_path):
     meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)])
     fakes = Fakes(fail_segments={"7/000002.wav"})
 
@@ -194,16 +197,78 @@ def test_a_segment_that_fails_twice_fails_the_meeting(tmp_path):
 
     assert [e[0] for e in fakes.events] == ["transcribe", "transcribe"]  # never reaches the summary
     loaded = Meeting.load(meeting.directory)
-    assert loaded.status == "failed" and "7/000002.wav" in loaded.error
-    assert not (meeting.directory / "summary.md").exists()
+    assert loaded.status == "transcribing" and loaded.error is None  # not failed: a temporary error is retried
+    assert (meeting.directory / "7/000002.wav").exists() and not (meeting.directory / "summary.md").exists()
+    assert json.loads((meeting.directory / "attempts.json").read_text(encoding="utf-8"))["full"] == 1
+
+    assert Fakes().run(tmp_path) == 0  # the next run, with the segment readable again
+    assert status_of(meeting) == "done"
 
 
-def test_a_segment_with_neither_audio_nor_text_fails_the_meeting(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="summarizing")
-    (meeting.directory / "7/000001.wav").unlink()
+def test_whisper_failing_to_load_keeps_the_audio_for_the_next_run(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)])
 
-    assert Fakes().run(tmp_path) != 0
-    assert status_of(meeting) == "failed" and "7/000001.wav" in Meeting.load(meeting.directory).error
+    def offline(name, threads):
+        raise RuntimeError("model download failed")
+    fakes = Fakes()
+
+    assert run(Config(meetings_dir=tmp_path), transcribe=partial(transcribe_meeting, model_factory=offline),
+               summarize=fakes.summarize, wait=fakes.wait) == 1
+
+    assert status_of(meeting) == "transcribing" and len(list(meeting.directory.rglob("*.wav"))) == 2
+    assert fakes.run(tmp_path) == 0 and status_of(meeting) == "done"
+
+
+def test_a_transcription_that_keeps_failing_is_failed_after_max_attempts_with_its_error(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], transcribed={(7, 1)})  # so no run gets anywhere
+    fakes = Fakes(fail_segments={"7/000002.wav"})
+    for _ in range(3):
+        assert fakes.run(tmp_path) == 1
+        assert status_of(meeting) == "transcribing" and (meeting.directory / "7/000002.wav").exists()
+
+    assert fakes.run(tmp_path) == 1
+
+    loaded = Meeting.load(meeting.directory)
+    assert loaded.status == "failed" and "3 times" in loaded.error and "7/000002.wav" in loaded.error
+    assert list(meeting.directory.rglob("*.wav")) == []  # failed for good: only now is the audio deleted
+    assert (meeting.directory / "7/000001.txt").exists()
+
+
+def lost_audio_transcriber():
+    def no_model(name, threads):
+        raise AssertionError("nothing to transcribe")
+    return partial(transcribe_meeting, model_factory=no_model)
+
+
+@pytest.mark.parametrize("status", ["queued", "summarizing"])
+def test_a_segment_with_neither_audio_nor_text_is_recorded_as_lost(tmp_path, status, caplog):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status=status, transcribed={(7, 1)})
+    (meeting.directory / "7/000002.wav").unlink()
+    fakes = Fakes()
+
+    assert run(Config(meetings_dir=tmp_path), transcribe=lost_audio_transcriber(), summarize=fakes.summarize,
+               wait=fakes.wait) == 0
+
+    assert status_of(meeting) == "done" and (meeting.directory / "7/000002.txt").read_text(encoding="utf-8") == ""
+    assert (meeting.directory / "transcript.txt").read_text(encoding="utf-8") == "[00:00:00] Μαρία: ήδη 1\n"
+    assert "7/000002.wav" in caplog.text and "lost" in caplog.text
+
+
+def test_a_failed_meeting_requeued_by_hand_is_finished(tmp_path):
+    """deploy/README.md: a failed meeting can be set back to `queued`. A summary that failed is made again from the
+    saved texts; a segment whose audio an older worker deleted when it failed is recorded as lost."""
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], transcribed={(7, 1)})
+    assert Fakes(summary_error=RuntimeError("Ollama returned HTTP 500")).run(tmp_path) == 1
+    assert status_of(meeting) == "failed"
+    old = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], status="failed", minute=10, transcribed={(7, 1)})
+    (old.directory / "7/000002.wav").unlink()
+
+    for failed in (meeting, old):
+        Meeting.load(failed.directory).set_status("queued")
+    fakes = Fakes()
+    assert run(Config(meetings_dir=tmp_path), transcribe=lost_audio_transcriber(), summarize=fakes.summarize,
+               wait=fakes.wait) == 0
+    assert status_of(meeting) == "done" and status_of(old) == "done"
 
 
 def test_a_summary_error_fails_the_meeting_and_records_why(tmp_path):
@@ -217,22 +282,76 @@ def test_a_summary_error_fails_the_meeting_and_records_why(tmp_path):
     assert loaded.speakers == {7: "Μαρία"}  # the rest of the manifest is kept
 
 
-def test_a_failed_meeting_loses_its_audio_but_keeps_its_texts(tmp_path):
-    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], transcribed={(7, 1)})
+def orphan_wav(meeting):
     orphan = meeting.directory / "8" / "000001.wav"  # open when the bot died, so never in the manifest
     orphan.parent.mkdir()
     write_wav(orphan)
+    return orphan
+
+
+def test_a_meeting_failed_for_good_loses_its_audio_but_keeps_its_texts(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 9.0)], transcribed={(7, 1)})
+    orphan_wav(meeting)
     notes = meeting.directory / "notes" / "12min" / "000.md"
     notes.parent.mkdir(parents=True)
     notes.write_text("σημειώσεις", encoding="utf-8")
     (meeting.directory / "transcript.txt").write_text("[00:00:00] Μαρία: ήδη 1\n", encoding="utf-8")
+    (meeting.directory / "attempts.json").write_text('{"full": 3}', encoding="utf-8")
 
-    assert Fakes(fail_segments={"7/000002.wav"}).run(tmp_path) != 0
+    assert Fakes().run(tmp_path) != 0
 
     assert status_of(meeting) == "failed"
     assert list(meeting.directory.rglob("*.wav")) == []
     assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == "ήδη 1"
     assert (meeting.directory / "transcript.txt").exists() and notes.exists()
+
+
+def test_a_failed_summary_deletes_the_leftover_audio_but_keeps_the_texts_for_a_requeue(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    orphan_wav(meeting)  # never listed, so a requeue would never use it
+
+    assert Fakes(summary_error=RuntimeError("Ollama returned HTTP 500")).run(tmp_path) == 1
+    assert status_of(meeting) == "failed" and list(meeting.directory.rglob("*.wav")) == []
+    assert (meeting.directory / "7/000001.txt").exists()
+
+    Meeting.load(meeting.directory).set_status("queued")
+    assert Fakes().run(tmp_path) == 0
+    assert status_of(meeting) == "done"
+
+
+def test_a_done_meeting_deletes_what_is_left(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    orphan_wav(meeting)
+    assert Fakes().run(tmp_path) == 0
+    assert status_of(meeting) == "done" and list(meeting.directory.rglob("*.wav")) == []
+
+
+def test_a_sigterm_just_as_a_meeting_is_marked_done_leaves_no_audio_or_count_behind(tmp_path, monkeypatch):
+    """A done meeting is never looked at again, so its cleanup cannot wait until after the status is saved."""
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    orphan_wav(meeting)
+    (meeting.directory / "attempts.json").write_text('{"full": 1}', encoding="utf-8")
+    set_status = Meeting.set_status
+
+    def then_stopped(self, status):
+        set_status(self, status)
+        if status == "done":
+            raise worker_run.Stopped()
+    monkeypatch.setattr(Meeting, "set_status", then_stopped)
+
+    assert Fakes().run(tmp_path) == STOPPED
+
+    assert status_of(meeting) == "done" and list(meeting.directory.rglob("*.wav")) == []
+    assert not (meeting.directory / "attempts.json").exists()
+
+
+@pytest.mark.parametrize("value", [True, False, -1, -5])
+def test_a_count_that_is_a_bool_or_negative_is_ignored(tmp_path, value):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    (meeting.directory / "attempts.json").write_text(json.dumps({"full": value, "full_progress": value}),
+                                                     encoding="utf-8")
+    assert worker_run._attempts(meeting.directory) == {}
+    assert worker_run.start_attempt(meeting.directory, "full") == 1
 
 
 def test_a_meeting_that_ends_done_keeps_no_attempt_count(tmp_path):
@@ -317,6 +436,73 @@ def test_a_live_pass_that_returns_resets_its_count(tmp_path):
     assert not (meeting.directory / "attempts.json").exists()
 
 
+def attempts(meeting):
+    path = meeting.directory / "attempts.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+@pytest.mark.parametrize("status, live", [("queued", False), ("summarizing", False), ("recording", True)])
+def test_a_stop_from_outside_is_not_counted_as_a_crash(tmp_path, status, live):
+    """`docker stop`, a reboot or the unit's timeout send SIGTERM: the run ends at once and the meeting is left as it
+    is for the next one, without using up one of its attempts."""
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status=status, transcribed={(7, 1)} if status == "summarizing"
+                           else ())
+    kind = "live" if live else "full"
+    (meeting.directory / "attempts.json").write_text(json.dumps({kind: 2}), encoding="utf-8")
+    fakes = Fakes()
+
+    def stopped(directory):
+        os.kill(os.getpid(), signal.SIGTERM)
+        raise AssertionError("the run should have stopped")
+    fakes.transcribe = fakes.summarize = stopped
+
+    def outer(signum, frame):  # whatever handler the process had before the run, not one an earlier test left behind
+        raise AssertionError("SIGTERM reached the outer handler")
+    previous = signal.signal(signal.SIGTERM, outer)
+    try:
+        assert fakes.run(tmp_path, live=live) == STOPPED
+        assert signal.getsignal(signal.SIGTERM) is outer  # the worker's handler is only there while it runs
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert status_of(meeting) == ("transcribing" if status == "queued" else status)
+    assert attempts(meeting).get(kind) == 2 and Meeting.load(meeting.directory).error is None
+    if not live:  # observable: the stopped run did not use up the last attempt, so the next run still finishes it
+        assert Fakes().run(tmp_path) == 0 and status_of(meeting) == "done"
+
+
+def test_a_run_that_ends_normally_puts_back_the_previous_sigterm_handler(tmp_path):
+    meeting_with(tmp_path, [(7, 1, 0.0)])
+
+    def outer(signum, frame):
+        pass
+    previous = signal.signal(signal.SIGTERM, outer)
+    try:
+        assert Fakes().run(tmp_path) == 0
+        assert signal.getsignal(signal.SIGTERM) is outer
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def test_runs_that_get_somewhere_before_dying_do_not_use_up_the_attempts(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, n, 9.0 * n) for n in range(1, 6)])
+    fakes = Fakes()
+
+    def one_then_killed(directory):  # killed by its memory limit after each segment
+        audio = sorted(directory.glob("7/*.wav"))[0]
+        audio.with_suffix(".txt").write_text("Καλησπέρα.", encoding="utf-8")
+        audio.unlink()
+        raise Killed()
+    fakes.transcribe = one_then_killed
+    for _ in range(5):
+        with pytest.raises(Killed):
+            fakes.run(tmp_path)
+    assert status_of(meeting) == "transcribing" and attempts(meeting)["full"] == 1
+
+    fakes.transcribe = Fakes().transcribe
+    assert fakes.run(tmp_path) == 0 and status_of(meeting) == "done"
+
+
 def test_an_empty_transcript_still_ends_done(tmp_path):
     meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
     fakes = Fakes()
@@ -356,7 +542,7 @@ def test_meetings_are_processed_oldest_first_and_a_failure_does_not_stop_the_res
 
     assert fakes.run(tmp_path) != 0
     assert [e[1] for e in fakes.events if e[0] == "transcribe"] == [older.id, older.id, newer.id]
-    assert status_of(older) == "failed" and status_of(newer) == "done"
+    assert status_of(older) == "transcribing" and status_of(newer) == "done"  # the older one is retried next run
 
 
 # --- during the call ------------------------------------------------------------------------------------------

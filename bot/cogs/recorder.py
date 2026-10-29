@@ -103,6 +103,7 @@ class RecorderCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.active: ActiveRecording | None = None
+        self._starting = False  # a /record start is joining the call: a second one must not start another recording
         self._warned_no_channel = False
         self._post_problems: set[tuple[str, str]] = set()  # (meeting id, error) already logged
         self._naming: set[asyncio.Task] = set()  # name lookups and chat warnings in flight (kept from the GC)
@@ -165,22 +166,31 @@ class RecorderCog(commands.Cog):
         if channel is None:
             await interaction.response.send_message("Join the voice channel you want to record first.", ephemeral=True)
             return
-        if self.active or find_busy(self.app.settings.meetings_dir):
+        if self.active or self._starting or find_busy(self.app.settings.meetings_dir):
             await interaction.response.send_message(
                 "A recording is already in progress, or the last one is still being processed.", ephemeral=True
             )
             return
+        self._starting = True  # before the first await, so a start meanwhile is refused
+        try:
+            await self._start(interaction, channel)
+        finally:
+            self._starting = False
+
+    async def _start(self, interaction: discord.Interaction, channel) -> None:
         await interaction.response.defer(ephemeral=True)  # joining a call can outlast Discord's 3 s limit
         try:
             voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        except (discord.ClientException, discord.HTTPException, asyncio.TimeoutError) as exc:
+        except Exception as exc:
             log.warning("Could not join the voice channel: %s", exc)
+            await self._leave_half_joined(channel)
             await interaction.followup.send("I couldn't join that voice channel. Check my permissions.", ephemeral=True)
             return
         try:
             await channel.send(ANNOUNCEMENT)
-        except discord.HTTPException:
-            await voice_client.disconnect()
+        except Exception as exc:  # usually a missing permission; whatever it is, the bot must not stay in the call
+            log.warning("Could not post the recording announcement in channel %s: %s", channel.id, exc)
+            await self._leave_after_failed_start(voice_client)
             await interaction.followup.send(
                 "I couldn't post the recording announcement in the channel's chat, so I did not record. "
                 "Give me permission to send messages there.", ephemeral=True,
@@ -193,6 +203,8 @@ class RecorderCog(commands.Cog):
             await self._abort_start(voice_client, channel)
             await interaction.followup.send(START_FAILED.format(error=short(exc)), ephemeral=True)
             return
+        if not self._has_people(channel):  # everyone left while the bot was joining: no leave event will come now
+            self._check_empty_later(self.active)
         await audit(self.app, interaction, f"started a recording in <#{channel.id}>")
         await interaction.followup.send(
             f"Recording {channel.mention}. Use `/record stop` when the meeting is over.", ephemeral=True
@@ -246,15 +258,31 @@ class RecorderCog(commands.Cog):
             except OSError:
                 log.exception("Could not mark meeting %s failed", meeting.id)
 
-    async def _abort_start(self, voice_client, channel) -> None:
+    @staticmethod
+    async def _leave_half_joined(channel) -> None:
+        """discord.py leaves its voice client registered when a join fails with anything but a timeout, and every
+        later join would then fail with "Already connected"."""
+        voice_client = getattr(channel.guild, "voice_client", None)
+        if voice_client is None:
+            return
         try:
             await voice_client.disconnect(force=True)
         except Exception:
-            log.exception("Could not leave the voice channel after a failed start")
+            log.exception("Could not clean up after a failed join")
+
+    async def _abort_start(self, voice_client, channel) -> None:
+        await self._leave_after_failed_start(voice_client)
         try:
             await channel.send(CANCELLED)  # the announcement already said it is recording
         except discord.HTTPException:
             log.warning("Could not tell channel %s that the recording was cancelled", channel.id)
+
+    @staticmethod
+    async def _leave_after_failed_start(voice_client) -> None:
+        try:
+            await voice_client.disconnect(force=True)
+        except Exception:
+            log.exception("Could not leave the voice channel after a failed start")
 
     def _warn_write_failing(self, meeting: Meeting, exc: BaseException) -> None:
         """Received audio keeps failing to be saved: say so once in the call's chat, as people are relying on it."""
@@ -355,7 +383,8 @@ class RecorderCog(commands.Cog):
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after) -> None:
         """Stop like /record stop would when the bot is kicked (or moved) out of the call, at once, or when the call
-        has had nobody in it (other bots do not count) for EMPTY_GRACE seconds: a dropped connection rejoins."""
+        has had nobody in it (other bots do not count) for EMPTY_GRACE seconds: a dropped connection rejoins. Someone
+        joining ends the wait, so the next time the call empties it gets the whole grace period again."""
         active = self.active
         if active is None:
             return
@@ -365,10 +394,16 @@ class RecorderCog(commands.Cog):
                 return
             await self._stop_automatically(active, "kicked")
         elif before.channel is not None and before.channel.id == recorded:
-            if self._has_people(active.channel):
-                return
-            if active.empty_check is None or active.empty_check.done():
-                active.empty_check = asyncio.create_task(self._stop_if_still_empty(active))
+            if not self._has_people(active.channel):
+                self._check_empty_later(active)
+        elif after.channel is not None and after.channel.id == recorded:
+            if active.empty_check and self._has_people(active.channel):
+                active.empty_check.cancel()  # not running _stop_automatically: that sets self.active to None first
+                active.empty_check = None
+
+    def _check_empty_later(self, active: ActiveRecording) -> None:
+        if active.empty_check is None or active.empty_check.done():
+            active.empty_check = asyncio.create_task(self._stop_if_still_empty(active))
 
     def _has_people(self, channel) -> bool:
         """Anyone in the call but bots. voice_states, not members: without the members intent the member cache is
@@ -465,6 +500,11 @@ class RecorderCog(commands.Cog):
                 level = logging.DEBUG if problem in self._post_problems else logging.WARNING  # once, not every turn
                 self._post_problems.add(problem)
                 log.log(level, "Could not post meeting %s yet, will retry: %s", meeting.id, exc)
+            except Exception as exc:  # a manifest edited by hand (no started_at, a bad date): the others still post
+                problem = (meeting.id, repr(exc))
+                if problem not in self._post_problems:
+                    self._post_problems.add(problem)
+                    log.exception("Could not post meeting %s; check its manifest.json", meeting.id)
 
     @poster.before_loop
     async def before_poster(self) -> None:

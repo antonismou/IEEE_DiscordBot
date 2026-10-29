@@ -16,9 +16,12 @@ name=ieee-meeting-worker
 busy=75  # the worker's exit code when another worker holds the lock (worker/run.py)
 compose="docker compose --profile job"
 
-# On a stop or a timeout systemd sends SIGTERM to this script only (KillMode=mixed): remove the job container,
-# which also ends the `compose run` client, and stop Ollama if this run uses it.
+# On a stop or a timeout systemd sends SIGTERM to this script only (KillMode=mixed): stop the job container, which
+# also ends the `compose run` client, and stop Ollama if this run uses it. `docker stop` sends the worker SIGTERM
+# first, so it leaves the meeting for the next run without counting the run as a crash (worker/run.py); 60 s, so all
+# of it fits in the unit's TimeoutStopSec (2 min). Then the container is removed, if `--rm` has not already.
 cleanup() {
+    docker stop --time 60 "$name" >/dev/null 2>&1
     docker rm -f "$name" >/dev/null 2>&1
     [ -n "$full" ] && $compose stop ollama
     exit 143
