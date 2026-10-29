@@ -54,7 +54,7 @@ SAMPLE_TRANSCRIPT = """\
 # Each fact: (label, groups). Every group needs at least one of its alternatives in the summary.
 # Text is compared lowercase with accents removed.
 FACTS = [
-    ("workshop on 21 November", [["21"], ["νοεμβρ"]]),
+    ("workshop on 21 November", [["21"], ["νοεμβρ", "/11"]]),
     ("room A2", [["α2"]]),
     ("budget 300 euros", [["300"]]),
     ("10 kits", [["10"], ["κιτ"]]),

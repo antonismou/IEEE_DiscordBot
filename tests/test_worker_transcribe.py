@@ -1,0 +1,378 @@
+import logging
+import wave
+from datetime import datetime
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from bot.recording.meeting import Meeting
+from bot.recording.segments import SegmentWriter
+from worker import transcribe as stage
+from worker.transcribe import AudioError, format_offset, read_wav, write_transcript
+
+NOW = datetime(2026, 10, 25, 18, 30, 5)
+
+
+class FakeModel:
+    """Stands in for a faster-whisper WhisperModel: the text for each file comes from `texts`, its pieces split at
+    "|" and starting 4 seconds apart."""
+
+    def __init__(self, texts, fail=()):
+        self.texts = texts
+        self.fail = set(fail)
+        self.calls = []
+
+    def transcribe(self, path, **options):
+        self.calls.append((path, options))
+        name = "/".join(path.split("/")[-2:])
+        if name in self.fail:
+            raise RuntimeError("decode failed")
+        texts = self.texts.get(name, "").split("|")
+        pieces = [SimpleNamespace(text=t, start=4.0 * n) for n, t in enumerate(texts)]
+        return iter(pieces), SimpleNamespace(language="el")
+
+
+def meeting_with(tmp_path, segments, speakers=None, status="recording"):
+    meeting = Meeting.create(tmp_path, 11, 22, NOW)
+    for user_id, name in (speakers or {}).items():
+        meeting.set_speaker(user_id, name)
+    for speaker, number, start in segments:
+        relative = f"{speaker}/{number:06d}.wav"
+        (meeting.directory / relative).parent.mkdir(parents=True, exist_ok=True)
+        (meeting.directory / relative).write_bytes(b"RIFF")
+        meeting.add_segment({"speaker": speaker, "file": relative, "start": start, "duration": 1.0})
+    meeting.set_status(status)
+    return meeting
+
+
+def transcribe_meeting(directory, **options):
+    """The real stage, with each file's path given to the fake model instead of its samples, so the fake knows which
+    file it got. The tests at the end read real WAVs."""
+    return stage.transcribe_meeting(directory, **{"load_audio": str, **options})
+
+
+def factory(model):
+    created = []
+
+    def make(name, threads):
+        created.append((name, threads))
+        return model
+    make.created = created
+    return make
+
+
+def transcript(meeting):
+    return (meeting.directory / "transcript.txt").read_text(encoding="utf-8")
+
+
+def test_offsets_are_formatted_as_hours_minutes_seconds():
+    assert format_offset(0) == "00:00:00"
+    assert format_offset(9.9) == "00:00:09"
+    assert format_offset(3725.4) == "01:02:05"
+    assert format_offset(36000) == "10:00:00"
+
+
+def test_speakers_are_merged_by_start_offset(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 20.0), (8, 1, 9.0)], {7: "Μαρία", 8: "Νίκος"})
+    model = FakeModel({"7/000001.wav": " Καλησπέρα.", "7/000002.wav": "Συμφωνώ.", "8/000001.wav": "Γεια σας."})
+
+    count = transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert count == 3
+    assert transcript(meeting) == (
+        "[00:00:00] Μαρία: Καλησπέρα.\n"
+        "[00:00:09] Νίκος: Γεια σας.\n"
+        "[00:00:20] Μαρία: Συμφωνώ.\n"
+    )
+
+
+def test_each_piece_of_a_segment_gets_its_own_line_and_time(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 3725.0)], {7: "Μαρία"})
+    model = FakeModel({"7/000001.wav": " Πρώτα αυτό.| Μετά εκείνο. "})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == "[01:02:05] Μαρία: Πρώτα αυτό.\n[01:02:09] Μαρία: Μετά εκείνο.\n"
+
+
+def test_pieces_of_different_speakers_are_interleaved_by_time(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    model = FakeModel({"7/000001.wav": "Ένα.|Τρία.", "8/000001.wav": "Δύο."})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == (
+        "[00:00:00] Μαρία: Ένα.\n[00:00:02] Νίκος: Δύο.\n[00:00:04] Μαρία: Τρία.\n"
+    )
+
+
+@pytest.mark.parametrize("invented", [
+    "Υπότιτλοι AUTHORWAVE", "Υπότιτλοι από την κοινότητα Amara.org", "Subtitles by the Amara.org community",
+    "Ευχαριστώ που παρακολουθήσατε!", "Ευχαριστούμε πολύ για την παρακολούθηση.", "Μην ξεχάσετε να εγγραφείτε!",
+])
+def test_text_whisper_invents_on_silence_is_dropped(tmp_path, invented):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    model = FakeModel({"7/000001.wav": f"Ας κάνουμε ένα διάλειμμα.|{invented}"})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == "[00:00:00] Μαρία: Ας κάνουμε ένα διάλειμμα.\n"
+
+
+@pytest.mark.parametrize("real", [
+    "Πρέπει να βάλουμε υπότιτλοι στο βίντεο του workshop, γιατί πολλοί το βλέπουν χωρίς ήχο.",
+    "Ευχαριστώ για την προσοχή σας.",
+    "Οι υπότιτλοι είναι έτοιμοι.",
+])
+def test_the_same_words_in_real_speech_are_kept(tmp_path, real):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": real})))
+
+    assert transcript(meeting) == f"[00:00:00] Μαρία: {real}\n"
+
+
+def test_the_whisper_settings_are_passed_to_the_model(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    model = FakeModel({"7/000001.wav": "Γεια."})
+    make = factory(model)
+
+    transcribe_meeting(meeting.directory, model_factory=make)
+
+    assert make.created == [("large-v3-turbo", 8)]
+    [(path, options)] = model.calls
+    assert path == str(meeting.directory / "7/000001.wav")
+    assert options["language"] == "el" and options["beam_size"] == 3 and options["vad_filter"] is True
+    assert options["condition_on_previous_text"] is False and "initial_prompt" not in options
+    assert "IEEE Student Branch" in options["hotwords"] and "Discord" in options["hotwords"]
+
+
+def test_each_transcript_is_saved_next_to_its_audio_and_the_audio_deleted(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Γεια.|Τι κάνετε;"})))
+
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == "0.00\tΓεια.\n4.00\tΤι κάνετε;\n"
+    assert not (meeting.directory / "7/000001.wav").exists()
+
+
+def test_a_plain_text_saved_by_an_older_worker_is_one_line_at_the_segment_start(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 5.0)], {7: "Μαρία"})
+    (meeting.directory / "7/000001.txt").write_text("Από πριν. Και άλλο.", encoding="utf-8")
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000002.wav": "Νέο.|Κι άλλο."})))
+
+    assert transcript(meeting) == (
+        "[00:00:00] Μαρία: Από πριν. Και άλλο.\n[00:00:05] Μαρία: Νέο.\n[00:00:09] Μαρία: Κι άλλο.\n"
+    )
+
+
+def test_segments_that_already_have_a_transcript_are_skipped(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 5.0)], {7: "Μαρία"})
+    (meeting.directory / "7/000001.txt").write_text("Από πριν.", encoding="utf-8")
+    model = FakeModel({"7/000002.wav": "Καινούργιο."})
+
+    count = transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert count == 1
+    assert [path for path, _ in model.calls] == [str(meeting.directory / "7/000002.wav")]
+    assert not (meeting.directory / "7/000001.wav").exists()  # left over from a crash before the delete
+    assert transcript(meeting) == "[00:00:00] Μαρία: Από πριν.\n[00:00:05] Μαρία: Καινούργιο.\n"
+
+
+def test_nothing_to_do_does_not_load_the_model(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)])
+    make = factory(FakeModel({"7/000001.wav": "Γεια."}))
+    transcribe_meeting(meeting.directory, model_factory=make)
+
+    assert transcribe_meeting(meeting.directory, model_factory=make) == 0
+    assert len(make.created) == 1
+
+
+def test_a_failed_segment_keeps_its_audio_and_the_others_go_on(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    model = FakeModel({"8/000001.wav": "Εντάξει."}, fail={"7/000001.wav"})
+
+    count = transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert count == 1
+    assert (meeting.directory / "7/000001.wav").exists()
+    assert not (meeting.directory / "7/000001.txt").exists()
+    assert not (meeting.directory / "8/000001.wav").exists()
+    assert transcript(meeting) == "[00:00:02] Νίκος: Εντάξει.\n"
+
+    retry = FakeModel({"7/000001.wav": "Τελικά."})
+    assert transcribe_meeting(meeting.directory, model_factory=factory(retry)) == 1
+    assert transcript(meeting) == "[00:00:00] Μαρία: Τελικά.\n[00:00:02] Νίκος: Εντάξει.\n"
+
+
+def test_silent_segments_are_left_out_of_the_transcript(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 4.0)], {7: "Μαρία"})
+    model = FakeModel({"7/000001.wav": "  |  ", "7/000002.wav": "Ναι."})
+
+    assert transcribe_meeting(meeting.directory, model_factory=factory(model)) == 2
+
+    assert (meeting.directory / "7/000001.txt").exists()  # done, so it is not transcribed again
+    assert not (meeting.directory / "7/000001.wav").exists()
+    assert transcript(meeting) == "[00:00:04] Μαρία: Ναι.\n"
+
+
+def test_an_unknown_speaker_gets_a_numbered_label(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (99, 1, 1.0)], {7: "Μαρία"})
+    model = FakeModel({"7/000001.wav": "Ποιος είναι;", "99/000001.wav": "Εγώ."})
+
+    transcribe_meeting(meeting.directory, model_factory=factory(model))
+
+    assert transcript(meeting) == "[00:00:00] Μαρία: Ποιος είναι;\n[00:00:01] Ομιλητής 99: Εγώ.\n"
+
+
+def test_status_is_transcribing_after_the_meeting_ended(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="queued")
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Γεια."})))
+
+    assert Meeting.load(meeting.directory).status == "transcribing"
+
+
+def test_during_the_call_the_manifest_is_left_to_the_bot(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], status="recording")
+
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Γεια."})))
+
+    assert Meeting.load(meeting.directory).status == "recording"
+
+
+def test_it_can_run_again_as_new_segments_arrive(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000001.wav": "Πρώτο."})))
+    (meeting.directory / "7/000002.wav").write_bytes(b"RIFF")
+    meeting.add_segment({"speaker": 7, "file": "7/000002.wav", "start": 8.0, "duration": 1.0})
+
+    assert transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"7/000002.wav": "Δεύτερο."}))) == 1
+    assert transcript(meeting) == "[00:00:00] Μαρία: Πρώτο.\n[00:00:08] Μαρία: Δεύτερο.\n"
+
+
+def test_write_transcript_uses_only_finished_segments(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (7, 2, 3.0)], {7: "Μαρία"})
+    (meeting.directory / "7/000002.txt").write_text("Μόνο αυτό.", encoding="utf-8")
+
+    path = write_transcript(meeting.directory)
+
+    assert path == meeting.directory / "transcript.txt"
+    assert transcript(meeting) == "[00:00:03] Μαρία: Μόνο αυτό.\n"
+
+
+# --- reading the audio ------------------------------------------------------------------------------------------
+
+def write_wav(path, samples, channels=1, width=2, rate=16000):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(channels)
+        wav.setsampwidth(width)
+        wav.setframerate(rate)
+        wav.writeframes(np.asarray(samples, dtype="<i2").tobytes())
+
+
+class SamplesModel:
+    """A faster-whisper stand-in that records what it was given."""
+
+    def __init__(self, text="Γεια."):
+        self.text = text
+        self.given = []
+
+    def transcribe(self, audio, **options):
+        self.given.append(audio)
+        return iter([SimpleNamespace(text=self.text, start=0.0)]), SimpleNamespace(language="el")
+
+
+def test_a_wav_the_bot_writes_is_read_as_float_samples_between_minus_one_and_one(tmp_path):
+    writer = SegmentWriter(tmp_path)
+    writer.add(7, np.array([0, 16384, -32768, 32767] * 4000, dtype="<i2").tobytes(), 0.0)
+    writer.close()
+
+    samples = read_wav(tmp_path / "7" / "000001.wav")
+
+    assert isinstance(samples, np.ndarray) and samples.dtype == np.float32 and samples.shape == (16000,)
+    assert samples[:4].tolist() == [0.0, 0.5, -1.0, 32767 / 32768]
+
+
+def test_whisper_gets_the_samples_not_the_path_so_its_own_decoder_is_never_used(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    write_wav(meeting.directory / "7/000001.wav", [1000] * 16000)
+    model = SamplesModel()
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(model)) == 1
+
+    [audio] = model.given
+    assert isinstance(audio, np.ndarray) and audio.dtype == np.float32 and len(audio) == 16000
+    assert transcript(meeting) == "[00:00:00] Μαρία: Γεια.\n"
+    assert not (meeting.directory / "7/000001.wav").exists()
+
+
+@pytest.mark.parametrize("content", [b"", "header only", "too short"])
+def test_a_segment_with_nothing_to_hear_is_done_with_no_text_and_no_model(tmp_path, content):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+    audio = meeting.directory / "7/000001.wav"
+    if content == "header only":
+        write_wav(audio, [])
+    elif content == "too short":
+        write_wav(audio, [500] * 100)
+    else:
+        audio.write_bytes(content)
+    make = factory(SamplesModel())
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=make) == 1
+
+    assert make.created == []
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
+    assert not audio.exists()
+    assert transcript(meeting) == ""
+
+
+@pytest.mark.parametrize("write, reason", [
+    (lambda path: path.write_bytes(b"RIFF"), "not a readable WAV"),
+    (lambda path: path.write_bytes(b"not a wav file at all, just some bytes"), "not a readable WAV"),
+    (lambda path: write_wav(path, [0] * 32000, channels=2), "expected mono 16-bit at 16000 Hz"),
+    (lambda path: write_wav(path, [0] * 16000, rate=48000), "48000 Hz"),
+])
+def test_a_corrupt_segment_is_recorded_as_lost_with_a_clear_warning(tmp_path, caplog, write, reason):
+    """It can never be read, so retrying it would only keep the meeting from finishing."""
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    write(meeting.directory / "7/000001.wav")
+    write_wav(meeting.directory / "8/000001.wav", [1000] * 16000)
+    caplog.set_level(logging.WARNING)
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel("Εντάξει."))) == 2
+
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
+    assert transcript(meeting) == "[00:00:02] Νίκος: Εντάξει.\n"
+    assert "7/000001.wav" in caplog.text and reason in caplog.text and "lost" in caplog.text
+
+
+def test_a_segment_whose_file_cannot_be_opened_keeps_its_audio_for_a_retry(tmp_path):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0)], {7: "Μαρία"})
+
+    def unreadable(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    assert stage.transcribe_meeting(meeting.directory, model_factory=factory(SamplesModel()),
+                                    load_audio=unreadable) == 0
+    assert (meeting.directory / "7/000001.wav").exists() and not (meeting.directory / "7/000001.txt").exists()
+
+
+def test_a_segment_with_no_audio_and_no_text_is_recorded_as_lost(tmp_path, caplog):
+    meeting = meeting_with(tmp_path, [(7, 1, 0.0), (8, 1, 2.0)], {7: "Μαρία", 8: "Νίκος"})
+    (meeting.directory / "7/000001.wav").unlink()  # deleted by an older worker when the meeting failed
+
+    assert transcribe_meeting(meeting.directory, model_factory=factory(FakeModel({"8/000001.wav": "Ναι."}))) == 2
+
+    assert (meeting.directory / "7/000001.txt").read_text(encoding="utf-8") == ""
+    assert transcript(meeting) == "[00:00:02] Νίκος: Ναι.\n"
+    assert "7/000001.wav" in caplog.text and "lost" in caplog.text
+
+
+def test_read_wav_raises_audio_error_for_a_file_that_is_not_a_wav(tmp_path):
+    (tmp_path / "x.wav").write_bytes(b"RIFF")
+    with pytest.raises(AudioError, match="x.wav"):
+        read_wav(tmp_path / "x.wav")

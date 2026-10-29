@@ -1,0 +1,192 @@
+"""Posting a processed meeting to the summaries channel: a status message, then the summary and the transcript."""
+from __future__ import annotations
+
+import hashlib
+import re
+
+import discord
+
+from bot.recording.meeting import Meeting
+
+LIMIT = 2000  # Discord's message length limit
+FILE_LIMIT = 10 * 1024 * 1024  # Discord's upload limit for a server without boosts
+HEADING = re.compile(r"\s*(#{1,6}\s|\*\*[^*]+\*\*:?\s*$)")  # "## Θέματα" or a line that is all bold
+NO_MENTIONS = discord.AllowedMentions.none()  # a transcript can contain "@everyone"
+FINAL = ("done", "failed")
+INTERRUPTED_NOTE = "⚠️ Η ηχογράφηση διακόπηκε από επανεκκίνηση του bot, οπότε μπορεί να είναι ελλιπής."
+TOO_LARGE_NOTE = (
+    "Η πλήρης απομαγνητοφώνηση ({size:.1f} MB) είναι μεγαλύτερη από το όριο αρχείων του Discord, "
+    "οπότε δεν ανέβηκε. Βρίσκεται στον server: `{path}`."
+)
+STATUS_TEXT = {  # the status message, in Greek like the summary
+    "queued": "⏳ Συνάντηση {when}: σε αναμονή για επεξεργασία.",
+    "transcribing": "🎙️ Συνάντηση {when}: απομαγνητοφώνηση σε εξέλιξη...",
+    "summarizing": "📝 Συνάντηση {when}: η απομαγνητοφώνηση τελείωσε, γράφεται η σύνοψη...",
+    "done": "✅ Συνάντηση {when}: η επεξεργασία ολοκληρώθηκε.",
+    "failed": "❌ Συνάντηση {when}: η επεξεργασία απέτυχε.",
+}
+
+
+def split_summary(text: str, limit: int = LIMIT) -> list[str]:
+    """Split into messages of at most `limit` characters, breaking between paragraphs and before headings."""
+    messages: list[str] = []
+    for block in _blocks(text):
+        if len(block) > limit:
+            messages.extend(_cut(block, limit))
+        elif messages and len(messages[-1]) + 2 + len(block) <= limit:
+            messages[-1] += "\n\n" + block
+        else:
+            messages.append(block)
+    return messages
+
+
+def _blocks(text: str):
+    for paragraph in re.split(r"\n\s*\n", text.strip()):
+        current: list[str] = []
+        for line in paragraph.split("\n"):
+            if current and HEADING.match(line):
+                yield "\n".join(current)
+                current = []
+            current.append(line)
+        yield "\n".join(current)
+
+
+def _cut(block: str, limit: int) -> list[str]:
+    """A block too long for one message: split it between lines, and cut lines that are longer than a message.
+
+    A cut can leave only whitespace (spaces after exactly `limit` characters); that is dropped, since Discord refuses
+    a message that is blank, and a part that can never be sent would keep the rest of the summary from being posted.
+    """
+    pieces: list[str] = []
+    for line in block.split("\n"):
+        for start in range(0, max(len(line), 1), limit):
+            chunk = line[start:start + limit]
+            if not chunk.strip():
+                continue
+            if pieces and len(pieces[-1]) + 1 + len(chunk) <= limit:
+                pieces[-1] += "\n" + chunk
+            else:
+                pieces.append(chunk)
+    return pieces
+
+
+def _when(meeting: Meeting) -> str:
+    return f"{meeting.started_at:%d/%m/%Y %H:%M}"
+
+
+def _token(status: str, text: str) -> str:
+    return f"{status}:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}"
+
+
+def result_token(meeting: Meeting) -> str | None:
+    """What the final post of a meeting in its current state shows: its status and a hash of the summary (`done`)
+    or of the failure reason (`failed`). None if the summary cannot be read (then nothing is reposted yet).
+
+    By content, not by file times, so moving or restoring the meetings folder never reposts anything.
+    """
+    if meeting.status == "done":
+        try:
+            return _token("done", meeting.summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+    return _token(meeting.status, meeting.error or "")
+
+
+def needs_update(meeting: Meeting) -> bool:
+    """Something about the meeting is not in the summaries channel yet.
+
+    A meeting already posted is posted again when it was processed again (deploy/README.md: set the status back to
+    `queued`; or a failed meeting retried): when the bot sees it processing again, or, if the job finished before the
+    bot looked, when its result differs from the one posted. A reprocess that produces the very same result (or
+    fails again for the same reason) without the bot seeing it in between is not posted again; that is already in
+    the channel.
+    """
+    if meeting.status not in STATUS_TEXT:
+        return False
+    if not meeting.posted:
+        return True
+    if meeting.status not in FINAL:
+        return True  # posted, yet processing again: a reprocess was started
+    # Posted by an older version, which kept no token: that post is taken as showing the current result. A summary
+    # that cannot be read is no new result either: the post stays as it is until it can be read and differs, so
+    # restart_posting never wipes the record of a post that could not be replaced.
+    if meeting.posted_for is None:
+        return False
+    token = result_token(meeting)
+    return token is not None and meeting.posted_for != token
+
+
+async def post_update(channel, meeting: Meeting) -> None:
+    """Bring the summaries channel up to date with the meeting.
+
+    Safe to call again after an error (discord.HTTPException, or OSError for a missing result file): what was
+    already posted is recorded in the meeting, so nothing is posted twice, also across a bot restart. A meeting
+    already posted is posted again, with a new status message, once it is processed again (see needs_update).
+    """
+    if not needs_update(meeting):
+        return
+    if meeting.posted:
+        meeting.restart_posting()
+    await _show_status(channel, meeting)
+    if meeting.status == "done":
+        await _post_result(channel, meeting)
+    elif meeting.status == "failed":
+        reason = f" Αιτία: {meeting.error[:300]}" if meeting.error else ""
+        note = f"\n{INTERRUPTED_NOTE}" if meeting.interrupted else ""
+        await channel.send(
+            f"❌ Η επεξεργασία της συνάντησης {_when(meeting)} (`{meeting.id}`) απέτυχε.{reason} "
+            f"Δείτε το log της επεξεργασίας στον server.{note}",
+            allowed_mentions=NO_MENTIONS,
+        )
+        meeting.mark_posted(_token("failed", meeting.error or ""))
+
+
+async def _show_status(channel, meeting: Meeting) -> None:
+    if meeting.status_shown == meeting.status:
+        return
+    text = STATUS_TEXT[meeting.status].format(when=_when(meeting))
+    if meeting.status_message_id is not None:
+        try:
+            await channel.get_partial_message(meeting.status_message_id).edit(content=text)
+            meeting.set_status_message(meeting.status_message_id, meeting.status)
+            return
+        except discord.NotFound:
+            pass  # someone deleted it
+    if meeting.status in FINAL:
+        return  # the result itself follows; a status message would only repeat it
+    message = await channel.send(text, allowed_mentions=NO_MENTIONS)
+    meeting.set_status_message(message.id, meeting.status)
+
+
+async def _post_result(channel, meeting: Meeting) -> None:
+    summary = meeting.summary_path.read_text(encoding="utf-8")
+    token = _token("done", summary)  # of exactly what is posted, so a summary changed meanwhile is posted later
+    if not meeting.transcript_path.is_file():
+        raise FileNotFoundError(meeting.transcript_path)  # check before posting anything
+    header = f"**Σύνοψη συνάντησης {_when(meeting)}**"
+    if meeting.interrupted:
+        header += f"\n{INTERRUPTED_NOTE}"
+    parts = split_summary(f"{header}\n\n{summary}")
+    for number in range(meeting.parts_sent, len(parts)):
+        await channel.send(parts[number], allowed_mentions=NO_MENTIONS)
+        meeting.set_parts_sent(number + 1)
+    size = meeting.transcript_path.stat().st_size
+    if size > _file_limit(channel):
+        # Discord would refuse the upload (413) on every retry and the meeting would never count as posted.
+        await channel.send(
+            TOO_LARGE_NOTE.format(size=size / 1024 / 1024, path=f"{meeting.directory.name}/{meeting.transcript_path.name}"),
+            allowed_mentions=NO_MENTIONS,
+        )
+    else:
+        await channel.send(
+            "Η πλήρης απομαγνητοφώνηση:",
+            file=discord.File(meeting.transcript_path, filename=f"transcript-{meeting.id}.txt"),
+            allowed_mentions=NO_MENTIONS,
+        )
+    meeting.mark_posted(token)
+
+
+def _file_limit(channel) -> int:
+    """The server's upload limit (higher with boosts), or Discord's default when the channel has no guild."""
+    guild = getattr(channel, "guild", None)
+    return getattr(guild, "filesize_limit", None) or FILE_LIMIT

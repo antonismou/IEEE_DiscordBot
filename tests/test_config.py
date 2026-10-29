@@ -31,6 +31,12 @@ def test_loads_values_and_defaults(tmp_path):
     assert (feed.id, feed.topic, feed.channel_id) == ("tpami", "ai-ml", None)
 
 
+def test_meetings_folder_defaults_next_to_the_other_data_and_can_be_moved(tmp_path):
+    assert load_settings(write(tmp_path, GOOD), ENV).meetings_dir == Path("data/meetings")
+    moved = load_settings(write(tmp_path, 'meetings_dir = "/srv/meetings"\n' + GOOD), ENV)
+    assert moved.meetings_dir == Path("/srv/meetings")
+
+
 def test_missing_env_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="GMAIL_APP_PASSWORD"):
         load_settings(write(tmp_path, GOOD), {"DISCORD_TOKEN": "t", "GMAIL_ADDRESS": "a"})
@@ -63,6 +69,11 @@ def test_feed_must_name_a_topic(tmp_path):
 def test_officer_log_is_a_reserved_topic(tmp_path):
     with pytest.raises(ConfigError, match="reserved"):
         load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "officer-log"')), ENV)
+
+
+def test_meeting_summaries_is_a_reserved_topic(tmp_path):
+    with pytest.raises(ConfigError, match="reserved"):
+        load_settings(write(tmp_path, GOOD.replace('channel = "ai-ml"', 'channel = "meeting-summaries"')), ENV)
 
 
 def test_old_id_keys_are_ignored_not_errors(tmp_path):

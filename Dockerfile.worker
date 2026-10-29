@@ -1,0 +1,27 @@
+# The meeting processing job: transcribes with faster-whisper, summarizes through Ollama over HTTP, then exits.
+# Started by deploy/ieee-meeting-worker.service through deploy/meeting-job.sh (`docker compose --profile job run`).
+FROM python:3.12-slim
+ENV TZ=Europe/Athens \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/home/worker/.cache/huggingface
+# tzdata for local timestamps; nice (coreutils) and ionice (util-linux) are already in the base image.
+# The worker reads the WAVs with Python's wave module (worker/transcribe.py), so no ffmpeg is needed.
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY worker/requirements.txt worker-requirements.txt
+RUN pip install --no-cache-dir -r worker-requirements.txt "requests>=2.31,<3"
+# The worker shares only the manifest code with the bot; the rest of bot/ (discord, voice) is not needed.
+COPY bot/__init__.py bot/__init__.py
+COPY bot/recording/__init__.py bot/recording/meeting.py bot/recording/
+COPY worker ./worker
+# Same uid as the bot image, so both can write the shared meetings folder. The model cache folder is created here
+# so the named volume mounted on it starts owned by uid 1000 (Docker copies the folder's owner into a new volume).
+RUN useradd --create-home --uid 1000 worker \
+    && mkdir -p "$HF_HOME" /app/data/meetings \
+    && chown -R worker:worker /home/worker/.cache /app/data
+USER worker
+# Lowest CPU and disk priority inside the container; the compose file adds CPU and memory limits on top.
+ENTRYPOINT ["nice", "-n", "19", "ionice", "-c", "3"]
+CMD ["python", "-m", "worker.run"]

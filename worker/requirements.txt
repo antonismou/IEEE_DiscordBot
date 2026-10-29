@@ -1,0 +1,5 @@
+# Exact faster-whisper, and PyAV below 16: faster-whisper 1.2.1 calls av.open(metadata_errors=...), which PyAV 16+
+# rejects. worker/transcribe.py reads the WAVs itself, so PyAV is not used for them, but keep it importable.
+faster-whisper==1.2.1
+av>=11,<16
+numpy>=1.26,<3  # worker/transcribe.py hands Whisper the samples as an array

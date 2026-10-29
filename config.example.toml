@@ -2,6 +2,7 @@
 # are all chosen from Discord with /setup roles and /channel set. Each feed's `channel` below is a topic name.
 db_path = "data/bot.sqlite3"
 backup_dir = "data/backups"
+meetings_dir = "data/meetings"  # recordings made with /record start; audio is deleted after transcription
 poll_interval_minutes = 30
 max_items_per_poll = 10
 quiet_alert_days = 7  # tell officer-log when a feed has had nothing new for this many days (0 = off)

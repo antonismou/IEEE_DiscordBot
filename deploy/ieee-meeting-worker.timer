@@ -1,0 +1,14 @@
+# Checks for pending meetings every 2 minutes. A tick with nothing pending runs one grep (see the service's
+# ExecCondition) and starts no container. A tick while a run is still going does nothing, so runs never overlap.
+[Unit]
+Description=Check for pending IEEE bot meetings every 2 minutes
+
+[Timer]
+OnActiveSec=1min
+# Counted from the end of the previous run, so there is always a 2-minute gap between runs.
+OnUnitInactiveSec=2min
+AccuracySec=15s
+Unit=ieee-meeting-worker.service
+
+[Install]
+WantedBy=timers.target

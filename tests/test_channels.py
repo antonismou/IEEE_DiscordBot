@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import discord
 
-from bot.channels import OFFICER_LOG, ChannelRepo
+from bot.channels import MEETING_SUMMARIES, OFFICER_LOG, ChannelRepo
 from bot.config import FeedConfig
 from tests.fakes import fake_guild, fake_interaction, fake_member, reply_text
 
@@ -54,9 +54,15 @@ def run_command(cog, command, *args):
     return interaction
 
 
-def test_topics_come_from_the_feeds_plus_officer_log(conn):
+def test_topics_come_from_the_feeds_plus_the_reserved_ones(conn):
     cog, _ = make_cog(conn, FEEDS)
-    assert cog.topics() == ["ai-ml", "audit-log", "officer-log", "robotics"]
+    assert cog.topics() == ["ai-ml", "audit-log", "meeting-summaries", "officer-log", "robotics"]
+
+
+def test_set_accepts_the_meeting_summaries_topic(conn):
+    cog, app = make_cog(conn, FEEDS)
+    run_command(cog, cog.set_channel, MEETING_SUMMARIES, fake_channel(56))
+    assert app.channels.get(MEETING_SUMMARIES) == 56
 
 
 def test_set_stores_the_channel(conn):
@@ -101,6 +107,7 @@ def test_list_shows_each_topic_and_flags_unset_ones(conn):
     assert "ai-ml" in text and "<#10>" in text
     assert "robotics" in text and "not set" in text
     assert "officer-log" in text
+    assert "`meeting-summaries` -> **not set** (summaries wait until you set one)" in text
 
 
 def test_private_channels_warn_when_everyone_can_see_them(conn):
@@ -120,6 +127,9 @@ def test_private_channels_warn_when_everyone_can_see_them(conn):
     assert "@everyone can see" in run("officer-log", True)
     assert "Warning" not in run("audit-log", False)
     assert "Warning" not in run("ai-ml", True)               # feed channels are meant to be public
+    summaries = run("meeting-summaries", True)                 # it carries every meeting's full transcript
+    assert "@everyone can see" in summaries and "transcript" in summaries
+    assert "Warning" not in run("meeting-summaries", False)
 
 
 def test_setting_a_channel_is_written_to_the_audit_log(conn):
