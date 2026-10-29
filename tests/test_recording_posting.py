@@ -136,6 +136,21 @@ def test_a_long_summary_is_posted_in_several_messages(tmp_path):
     assert transcript.file is not None
 
 
+def test_a_transcript_too_large_for_discord_is_named_instead_of_uploaded(tmp_path):
+    channel = FakeChannel()
+    channel.guild = SimpleNamespace(filesize_limit=10)                  # a tiny upload limit
+    meeting = run(channel, meeting_with(tmp_path, "done"))
+
+    _, note = channel.sent
+    assert getattr(note, "file", None) is None and "όριο" in note.content
+    assert f"{meeting.directory.name}/transcript.txt" in note.content
+    assert note.allowed_mentions.to_dict() == {"parse": []}
+    assert meeting.posted                                                # not retried forever
+
+    run(channel, meeting)
+    assert len(channel.sent) == 2
+
+
 def test_a_failed_post_is_retried_without_repeating_what_was_already_sent(tmp_path):
     channel = FakeChannel()
     long_summary = "\n\n".join(f"## Θέμα {n}\n" + "- " + "ε" * 900 for n in range(5))

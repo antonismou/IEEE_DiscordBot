@@ -9,10 +9,15 @@ import discord
 from bot.recording.meeting import Meeting
 
 LIMIT = 2000  # Discord's message length limit
+FILE_LIMIT = 10 * 1024 * 1024  # Discord's upload limit for a server without boosts
 HEADING = re.compile(r"\s*(#{1,6}\s|\*\*[^*]+\*\*:?\s*$)")  # "## Θέματα" or a line that is all bold
 NO_MENTIONS = discord.AllowedMentions.none()  # a transcript can contain "@everyone"
 FINAL = ("done", "failed")
 INTERRUPTED_NOTE = "⚠️ Η ηχογράφηση διακόπηκε από επανεκκίνηση του bot, οπότε μπορεί να είναι ελλιπής."
+TOO_LARGE_NOTE = (
+    "Η πλήρης απομαγνητοφώνηση ({size:.1f} MB) είναι μεγαλύτερη από το όριο αρχείων του Discord, "
+    "οπότε δεν ανέβηκε. Βρίσκεται στον server: `{path}`."
+)
 STATUS_TEXT = {  # the status message, in Greek like the summary
     "queued": "⏳ Συνάντηση {when}: σε αναμονή για επεξεργασία.",
     "transcribing": "🎙️ Συνάντηση {when}: απομαγνητοφώνηση σε εξέλιξη...",
@@ -165,9 +170,23 @@ async def _post_result(channel, meeting: Meeting) -> None:
     for number in range(meeting.parts_sent, len(parts)):
         await channel.send(parts[number], allowed_mentions=NO_MENTIONS)
         meeting.set_parts_sent(number + 1)
-    await channel.send(
-        "Η πλήρης απομαγνητοφώνηση:",
-        file=discord.File(meeting.transcript_path, filename=f"transcript-{meeting.id}.txt"),
-        allowed_mentions=NO_MENTIONS,
-    )
+    size = meeting.transcript_path.stat().st_size
+    if size > _file_limit(channel):
+        # Discord would refuse the upload (413) on every retry and the meeting would never count as posted.
+        await channel.send(
+            TOO_LARGE_NOTE.format(size=size / 1024 / 1024, path=f"{meeting.directory.name}/{meeting.transcript_path.name}"),
+            allowed_mentions=NO_MENTIONS,
+        )
+    else:
+        await channel.send(
+            "Η πλήρης απομαγνητοφώνηση:",
+            file=discord.File(meeting.transcript_path, filename=f"transcript-{meeting.id}.txt"),
+            allowed_mentions=NO_MENTIONS,
+        )
     meeting.mark_posted(token)
+
+
+def _file_limit(channel) -> int:
+    """The server's upload limit (higher with boosts), or Discord's default when the channel has no guild."""
+    guild = getattr(channel, "guild", None)
+    return getattr(guild, "filesize_limit", None) or FILE_LIMIT
