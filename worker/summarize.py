@@ -148,6 +148,16 @@ RULES = (
     "- Αν μια απόφαση, ημερομηνία ή αριθμός διορθώθηκε αργότερα, γράψε μόνο την τελική εκδοχή.\n"
     "- Θέματα που δεν αποφασίστηκαν ή αναβλήθηκαν γράφονται στα Ανοιχτά θέματα, όχι στις Αποφάσεις.\n"
     "- Κράτησε ακριβώς τους αριθμούς, τα ποσά, τις ημερομηνίες και τα ονόματα του κειμένου.\n"
+    "- Μια πρόταση ή αμφιβολία («ίσως», «θα δούμε», «να το σκεφτούμε», «θα μπορούσαμε») δεν είναι απόφαση: "
+    "γράψε τη στα Ανοιχτά θέματα.\n"
+    "- Μια εργασία χρειάζεται συγκεκριμένο όνομα. Το «κάποιος πρέπει να...» ή το «πρέπει να γίνει...» χωρίς "
+    "υπεύθυνο δεν είναι εργασία.\n"
+    "- Μην επαναλαμβάνεις το ίδιο πράγμα σε δύο ενότητες. Κάθε κουκκίδα είναι μία σύντομη γραμμή, με χρονολογική "
+    "σειρά.\n"
+    "- Παράλειψε την κουβέντα χωρίς περιεχόμενο (χαιρετισμοί, «ακούγομαι;», τεχνικά προβλήματα σύνδεσης).\n"
+    "- Η απομαγνητοφώνηση είναι αυτόματη και έχει λάθη. Αν μια λέξη φαίνεται παραμορφωμένη, κράτησέ την όπως "
+    "είναι ή παράλειψέ την, μην τη μαντεύεις.\n"
+    "- Στις Αποφάσεις γράψε σε παρένθεση ποιος το πρότεινε ή το ανέλαβε, αν ειπώθηκε.\n"
     f"- Αν μια ενότητα δεν έχει τίποτα, γράψε «{EMPTY_SECTION}»\n"
 )
 
@@ -258,6 +268,107 @@ def ensure_headings(text: str) -> str:
     return "\n\n".join(blocks)
 
 
+# --- unsupported details ------------------------------------------------------------------------------------------
+
+NUMBER = re.compile(r"\d+(?:[.,:/]\d+)*")
+WORD = re.compile(r"[^\W\d_]+")
+STEM = 5  # Greek endings change (Μαρία, Μαρίας), so words are compared by their first letters
+# Weekdays and months are capitalized in a summary but not necessarily in the transcript, and are not details to check.
+CALENDAR = {_k for _k in (
+    "δευτερα", "τριτη", "τεταρτη", "πεμπτη", "παρασκευη", "σαββατο", "κυριακη", "ιανουαριος", "φεβρουαριος",
+    "μαρτιος", "απριλιος", "μαιος", "ιουνιος", "ιουλιος", "αυγουστος", "σεπτεμβριος", "οκτωβριος", "νοεμβριος",
+    "δεκεμβριος", "ιανουαριου", "φεβρουαριου", "μαρτιου", "απριλιου", "μαιου", "ιουνιου", "ιουλιου", "αυγουστου",
+    "σεπτεμβριου", "οκτωβριου", "νοεμβριου", "δεκεμβριου",
+)}
+UNIT_WORDS = {
+    "ενα": 1, "ενας": 1, "μια": 1, "μιαν": 1, "δυο": 2, "τρια": 3, "τρεις": 3, "τεσσερα": 4, "τεσσερις": 4,
+    "τεσσαρα": 4, "τεσσαρις": 4, "πεντε": 5, "εξι": 6, "επτα": 7, "εφτα": 7, "οκτω": 8, "οχτω": 8, "εννια": 9,
+    "εννεα": 9, "δεκα": 10, "ενδεκα": 11, "δωδεκα": 12, "εκατο": 100, "εκατον": 100,
+}
+TENS_WORDS = {"εικοσι": 20, "τριαντα": 30, "σαραντα": 40, "πενηντα": 50, "εξηντα": 60, "εβδομηντα": 70,
+              "ογδοντα": 80, "ενενηντα": 90}
+HUNDREDS_STEMS = {"διακοσι": 200, "τριακοσι": 300, "τετρακοσι": 400, "πεντακοσι": 500, "εξακοσι": 600,
+                  "επτακοσι": 700, "εφτακοσι": 700, "οκτακοσι": 800, "οχτακοσι": 800, "εννιακοσι": 900}
+THOUSAND_STEM = "χιλι"
+# "δεκαπέντε", "εικοσιπέντε": a ten written together with a unit.
+for _ten, _tv in {"δεκα": 10, **TENS_WORDS}.items():
+    for _unit, _uv in tuple(UNIT_WORDS.items()):
+        if _uv < 10:
+            UNIT_WORDS.setdefault(_ten + _unit, _tv + _uv)
+UNIT_WORDS.update({"δεκατρεις": 13, "δεκατεσσερις": 14, "δεκαεξη": 16, "δεκαεννεα": 19})
+
+
+def _word_value(token: str) -> int | None:
+    if token in UNIT_WORDS:
+        return UNIT_WORDS[token]
+    if token in TENS_WORDS:
+        return TENS_WORDS[token]
+    return next((v for stem, v in HUNDREDS_STEMS.items() if token.startswith(stem)), None)
+
+
+def spoken_numbers(text: str) -> set[str]:
+    """The numbers the text says in words, as digits: «είκοσι πέντε» is 25, «δύο χιλιάδες» is 2000. Every word's own
+    value is included as well, so a number split differently by the speaker is still found."""
+    found: set[int] = set()
+    total = current = 0
+    run = False
+
+    def finish():
+        nonlocal total, current, run
+        if run:
+            found.add(total + current)
+        total = current = 0
+        run = False
+
+    for word in re.findall(r"[^\W\d_]+|[^\w\s]|\d+", text):  # words, and punctuation or digits that end a number
+        token = _normalize(word)
+        if not word[0].isalpha():
+            finish()
+        elif token.startswith(THOUSAND_STEM):
+            total += (current or 1) * 1000
+            current, run = 0, True
+            found.add(total)
+        elif (value := _word_value(token)) is not None:
+            current += value
+            run = True
+            found.add(value)
+        else:
+            finish()
+    finish()
+    return {str(n) for n in found}
+
+
+UNSUPPORTED_NOTE = "⚠️ (δεν βρέθηκε στην απομαγνητοφώνηση: {})"
+
+
+def _stem(word: str) -> str:
+    return _normalize(word)[:STEM]
+
+
+def flag_unsupported(summary: str, transcript: str) -> str:
+    """Marks, never removes, the bullets with a number or a capitalized word (a name) that the transcript does not
+    contain, so a reader can check them; the model sometimes invents a detail despite the rules. Words are compared
+    by their first letters, so a changed ending is not flagged. This is a hint, not proof: a number said in words
+    in the transcript is found too (see `spoken_numbers`)."""
+    numbers = set(NUMBER.findall(transcript)) | spoken_numbers(transcript)
+    stems = {_stem(w) for w in WORD.findall(transcript)} | {_stem(w) for w in CALENDAR}
+    marked = []
+    for raw in summary.splitlines():
+        if not raw.startswith("-") or EMPTY_SECTION in raw:
+            marked.append(raw)
+            continue
+        missing = [n for n in NUMBER.findall(raw) if n not in numbers]
+        for match in WORD.finditer(raw):
+            word = match[0]
+            first = raw[:match.start()].strip("- ") == ""  # a bullet starts with a capital whatever the word is
+            named = raw[match.end():].startswith(":")
+            if (len(word) >= 3 and word[0].isupper() and (not first or named)
+                    and _stem(word) not in stems and word not in missing):
+                missing.append(word)
+        marked.append(f"{raw} {UNSUPPORTED_NOTE.format(', '.join(missing))}" if missing else raw)
+    return "\n".join(marked)
+
+
 # --- Ollama -------------------------------------------------------------------------------------------------------
 
 def make_ollama_generate(model: str = DEFAULT_MODEL, base_url: str = DEFAULT_OLLAMA_URL,
@@ -343,7 +454,8 @@ def summarize_meeting(meeting_dir: Path | str, generate: Generate | None = None,
             notes.append(with_names(text.strip(), speakers))
         raw = merge_notes(generate, notes)
 
-    summary = ensure_headings(raw)
+    known = "\n".join([transcript, *_speakers(directory).values()])
+    summary = flag_unsupported(ensure_headings(raw), known)
     (directory / "summary.md").write_text(summary + "\n", encoding="utf-8")
     return summary
 

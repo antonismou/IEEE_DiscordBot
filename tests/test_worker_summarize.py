@@ -15,7 +15,10 @@ from worker.summarize import (
     OllamaError,
     SummaryError,
     chunk_lines,
+    UNSUPPORTED_NOTE,
     ensure_headings,
+    flag_unsupported,
+    spoken_numbers,
     estimate_tokens,
     extract_prompt,
     extract_window,
@@ -36,6 +39,13 @@ GOOD_SUMMARY = (
     "## Θέματα\n- Workshop Arduino\n\n## Αποφάσεις\n- Εγγραφές με φόρμα\n\n"
     "## Εργασίες\n- Μαρία: φόρμα, μέχρι Παρασκευή\n\n## Ανοιχτά θέματα\n- Ομιλητής"
 )
+
+
+@pytest.fixture(autouse=True)
+def no_flags(monkeypatch, request):
+    """The stage tests use canned summaries that say things their tiny transcripts do not; flagging has its own tests."""
+    if "flag" not in request.node.name:
+        monkeypatch.setattr("worker.summarize.flag_unsupported", lambda summary, transcript: summary)
 
 
 def line(seconds, name="Μαρία", text="καλησπέρα"):
@@ -542,3 +552,55 @@ def test_many_notes_are_merged_in_groups_then_the_groups_are_merged():
     assert all(f"## {h}" in generate.prompts[-1] for h in HEADINGS)  # the last pass merges the group summaries
     for prompt in generate.prompts:  # every level keeps the merge rules
         assert "ΜΟΝΟ εργασίες που ανατέθηκαν ρητά" in prompt and "αποφασίστηκε σε επόμενο" in prompt
+
+
+# --- unsupported details ------------------------------------------------------------------------------------------
+
+def note(*missing):
+    return UNSUPPORTED_NOTE.format(", ".join(missing))
+
+
+def test_flag_marks_a_number_the_transcript_does_not_contain_and_keeps_the_line():
+    summary = "## Εργασίες\n- Φόρμα, 500 ευρώ\n- Πληρωμή 300 ευρώ"
+    assert flag_unsupported(summary, "Νίκος: 300 ευρώ") == f"## Εργασίες\n- Φόρμα, 500 ευρώ {note('500')}\n- Πληρωμή 300 ευρώ"
+
+
+def test_flag_marks_a_name_the_transcript_does_not_contain():
+    summary = "- Ο Γιώργος ανέλαβε τη φόρμα"
+    assert flag_unsupported(summary, "Μαρία: θα κάνω τη φόρμα") == f"{summary} {note('Γιώργος')}"
+
+
+def test_flag_ignores_changed_endings_stressed_capitals_and_the_start_of_a_bullet():
+    summary = "- Ο Νίκος ζήτησε από τη Μαρία\n- Αποφασίστηκε workshop τη Δευτέρα"
+    assert flag_unsupported(summary, "Νίκος: Μαρίας φόρμα και workshop") == summary
+
+
+def test_flag_checks_a_name_that_starts_a_bullet_when_it_is_followed_by_a_colon():
+    assert flag_unsupported("- Γιώργος: φόρμα", "Μαρία: φόρμα") == f"- Γιώργος: φόρμα {note('Γιώργος')}"
+
+
+def test_flag_leaves_empty_sections_and_headings_alone():
+    summary = "## Θέματα\nΔεν υπάρχουν.\n\n## Αποφάσεις\n- Δεν υπάρχουν."
+    assert flag_unsupported(summary, "") == summary
+
+
+def test_flag_marks_what_is_not_in_the_transcript_in_the_written_summary(tmp_path):
+    write_transcript(tmp_path, [line(4, "Μαρία", "θα φτιάξω τη φόρμα")])
+    summary = summarize_meeting(tmp_path, generate=Recorder("## Εργασίες\n- Μαρία: φόρμα, 40 ευρώ"))
+    assert f"- Μαρία: φόρμα, 40 ευρώ {note('40')}" in summary
+    assert note("40") in (tmp_path / "summary.md").read_text(encoding="utf-8")
+
+
+def test_spoken_numbers_reads_greek_number_words_as_digits():
+    text = "Νίκος: δέκα άτομα, είκοσι πέντε ευρώ, δεκαπέντε μέρες, εικοσιπέντε, εκατόν είκοσι, δύο χιλιάδες πεντακόσια"
+    assert {"10", "25", "15", "120", "2500", "2000", "500"} <= spoken_numbers(text)
+
+
+def test_spoken_numbers_ignores_other_words():
+    assert spoken_numbers("Μαρία: καλησπέρα σε όλους") == set()
+
+
+def test_flag_accepts_a_number_the_transcript_says_in_words_but_not_a_different_one():
+    transcript = "Νίκος: θα πληρώσουμε είκοσι πέντε ευρώ"
+    assert flag_unsupported("- Πληρωμή 25 ευρώ", transcript) == "- Πληρωμή 25 ευρώ"
+    assert flag_unsupported("- Πληρωμή 30 ευρώ", transcript) == f"- Πληρωμή 30 ευρώ {note('30')}"
