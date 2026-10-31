@@ -12,6 +12,7 @@ from bot.health import Health
 from bot.mailer import make_gmail_checker, make_gmail_sender
 from bot.members import MemberRepo
 from bot.pins import PinLimiter
+from bot.quotes.store import QuoteRepo
 from bot.serversettings import ServerSettings
 from bot.verification import VerificationService
 
@@ -28,6 +29,7 @@ class AppContext:
     channels: ChannelRepo
     server: ServerSettings
     pin_limiter: PinLimiter
+    quotes: QuoteRepo
     check_mail: Callable[[], None]
     health: Health
 
@@ -46,6 +48,7 @@ def build_app(settings: Settings) -> AppContext:
         channels=ChannelRepo(conn),
         server=ServerSettings(conn),
         pin_limiter=PinLimiter(conn),
+        quotes=QuoteRepo(conn),
         check_mail=make_gmail_checker(settings.gmail_address, settings.gmail_app_password),
         health=Health(),
     )

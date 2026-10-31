@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS custom_feeds (
     url        TEXT NOT NULL,
     channel_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quotes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    text        TEXT NOT NULL,
+    author_id   INTEGER NOT NULL,
+    author_name TEXT NOT NULL,
+    message_url TEXT NOT NULL,
+    quoted_by   INTEGER NOT NULL,
+    quoted_at   TEXT NOT NULL
+);
 """
 
 
