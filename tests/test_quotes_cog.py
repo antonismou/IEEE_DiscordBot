@@ -432,7 +432,7 @@ def channel_seen_by_everyone(visible: bool, *, kind=discord.ChannelType.text):
     return channel
 
 
-def random_from(conn, monkeypatch, channels: dict):
+def random_from(conn, monkeypatch, channels: dict, *, here=None):
     async def scenario():
         cog, app, module = make_cog(conn, monkeypatch)
         for channel_id in channels:
@@ -440,6 +440,7 @@ def random_from(conn, monkeypatch, channels: dict):
                            message_url=f"https://discord.com/channels/111/{channel_id}/333",
                            quoted_by=1, quoted_at=WHEN)
         interaction = interaction_with()
+        interaction.channel_id = here
         interaction.guild.get_channel_or_thread = MagicMock(side_effect=lambda cid: channels.get(cid))
         await cog.randomquote.callback(cog, interaction)
         return interaction, module
@@ -449,6 +450,18 @@ def random_from(conn, monkeypatch, channels: dict):
 
 def test_randomquote_never_serves_a_quote_from_a_private_channel(conn, monkeypatch):
     interaction, module = random_from(conn, monkeypatch, {501: channel_seen_by_everyone(False)})
+    assert "no quotes" in refused_privately(interaction).lower()
+    module.render_quote_gif.assert_not_called()
+
+
+def test_randomquote_serves_a_private_channels_quote_back_into_that_same_channel(conn, monkeypatch):
+    interaction, module = random_from(conn, monkeypatch, {501: channel_seen_by_everyone(False)}, here=501)
+    assert module.render_quote_gif.call_args.kwargs["text"] == "from 501"
+    assert isinstance(sent_kwargs(interaction)["file"], discord.File)
+
+
+def test_randomquote_still_refuses_a_private_channels_quote_in_another_channel(conn, monkeypatch):
+    interaction, module = random_from(conn, monkeypatch, {501: channel_seen_by_everyone(False)}, here=777)
     assert "no quotes" in refused_privately(interaction).lower()
     module.render_quote_gif.assert_not_called()
 

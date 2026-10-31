@@ -76,6 +76,14 @@ def _seen_by_everyone(guild, quote) -> bool:
         return False
 
 
+def _replayable(guild, quote, here: int | None) -> bool:
+    """Whether /randomquote may post `quote` in channel `here`: its own channel (same audience) or any public one."""
+    ids = _channel_id(quote.message_url)
+    if guild is not None and ids is not None and ids[0] == guild.id and ids[1] == here:
+        return True
+    return _seen_by_everyone(guild, quote)
+
+
 def _message_year(quote) -> int:
     """The year the quoted message was sent: its ID (the last part of the link) encodes the time."""
     try:
@@ -153,8 +161,10 @@ class QuotesCog(commands.Cog):
     async def randomquote(self, interaction: discord.Interaction) -> None:
         async def job() -> bool:
             rng = random.Random()
-            # never replay a quote from a channel some members cannot see
-            quote = self.app.quotes.random(rng, accept=lambda q: _seen_by_everyone(interaction.guild, q))
+            # replay a quote only in its own channel or from a channel everyone can see
+            quote = self.app.quotes.random(
+                rng, accept=lambda q: _replayable(interaction.guild, q, interaction.channel_id)
+            )
             if quote is None:
                 await _refuse(interaction, NO_QUOTES)
                 return False
