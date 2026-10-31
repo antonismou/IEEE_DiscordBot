@@ -24,6 +24,7 @@ import discord  # noqa: E402
 
 from bot.channels import AUDIT_LOG, ChannelRepo  # noqa: E402
 from bot.members import MemberRepo  # noqa: E402
+from bot.quotes.store import QuoteRepo  # noqa: E402
 from bot.verification import VerificationService  # noqa: E402
 from tests.fakes import fake_guild, fake_interaction, fake_member, followup_text  # noqa: E402
 
@@ -39,6 +40,7 @@ def make_cog(conn):
         members=members,
         verification=VerificationService(conn, members),
         channels=ChannelRepo(conn),
+        quotes=QuoteRepo(conn),
     )
     return OfficerCog(SimpleNamespace(app=app)), app
 
@@ -174,3 +176,34 @@ def test_stats_verification_reports_the_numbers(conn):
     asyncio.run(cog.verification_stats.callback(cog, interaction))
     text = interaction.response.send_message.await_args.args[0]
     assert "Codes sent: **0**" in text and "Last 7 days" in text
+
+
+def add_quotes(app, user_id):
+    app.quotes.add(text="said by them", author_id=user_id, author_name="Zed", message_url="u1",
+                   quoted_by=2, quoted_at=NOW)
+    app.quotes.add(text="quoted by them", author_id=2, author_name="Ana", message_url="u2",
+                   quoted_by=user_id, quoted_at=NOW)
+
+
+def quote_rows(conn):
+    return [(r["text"], r["author_id"], r["quoted_by"]) for r in conn.execute("SELECT * FROM quotes ORDER BY id")]
+
+
+def test_forget_me_also_removes_quote_data(conn):
+    async def scenario():
+        cog, app = make_cog(conn)
+        add_quotes(app, 7)
+        await cog.forget_me.callback(cog, fake_interaction(fake_member(7), fake_guild()))
+
+    asyncio.run(scenario())
+    assert quote_rows(conn) == [("quoted by them", 2, 0)]
+
+
+def test_member_delete_also_removes_quote_data(conn):
+    async def scenario():
+        cog, app = make_cog(conn)
+        add_quotes(app, 8)
+        await cog.delete.callback(cog, fake_interaction(fake_member(1), fake_guild()), SimpleNamespace(id=8))
+
+    asyncio.run(scenario())
+    assert quote_rows(conn) == [("quoted by them", 2, 0)]

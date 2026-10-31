@@ -49,3 +49,23 @@ def test_random_returns_a_saved_quote(conn):
     assert first.id in ids
     assert first == second
     assert first in added
+
+
+def test_delete_by_user_removes_their_quotes_and_anonymises_what_they_quoted(conn):
+    repo = QuoteRepo(conn)
+    theirs = repo.add(text="mine", author_id=7, author_name="Zed", message_url="u1", quoted_by=99, quoted_at=WHEN)
+    quoted = repo.add(text="yours", author_id=8, author_name="Ana", message_url="u2", quoted_by=7, quoted_at=WHEN)
+    other = repo.add(text="other", author_id=8, author_name="Ana", message_url="u3", quoted_by=99, quoted_at=WHEN)
+    assert repo.delete_by_user(7) == 1
+    rows = {r["id"]: (r["author_id"], r["quoted_by"]) for r in conn.execute("SELECT * FROM quotes")}
+    assert rows == {quoted.id: (8, 0), other.id: (8, 99)}
+    assert theirs.id not in rows
+    assert repo.delete_by_user(7) == 0
+
+
+def test_random_only_returns_accepted_quotes(conn):
+    repo = QuoteRepo(conn)
+    added = [_add(repo, text=f"q{i}") for i in range(6)]
+    for seed in range(20):
+        assert repo.random(random.Random(seed), accept=lambda q: q.text == "q3") == added[3]
+    assert repo.random(accept=lambda q: False) is None

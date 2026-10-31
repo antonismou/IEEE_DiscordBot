@@ -101,6 +101,9 @@ Emails and names are personal data (GDPR). They are stored in the Docker volume 
 `backups/` (last 7 kept). Only officers can read or export them. `/forget-me` and `/member delete` remove a
 person from the database immediately and from the backups within 7 days. Rate-limit records keep a hash of the
 recipient address for at most 24 hours.
+Quotes saved with **Quote it** / `/quoteit` store the message text, its author's ID and display name, the message
+link and who quoted it. `/forget-me` and `/member delete` delete the quotes of that person's messages and remove
+their name from quotes they made of others (those quotes stay).
 
 ## Development
 
