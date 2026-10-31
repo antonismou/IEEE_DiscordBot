@@ -86,6 +86,14 @@ Administrators can always use the officer commands, even before the officer role
 | `/record start / stop / status` | officers | record the voice channel you are in (announced in its chat); it also stops at once if the bot is disconnected, and when nobody but bots has been in the call for 45 seconds (a dropped connection can rejoin). The summary and transcript are posted in `meeting-summaries`, with a status message updated while it is processed; a meeting reprocessed later is posted again. A recording stopped with no audio is marked failed and posted as such |
 | `/stats verification` | officers | codes sent vs members verified (24 h / 7 days), to spot emails that don't arrive |
 | `/forget-me` | everyone | delete your own stored data |
+| **Quote it** (right-click a message, Apps) | everyone | turn the message into a random animated meme GIF and save it as a quote |
+| `/quoteit message [gif]` | everyone | the same, for a message link or an ID from the current channel; `gif:` picks the Giphy search term |
+| `/randomquote` | everyone | post a saved quote again with a new random look |
+
+**Quote memes:** put a Giphy API key in `.env` as `GIPHY_API_KEY` (optional; results are rated PG-13 or lower). Without
+it, or when Giphy fails, backgrounds come from `assets/memes/` (add your own GIFs, PNGs or JPEGs there), and if that is
+empty a generated background is used. Each member can make one meme every 15 seconds; bot messages and messages with
+no text are not quoted.
 
 ## Data
 

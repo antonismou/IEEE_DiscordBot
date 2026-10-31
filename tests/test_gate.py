@@ -63,3 +63,17 @@ def test_error_handler_shows_the_refusal_text_not_the_officer_text():
     interaction = fake_interaction(fake_member(1), MagicMock())
     asyncio.run(handle_app_command_error(interaction, Refused("This bot is set up for a different server.")))
     assert reply_text(interaction) == "This bot is set up for a different server."
+
+
+def test_context_menu_is_gated_like_commands(conn):
+    import discord
+    from discord import app_commands
+
+    async def quote_it(interaction, message: discord.Message):
+        pass
+
+    interaction = fake_interaction(fake_member(1), MagicMock())
+    interaction.command = app_commands.ContextMenu(name="Quote it", callback=quote_it)
+    interaction.client.app = SimpleNamespace(server=ServerSettings(conn))      # not set up yet
+    with pytest.raises(Refused, match="isn't set up yet"):
+        asyncio.run(GuildLockedTree.interaction_check(SimpleNamespace(), interaction))
