@@ -3,3 +3,4 @@ discord-ext-voice-recv==0.5.2a179  # community extension; receives voice (see do
 feedparser>=6.0,<7
 requests>=2.31,<3
 python-dotenv>=1.0,<2
+Pillow>=10,<13

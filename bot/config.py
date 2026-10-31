@@ -36,6 +36,8 @@ class Settings:
     feeds: tuple[FeedConfig, ...]
     quiet_alert_days: int = 7  # tell officers when a feed has had nothing new for this long; 0 turns it off
     meetings_dir: Path = Path("data/meetings")  # recordings and their manifests
+    giphy_api_key: str = ""  # optional; without it /quoteit uses only the local memes folder
+    memes_dir: Path = Path("assets/memes")  # local background images for /quoteit
 
 
 def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Settings:
@@ -82,6 +84,8 @@ def load_settings(config_path: Path, env: Mapping[str, str] | None = None) -> Se
             feeds=tuple(feeds),
             quiet_alert_days=int(raw.get("quiet_alert_days", 7)),
             meetings_dir=Path(raw.get("meetings_dir", "data/meetings")),
+            giphy_api_key=env.get("GIPHY_API_KEY", ""),
+            memes_dir=Path(raw.get("memes_dir", "assets/memes")),
         )
     except KeyError as exc:
         raise ConfigError(f"Missing config key: {exc}") from None
