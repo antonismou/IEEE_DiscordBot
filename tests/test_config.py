@@ -37,6 +37,17 @@ def test_meetings_folder_defaults_next_to_the_other_data_and_can_be_moved(tmp_pa
     assert moved.meetings_dir == Path("/srv/meetings")
 
 
+def test_giphy_key_is_optional_and_read_from_env(tmp_path):
+    assert load_settings(write(tmp_path, GOOD), ENV).giphy_api_key == ""
+    assert load_settings(write(tmp_path, GOOD), {**ENV, "GIPHY_API_KEY": "k"}).giphy_api_key == "k"
+
+
+def test_memes_dir_defaults_to_assets_memes_and_can_be_overridden(tmp_path):
+    assert load_settings(write(tmp_path, GOOD), ENV).memes_dir == Path("assets/memes")
+    moved = load_settings(write(tmp_path, 'memes_dir = "/srv/memes"\n' + GOOD), ENV)
+    assert moved.memes_dir == Path("/srv/memes")
+
+
 def test_missing_env_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="GMAIL_APP_PASSWORD"):
         load_settings(write(tmp_path, GOOD), {"DISCORD_TOKEN": "t", "GMAIL_ADDRESS": "a"})

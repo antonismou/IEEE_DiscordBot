@@ -134,6 +134,7 @@ class OfficerCog(commands.Cog):
     async def _forget(self, interaction: discord.Interaction, user) -> None:
         await interaction.response.defer(ephemeral=True)  # the member lookup and role call can be slow
         deleted = self.app.members.delete(user.id)
+        deleted = self.app.quotes.delete_by_user(user.id) > 0 or deleted
         who = "their own" if user.id == interaction.user.id else f"<@{user.id}>'s"
         await audit(self.app, interaction, f"deleted {who} stored data" + ("" if deleted else " (there was none)"))
         self.app.verification.abort(user.id)
