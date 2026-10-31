@@ -421,3 +421,181 @@ def test_a_thread_whose_parent_is_not_cached_is_a_friendly_refusal(conn, monkeyp
     assert "couldn't find" in refused_privately(interaction).lower()
     thread.fetch_message.assert_not_awaited()
     assert count(conn) == 0
+
+
+# --- /randomquote only serves quotes from channels everyone can see ----------------------------------------
+
+def channel_seen_by_everyone(visible: bool, *, kind=discord.ChannelType.text):
+    channel = MagicMock()
+    channel.type = kind
+    channel.permissions_for.return_value = discord.Permissions(view_channel=visible)
+    return channel
+
+
+def random_from(conn, monkeypatch, channels: dict):
+    async def scenario():
+        cog, app, module = make_cog(conn, monkeypatch)
+        for channel_id in channels:
+            app.quotes.add(text=f"from {channel_id}", author_id=9, author_name="Ana",
+                           message_url=f"https://discord.com/channels/111/{channel_id}/333",
+                           quoted_by=1, quoted_at=WHEN)
+        interaction = interaction_with()
+        interaction.guild.get_channel_or_thread = MagicMock(side_effect=lambda cid: channels.get(cid))
+        await cog.randomquote.callback(cog, interaction)
+        return interaction, module
+
+    return asyncio.run(scenario())
+
+
+def test_randomquote_never_serves_a_quote_from_a_private_channel(conn, monkeypatch):
+    interaction, module = random_from(conn, monkeypatch, {501: channel_seen_by_everyone(False)})
+    assert "no quotes" in refused_privately(interaction).lower()
+    module.render_quote_gif.assert_not_called()
+
+
+def test_randomquote_serves_a_quote_from_a_public_channel(conn, monkeypatch):
+    for _ in range(5):
+        conn.execute("DELETE FROM quotes")
+        conn.commit()
+        interaction, module = random_from(conn, monkeypatch, {
+            501: channel_seen_by_everyone(False),
+            502: channel_seen_by_everyone(True),
+            503: channel_seen_by_everyone(True, kind=discord.ChannelType.private_thread),
+        })
+        assert module.render_quote_gif.call_args.kwargs["text"] == "from 502"
+        assert isinstance(sent_kwargs(interaction)["file"], discord.File)
+
+
+def test_randomquote_skips_quotes_whose_channel_is_gone(conn, monkeypatch):
+    uncached_parent = channel_seen_by_everyone(True)
+    uncached_parent.permissions_for.side_effect = discord.ClientException("Parent channel not found")
+    interaction, module = random_from(conn, monkeypatch, {501: None, 502: uncached_parent})
+    assert "no quotes" in refused_privately(interaction).lower()
+    module.render_quote_gif.assert_not_called()
+
+
+# --- text cleanup ----------------------------------------------------------------------------------------
+
+def rendered_text(conn, monkeypatch, text):
+    async def scenario():
+        cog, _, module = make_cog(conn, monkeypatch)
+        interaction = interaction_with(fake_message(text))
+        await cog.quoteit.callback(cog, interaction, URL, None)
+        return interaction, module
+
+    return asyncio.run(scenario())
+
+
+def test_custom_emoji_markdown_and_spoilers_are_cleaned_up(conn, monkeypatch):
+    interaction, module = rendered_text(
+        conn, monkeypatch, "**so** <:pepe_laugh:123> _true_ <a:party_time:456> ||the butler did it||"
+    )
+    text = module.render_quote_gif.call_args.kwargs["text"]
+    assert text == "so :pepe_laugh: true :party_time: [spoiler]"
+    assert "butler" not in QuoteRepo(conn).random().text
+
+
+def test_the_zero_width_space_clean_content_adds_to_everyone_is_dropped(conn, monkeypatch):
+    _, module = rendered_text(conn, monkeypatch, "@\u200beveryone look")
+    assert module.render_quote_gif.call_args.kwargs["text"] == "@everyone look"
+
+
+def test_text_that_is_empty_after_cleanup_is_refused(conn, monkeypatch):
+    interaction, module = rendered_text(conn, monkeypatch, "** **")
+    assert "text" in refused_privately(interaction).lower()
+    module.render_quote_gif.assert_not_called()
+
+
+# --- concurrency and size --------------------------------------------------------------------------------
+
+def test_a_second_parallel_use_is_refused_while_the_first_is_still_fetching(conn, monkeypatch):
+    async def scenario():
+        cog, _, _ = make_cog(conn, monkeypatch)
+        gate = asyncio.Event()
+
+        async def slow_fetch(message_id):
+            await gate.wait()
+            return fake_message()
+
+        first = interaction_with()
+        first.channel.fetch_message = AsyncMock(side_effect=slow_fetch)
+        task = asyncio.create_task(cog.quoteit.callback(cog, first, URL, None))
+        await asyncio.sleep(0)                               # the first is now waiting on fetch_message
+        second = interaction_with(fake_message())
+        await cog.quoteit.callback(cog, second, URL, None)
+        gate.set()
+        await task
+        return first, second
+
+    first, second = asyncio.run(scenario())
+    assert "slow down" in refused_privately(second).lower()
+    second.channel.fetch_message.assert_not_awaited()
+    assert isinstance(sent_kwargs(first)["file"], discord.File)
+    assert count(conn) == 1
+
+
+def test_a_refusal_after_fetching_releases_the_cooldown(conn, monkeypatch):
+    async def scenario():
+        cog, _, _ = make_cog(conn, monkeypatch)
+        missing = discord.NotFound(MagicMock(status=404), "Unknown Message")
+        await cog.quoteit.callback(cog, interaction_with(fetch_error=missing), URL, None)
+        retry = interaction_with(fake_message())
+        await cog.quoteit.callback(cog, retry, URL, None)
+        return retry
+
+    assert isinstance(sent_kwargs(asyncio.run(scenario()))["file"], discord.File)
+
+
+def test_at_most_two_renders_run_at_once(conn, monkeypatch):
+    import threading
+
+    lock, release = threading.Lock(), threading.Event()
+    state = {"active": 0, "peak": 0}
+
+    def blocking_render(background, **kwargs):
+        with lock:
+            state["active"] += 1
+            state["peak"] = max(state["peak"], state["active"])
+        release.wait(5)
+        with lock:
+            state["active"] -= 1
+        return b"GIF89a-fake"
+
+    async def scenario():
+        cog, _, _ = make_cog(conn, monkeypatch, render=MagicMock(side_effect=blocking_render))
+        tasks = [
+            asyncio.create_task(cog.quoteit.callback(cog, interaction_with(fake_message(), user_id=uid), URL, None))
+            for uid in (1, 2, 3, 4)
+        ]
+        for _ in range(200):
+            if state["active"] == 2:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.1)                             # give a third render the chance to (wrongly) start
+        peak_while_blocked = state["peak"]
+        release.set()
+        await asyncio.gather(*tasks)
+        return peak_while_blocked
+
+    assert asyncio.run(scenario()) == 2
+    assert count(conn) == 4
+
+
+def test_a_gif_over_the_size_limit_is_a_render_failure(conn, monkeypatch):
+    import bot.quotes.render as render_module
+
+    async def scenario():
+        too_big = MagicMock(return_value=b"x" * (render_module.MAX_GIF_BYTES + 1))
+        cog, _, _ = make_cog(conn, monkeypatch, render=too_big)
+        interaction = interaction_with(fake_message())
+        await cog.quoteit.callback(cog, interaction, URL, None)
+        retry = interaction_with(fake_message())
+        await cog.quoteit.callback(cog, retry, URL, None)
+        return interaction, retry
+
+    interaction, retry = asyncio.run(scenario())
+    kwargs = sent_kwargs(interaction)
+    assert kwargs.get("ephemeral") is True and "file" not in kwargs
+    assert "sorry" in reply_text(interaction).lower()
+    retry.response.defer.assert_awaited_once()               # the cooldown was released
+    assert count(conn) == 0

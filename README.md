@@ -93,7 +93,8 @@ Administrators can always use the officer commands, even before the officer role
 **Quote memes:** put a Giphy API key in `.env` as `GIPHY_API_KEY` (optional; results are rated PG-13 or lower). Without
 it, or when Giphy fails, backgrounds come from `assets/memes/` (add your own GIFs, PNGs or JPEGs there), and if that is
 empty a generated background is used. Each member can make one meme every 15 seconds; bot messages and messages with
-no text are not quoted.
+no text are not quoted. Spoilers are never shown in the meme, and `/randomquote` only replays quotes from channels
+`@everyone` can see.
 
 ## Data
 
