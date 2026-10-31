@@ -362,3 +362,62 @@ def test_render_failure_gives_a_friendly_message_and_no_quote_saved(conn, monkey
     interaction.delete_original_response.assert_awaited_once()
     retry.response.defer.assert_awaited_once()
     assert count(conn) == 0
+
+
+def private_thread(*, member=False, manage_threads=False):
+    thread = MagicMock()
+    thread.id = 777
+    thread.type = discord.ChannelType.private_thread
+    thread.fetch_message = AsyncMock(return_value=fake_message())
+    thread.permissions_for.return_value = discord.Permissions(
+        view_channel=True, read_message_history=True, manage_threads=manage_threads,
+    )
+    error = None if member else discord.NotFound(MagicMock(status=404), "Unknown Member")
+    thread.fetch_member = AsyncMock(return_value=SimpleNamespace(id=1), side_effect=error)
+    return thread
+
+
+def quote_from(conn, monkeypatch, channel):
+    async def scenario():
+        cog, _, _ = make_cog(conn, monkeypatch)
+        interaction = interaction_with(fake_message())
+        interaction.guild.get_channel_or_thread = MagicMock(return_value=channel)
+        await cog.quoteit.callback(cog, interaction, "https://discord.com/channels/111/777/333", None)
+        return interaction
+
+    return asyncio.run(scenario())
+
+
+def test_a_private_thread_the_member_is_not_in_is_refused(conn, monkeypatch):
+    thread = private_thread()
+    interaction = quote_from(conn, monkeypatch, thread)
+    assert "couldn't find" in refused_privately(interaction).lower()
+    thread.fetch_member.assert_awaited_once_with(1)
+    thread.fetch_message.assert_not_awaited()
+    interaction.response.defer.assert_not_awaited()
+    assert count(conn) == 0
+
+
+def test_a_private_thread_the_member_is_in_can_be_quoted(conn, monkeypatch):
+    thread = private_thread(member=True)
+    interaction = quote_from(conn, monkeypatch, thread)
+    thread.fetch_message.assert_awaited_once_with(333)
+    assert isinstance(sent_kwargs(interaction)["file"], discord.File)
+    assert count(conn) == 1
+
+
+def test_a_private_thread_can_be_quoted_by_someone_who_manages_threads(conn, monkeypatch):
+    thread = private_thread(manage_threads=True)
+    interaction = quote_from(conn, monkeypatch, thread)
+    thread.fetch_message.assert_awaited_once_with(333)
+    assert isinstance(sent_kwargs(interaction)["file"], discord.File)
+    assert count(conn) == 1
+
+
+def test_a_thread_whose_parent_is_not_cached_is_a_friendly_refusal(conn, monkeypatch):
+    thread = private_thread(member=True)
+    thread.permissions_for.side_effect = discord.ClientException("Parent channel not found")
+    interaction = quote_from(conn, monkeypatch, thread)
+    assert "couldn't find" in refused_privately(interaction).lower()
+    thread.fetch_message.assert_not_awaited()
+    assert count(conn) == 0

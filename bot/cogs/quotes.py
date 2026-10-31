@@ -143,9 +143,7 @@ class QuotesCog(commands.Cog):
         if channel is None or not hasattr(channel, "fetch_message"):
             await _refuse(interaction, NOT_FOUND)
             return None
-        # the bot may see channels the member cannot; never let a link leak those
-        permissions = channel.permissions_for(interaction.user)
-        if not (permissions.view_channel and permissions.read_message_history):
+        if not await self._member_can_read(channel, interaction.user):
             await _refuse(interaction, NOT_FOUND)
             return None
         try:
@@ -153,6 +151,23 @@ class QuotesCog(commands.Cog):
         except discord.HTTPException:  # NotFound and Forbidden included
             await _refuse(interaction, NOT_FOUND)
             return None
+
+    @staticmethod
+    async def _member_can_read(channel, member) -> bool:
+        """The bot may see channels the member cannot; never let a link leak those."""
+        try:
+            permissions = channel.permissions_for(member)
+        except discord.ClientException:  # a thread whose parent channel is not cached
+            return False
+        if not (permissions.view_channel and permissions.read_message_history):
+            return False
+        # a thread's permissions are its parent's, so a private thread also needs membership
+        if getattr(channel, "type", None) is discord.ChannelType.private_thread and not permissions.manage_threads:
+            try:
+                await channel.fetch_member(member.id)
+            except discord.HTTPException:  # NotFound: not in the thread
+                return False
+        return True
 
     async def make_card(self, interaction: discord.Interaction, message: discord.Message, term: str | None) -> None:
         """Validate, render and post the meme for `message`, then save it as a quote."""
