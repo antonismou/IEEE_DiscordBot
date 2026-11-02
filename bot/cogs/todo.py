@@ -5,16 +5,16 @@ from typing import Literal
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from bot.audit import audit
-from bot.channels import TODO_REMINDERS
+from bot.channels import OFFICER_LOG, TODO_REMINDERS
 from bot.checks import is_officer, officer_only
 from bot.db import utcnow
-from bot.roles import resolve_member
+from bot.roles import notify_officers, resolve_member
 from bot.todo import render
 from bot.todo.dates import ATHENS, parse_when
-from bot.todo.service import schedule_task
+from bot.todo.service import UNASSIGNED, Delivery, run_due, schedule_task
 from bot.validation import clean_text
 
 log = logging.getLogger(__name__)
@@ -76,6 +76,76 @@ class TodoCog(commands.Cog):
         name="todo", description="Officer tasks and reminders", guild_only=True,
         default_permissions=discord.Permissions(administrator=True),
     )
+
+    async def cog_load(self) -> None:
+        self.reminder_loop.start()
+
+    async def cog_unload(self) -> None:
+        self.reminder_loop.cancel()
+
+    # --- reminders -------------------------------------------------------------------------------------------
+    @tasks.loop(seconds=30)
+    async def reminder_loop(self) -> None:
+        try:
+            await run_due(self.app.todo, self._clock(), self.deliver, is_active=self.is_active)
+        except Exception:
+            log.exception("Reminder pass failed")
+
+    @reminder_loop.before_loop
+    async def _before_reminder_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
+    async def is_active(self, user_id: int) -> bool:
+        """Still an officer in the server? Reminders for someone who left or lost the role are dropped.
+        When Discord can't tell us (guild not cached, API error) the reminder is kept."""
+        guild = self.bot.get_guild(self.app.server.guild_id) if self.app.server.guild_id else None
+        if guild is None:
+            return True
+        try:
+            member = await resolve_member(guild, discord.Object(id=user_id))
+        except discord.HTTPException:
+            return True
+        return member is not None and is_officer(member, self.app.server.officer_role_id)
+
+    async def _dm(self, user_id: int, text: str) -> bool:
+        try:
+            user = await self.bot.fetch_user(user_id)
+            await user.send(text, allowed_mentions=discord.AllowedMentions.none())
+        except (discord.Forbidden, discord.HTTPException):
+            return False
+        return True
+
+    async def _post(self, delivery: Delivery, text: str) -> bool:
+        channel_id = self.app.channels.get(TODO_REMINDERS)
+        if channel_id is None:
+            return False
+        user_id = delivery.reminder.user_id
+        if user_id == UNASSIGNED:
+            role_id = self.app.server.officer_role_id
+            prefix = f"<@&{role_id}> " if role_id else ""
+            mentions = discord.AllowedMentions(roles=[discord.Object(id=role_id)] if role_id else False, users=False)
+        else:
+            prefix = f"<@{user_id}> "
+            mentions = discord.AllowedMentions(users=[discord.Object(id=user_id)], roles=False)
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            await channel.send(render.truncate(prefix + text), allowed_mentions=mentions)
+        except (discord.Forbidden, discord.HTTPException):
+            log.exception("Could not post a reminder to channel %s", channel_id)
+            return False
+        return True
+
+    async def deliver(self, delivery: Delivery) -> None:
+        """Send one reminder by DM and/or to the tasks channel, falling back to the channel if a DM fails."""
+        reminder = delivery.reminder
+        text = render.reminder_text(delivery)
+        want_dm = reminder.delivery in ("dm", "both") and reminder.user_id != UNASSIGNED
+        dm_ok = await self._dm(reminder.user_id, text) if want_dm else False
+        want_channel = reminder.delivery in ("channel", "both") or (want_dm and not dm_ok)
+        posted = await self._post(delivery, text) if want_channel else False
+        if not dm_ok and not posted:
+            label = f"task #{delivery.task.id}" if delivery.task else "a reminder"
+            await notify_officers(self.bot, self.app.channels.get(OFFICER_LOG), f"Could not deliver the reminder for {label}.")
 
     # --- helpers ---------------------------------------------------------------------------------------------
     async def announce(self, client, text: str, *, mention_user_id: int | None = None) -> None:

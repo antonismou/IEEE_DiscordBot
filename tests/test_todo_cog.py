@@ -23,7 +23,7 @@ def make_cog(conn):
 
     audit_lines = []
     app = SimpleNamespace(
-        todo=TodoRepo(conn), channels=ChannelRepo(conn), server=SimpleNamespace(officer_role_id=OFFICER_ROLE),
+        todo=TodoRepo(conn), channels=ChannelRepo(conn), server=SimpleNamespace(officer_role_id=OFFICER_ROLE, guild_id=None),
     )
     bot = SimpleNamespace(app=app)
     cog = TodoCog(bot)
@@ -265,3 +265,153 @@ def test_forget_removes_todo_data(conn):
     assert app.todo.get_task(task.id).assignee_id is None
     assert app.todo.pending_reminders() == []
     assert reply_text(interaction) == "Stored data deleted."
+
+
+# --- reminder delivery -------------------------------------------------------------------------------------
+
+from bot.channels import OFFICER_LOG  # noqa: E402
+from bot.todo.service import UNASSIGNED, Delivery, run_due, schedule_task  # noqa: E402
+from bot.todo.store import Reminder  # noqa: E402
+
+
+def delivery_for(app, *, user_id=5, mode="both", kind="1h", with_task=True):
+    task = None
+    if with_task:
+        task = app.todo.add_task(
+            title="Book venue", description="", created_by=1, assignee_id=user_id or None, due_at=NOW + timedelta(hours=1),
+            priority="normal", repeat="none", notify=mode, now=NOW,
+        )
+    reminder = Reminder(1, task.id if task else None, user_id, kind, NOW, None if task else "call them", mode, None)
+    return Delivery(reminder, task, False)
+
+
+def wire(cog, app, *, dm_error=None, officer_log=True):
+    dm_user = MagicMock()
+    dm_user.send = AsyncMock(side_effect=dm_error)
+    channel = MagicMock()
+    channel.send = AsyncMock()
+    log_channel = MagicMock()
+    log_channel.send = AsyncMock()
+    cog.bot.fetch_user = AsyncMock(return_value=dm_user)
+    app.channels.set(TODO_REMINDERS, 77)
+    if officer_log:
+        app.channels.set(OFFICER_LOG, 88)
+    cog.bot.get_channel = lambda cid: {77: channel, 88: log_channel}.get(cid)
+    return dm_user, channel, log_channel
+
+
+def forbidden():
+    return discord.Forbidden(MagicMock(status=403), "no dms")
+
+
+def test_both_goes_to_dm_and_channel_with_restricted_mentions(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, _ = wire(cog, app)
+    asyncio.run(cog.deliver(delivery_for(app)))
+    dm.send.assert_awaited_once()
+    assert dm.send.await_args.kwargs["allowed_mentions"].to_dict() == discord.AllowedMentions.none().to_dict()
+    text = channel.send.await_args.args[0]
+    assert text.startswith("<@5> ") and "Book venue" in text
+    assert [u.id for u in channel.send.await_args.kwargs["allowed_mentions"].users] == [5]
+
+
+def test_dm_only_and_channel_only(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, _ = wire(cog, app)
+    asyncio.run(cog.deliver(delivery_for(app, mode="dm")))
+    assert dm.send.await_count == 1 and channel.send.await_count == 0
+    asyncio.run(cog.deliver(delivery_for(app, mode="channel")))
+    assert dm.send.await_count == 1 and channel.send.await_count == 1
+
+
+def test_failed_dm_falls_back_to_the_channel(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, log_channel = wire(cog, app, dm_error=forbidden())
+    asyncio.run(cog.deliver(delivery_for(app, mode="dm")))
+    channel.send.assert_awaited_once()
+    log_channel.send.assert_not_awaited()
+
+
+def test_unassigned_pings_the_officer_role_only(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, _ = wire(cog, app)
+    asyncio.run(cog.deliver(delivery_for(app, user_id=UNASSIGNED, mode="channel")))
+    dm.send.assert_not_awaited()
+    assert channel.send.await_args.args[0].startswith(f"<@&{OFFICER_ROLE}> ")
+    mentions = channel.send.await_args.kwargs["allowed_mentions"]
+    assert [r.id for r in mentions.roles] == [OFFICER_ROLE] and mentions.users is False
+
+
+def test_nothing_deliverable_tells_officer_log_without_the_task_text(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, log_channel = wire(cog, app, dm_error=forbidden())
+    app.channels.clear(TODO_REMINDERS)
+    asyncio.run(cog.deliver(delivery_for(app, mode="dm")))
+    sent = log_channel.send.await_args.args[0]
+    assert "task #" in sent and "Book venue" not in sent
+
+
+def test_no_channel_bound_still_sends_the_dm(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, log_channel = wire(cog, app)
+    app.channels.clear(TODO_REMINDERS)
+    asyncio.run(cog.deliver(delivery_for(app)))
+    dm.send.assert_awaited_once()
+    log_channel.send.assert_not_awaited()
+
+
+def test_free_standing_reminder_text(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, _ = wire(cog, app)
+    asyncio.run(cog.deliver(delivery_for(app, with_task=False, kind="custom")))
+    assert "call them" in dm.send.await_args.args[0]
+
+
+def test_loop_pass_delivers_due_reminders_and_survives_errors(conn):
+    cog, app, _ = make_cog(conn)
+    dm, channel, _ = wire(cog, app)
+    task = app.todo.add_task(
+        title="Book venue", description="", created_by=1, assignee_id=5, due_at=NOW + timedelta(minutes=5),
+        priority="normal", repeat="none", notify="dm", now=NOW - timedelta(days=1),
+    )
+    schedule_task(app.todo, task, NOW - timedelta(days=1))
+    cog._clock = lambda: NOW + timedelta(minutes=5)
+    asyncio.run(cog.reminder_loop.coro(cog))
+    assert dm.send.await_count == 1                      # "due"; 2d/1d/1h were superseded
+    cog.deliver = AsyncMock(side_effect=RuntimeError("boom"))
+    asyncio.run(cog.reminder_loop.coro(cog))             # nothing due, and must not raise
+
+
+def test_loop_swallows_exceptions(conn):
+    cog, app, _ = make_cog(conn)
+    app.todo = None                                      # makes run_due blow up
+    asyncio.run(cog.reminder_loop.coro(cog))
+
+
+def test_is_active_checks_the_officer_role_and_keeps_reminders_when_unsure(conn):
+    cog, app, _ = make_cog(conn)
+    app.server.guild_id = 111
+    member = officer(5)
+    guild = fake_guild(fetched=member)
+    cog.bot.get_guild = lambda gid: guild
+    assert asyncio.run(cog.is_active(5)) is True
+    guild.fetch_member.return_value = fake_member(5)      # lost the role
+    assert asyncio.run(cog.is_active(5)) is False
+    guild.fetch_member.side_effect = discord.NotFound(MagicMock(status=404), "gone")
+    assert asyncio.run(cog.is_active(5)) is False         # left the server
+    guild.fetch_member.side_effect = discord.HTTPException(MagicMock(status=500), "oops")
+    assert asyncio.run(cog.is_active(5)) is True          # unsure: keep
+    cog.bot.get_guild = lambda gid: None
+    assert asyncio.run(cog.is_active(5)) is True
+
+
+def test_cog_load_starts_and_unload_stops_the_loop(conn):
+    async def scenario():
+        cog, _, _ = make_cog(conn)
+        cog.bot.wait_until_ready = AsyncMock()
+        await cog.cog_load()
+        running = cog.reminder_loop.is_running()
+        await cog.cog_unload()
+        return running
+
+    assert asyncio.run(scenario()) is True
