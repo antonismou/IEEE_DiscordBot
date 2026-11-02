@@ -62,6 +62,34 @@ class TaskListView(discord.ui.View):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
 
+MAX_FREE_REMINDERS = 25
+MAX_REMINDER_LINES = 25
+
+
+class CancelRemindersView(discord.ui.View):
+    """One Cancel button per free-standing reminder of the person who asked."""
+
+    def __init__(self, repo, owner_id: int, own_reminders):
+        super().__init__(timeout=120)
+        self.repo, self.owner_id = repo, owner_id
+        for reminder in own_reminders[:20]:
+            button = discord.ui.Button(label=f"Cancel #{reminder.id}", style=discord.ButtonStyle.danger)
+            button.callback = self._make_callback(reminder.id, button)
+            self.add_item(button)
+
+    def _make_callback(self, reminder_id: int, button: discord.ui.Button):
+        async def callback(interaction: discord.Interaction) -> None:
+            cancelled = self.repo.cancel_reminder(reminder_id, interaction.user.id)
+            button.disabled = True
+            button.label = f"#{reminder_id} cancelled" if cancelled else f"#{reminder_id} already gone"
+            await interaction.response.edit_message(view=self)
+
+        return callback
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.owner_id
+
+
 class TodoCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -347,6 +375,53 @@ class TodoCog(commands.Cog):
         await audit(self.app, interaction, f"deleted task #{found.id}")
         await self.announce(interaction.client, render.announcement_text("deleted", found, interaction.user.id))
         await interaction.response.send_message(f"Task #{found.id} deleted.", ephemeral=True)
+
+    @todo.command(name="remind", description="Remind yourself (and the team) about something")
+    @app_commands.describe(when="e.g. in 2h, tomorrow 09:00, fri 18:00", text="What to remind you of", delivery="Where")
+    @officer_only()
+    async def remind(self, interaction: discord.Interaction, when: str, text: str, delivery: Notify = "both") -> None:
+        now = self._clock()
+        try:
+            fire_at = parse_when(when, now)
+            clean_reminder = clean_text(text, min_len=1, max_len=200, label="Text")
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        if self.app.todo.count_pending_free(interaction.user.id) >= MAX_FREE_REMINDERS:
+            await interaction.response.send_message(
+                f"You already have {MAX_FREE_REMINDERS} pending reminders. Cancel some with `/todo reminders`.",
+                ephemeral=True,
+            )
+            return
+        reminder = self.app.todo.add_reminder(
+            task_id=None, user_id=interaction.user.id, kind="custom", fire_at=fire_at, text=clean_reminder,
+            delivery=delivery,
+        )
+        where = {"dm": "by DM", "channel": "in the tasks channel", "both": "by DM and in the tasks channel"}[delivery]
+        await interaction.response.send_message(
+            f"Reminder #{reminder.id} set for {render.stamp(fire_at)} {where}.", ephemeral=True
+        )
+
+    @todo.command(name="reminders", description="Show pending reminders")
+    @officer_only()
+    async def reminders(self, interaction: discord.Interaction) -> None:
+        pending = self.app.todo.pending_reminders()
+        lines = []
+        for reminder in pending[:MAX_REMINDER_LINES]:
+            if reminder.task_id is None:
+                who = f"<@{reminder.user_id}>"
+                lines.append(f"#{reminder.id} {render.stamp(reminder.fire_at)} {who}: {render.clean(reminder.text or '')}")
+            else:
+                lines.append(f"Task #{reminder.task_id} ({reminder.kind}) {render.stamp(reminder.fire_at, 'R')}")
+        if len(pending) > MAX_REMINDER_LINES:
+            lines.append(f"+{len(pending) - MAX_REMINDER_LINES} more")
+        mine = [r for r in pending if r.task_id is None and r.user_id == interaction.user.id]
+        body = render.truncate("\n".join(lines) or "No pending reminders.", 4000)
+        embed = discord.Embed(title="Pending reminders", description=body)
+        await interaction.response.send_message(
+            embed=embed, view=CancelRemindersView(self.app.todo, interaction.user.id, mine) if mine else discord.utils.MISSING,
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     done.autocomplete("task")(_task_choices)
     edit.autocomplete("task")(_task_choices)

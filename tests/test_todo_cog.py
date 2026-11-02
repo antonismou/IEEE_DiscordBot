@@ -427,3 +427,69 @@ def test_done_on_a_repeating_task_creates_the_next_and_says_so(conn):
     run(cog, cog.done, done, "1")
     assert app.todo.get_task(2).due_at == NOW + timedelta(days=8)
     assert "Next one is #2" in reply_text(done)
+
+
+# --- /todo remind and /todo reminders ----------------------------------------------------------------------
+
+def test_remind_creates_a_free_standing_reminder(conn):
+    cog, app, _ = make_cog(conn)
+    interaction = interaction_for(officer(4))
+    run(cog, cog.remind, interaction, "in 2h", "call the venue")
+    reminder = app.todo.get_reminder(1)
+    assert (reminder.task_id, reminder.user_id, reminder.kind, reminder.delivery) == (None, 4, "custom", "both")
+    assert reminder.fire_at == NOW + timedelta(hours=2) and reminder.text == "call the venue"
+    assert "Reminder #1" in reply_text(interaction)
+
+
+def test_remind_refusals(conn, monkeypatch):
+    import bot.cogs.todo as module
+
+    cog, app, _ = make_cog(conn)
+    past = interaction_for()
+    run(cog, cog.remind, past, "2020-01-01", "x")
+    assert "past" in reply_text(past)
+    empty = interaction_for()
+    run(cog, cog.remind, empty, "in 1h", "  ")
+    assert "Text" in reply_text(empty)
+    monkeypatch.setattr(module, "MAX_FREE_REMINDERS", 1)
+    run(cog, cog.remind, interaction_for(), "in 1h", "one")
+    full = interaction_for()
+    run(cog, cog.remind, full, "in 1h", "two")
+    assert "already have 1 pending" in reply_text(full)
+    assert app.todo.count_pending_free(1) == 1
+
+
+def test_reminders_lists_everyones_and_offers_cancel_only_for_own(conn):
+    cog, app, _ = make_cog(conn)
+    run(cog, cog.remind, interaction_for(officer(1)), "in 1h", "mine")
+    run(cog, cog.remind, interaction_for(officer(2)), "in 1h", "theirs")
+    interaction = interaction_for(officer(1))
+    run(cog, cog.reminders, interaction)
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert "mine" in kwargs["embed"].description and "theirs" in kwargs["embed"].description
+    labels = [b.label for b in kwargs["view"].children]
+    assert labels == ["Cancel #1"]
+
+
+def test_cancel_button_removes_only_the_owners_reminder(conn):
+    cog, app, _ = make_cog(conn)
+    run(cog, cog.remind, interaction_for(officer(1)), "in 1h", "mine")
+    run(cog, cog.remind, interaction_for(officer(2)), "in 1h", "theirs")
+    interaction = interaction_for(officer(1))
+    run(cog, cog.reminders, interaction)
+    view = interaction.response.send_message.await_args.kwargs["view"]
+    button = view.children[0]
+    click = interaction_for(officer(1))
+    asyncio.run(button.callback(click))
+    assert app.todo.get_reminder(1) is None and app.todo.get_reminder(2) is not None
+    assert button.disabled
+    assert asyncio.run(view.interaction_check(interaction_for(officer(2)))) is False
+    assert app.todo.cancel_reminder(2, 1) is False
+
+
+def test_reminders_with_nothing_pending(conn):
+    cog, app, _ = make_cog(conn)
+    interaction = interaction_for()
+    run(cog, cog.reminders, interaction)
+    kwargs = interaction.response.send_message.await_args.kwargs
+    assert kwargs["embed"].description == "No pending reminders."
