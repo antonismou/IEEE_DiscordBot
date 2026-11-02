@@ -61,7 +61,9 @@ class SetupCog(commands.Cog):
             )
         await interaction.response.send_message(
             f"Saved. Verified role: {verified.mention}. Officer role: {officer.mention}. "
-            f"Administrators can always use officer commands too.{warning}",
+            f"Administrators can always use officer commands too.{warning}\n\n"
+            "To show `/todo` to officers only: Server Settings -> Integrations -> this bot -> `/todo` -> add the "
+            "Officer role. Until then only administrators see it.",
             ephemeral=True, allowed_mentions=NO_MENTIONS,
         )
 

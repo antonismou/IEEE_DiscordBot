@@ -5,7 +5,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from bot.audit import audit
-from bot.channels import AUDIT_LOG, MEETING_SUMMARIES, OFFICER_LOG, PRIVATE_TOPICS, topics_for
+from bot.channels import (
+    AUDIT_LOG, MEETING_SUMMARIES, OFFICER_LOG, PRIVATE_TOPICS, TODO_BOARD, TODO_REMINDERS, topics_for,
+)
 from bot.checks import officer_only
 
 
@@ -55,9 +57,11 @@ class ChannelsCog(commands.Cog):
         await audit(self.app, interaction, f"set `{topic}` to post to <#{channel.id}>")
         text = f"`{topic}` now posts to {channel.mention}."
         if topic in PRIVATE_TOPICS and channel.permissions_for(interaction.guild.default_role).view_channel:
-            shows = (
-                "the full transcript of every recorded meeting" if topic == MEETING_SUMMARIES else "officer activity"
-            )
+            shows = {
+                MEETING_SUMMARIES: "the full transcript of every recorded meeting",
+                TODO_REMINDERS: "every task and reminder",
+                TODO_BOARD: "every open task",
+            }.get(topic, "officer activity")
             text += (
                 f"\n\n**Warning:** @everyone can see {channel.mention}. This channel shows {shows}: "
                 "make it visible to the Officer role only (channel settings -> Permissions)."
@@ -94,6 +98,10 @@ class ChannelsCog(commands.Cog):
                 lines.append(f"`{topic}` -> **not set** (optional: problems are only logged)")
             elif topic == AUDIT_LOG:
                 lines.append(f"`{topic}` -> **not set** (officer actions are not being recorded)")
+            elif topic == TODO_REMINDERS:
+                lines.append(f"`{topic}` -> **not set** (task announcements and channel reminders are off)")
+            elif topic == TODO_BOARD:
+                lines.append(f"`{topic}` -> **not set** (no live task board)")
             elif topic == MEETING_SUMMARIES:
                 lines.append(f"`{topic}` -> **not set** (summaries wait until you set one)")
             else:

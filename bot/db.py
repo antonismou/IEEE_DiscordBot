@@ -83,6 +83,33 @@ CREATE TABLE IF NOT EXISTS quotes (
     quoted_by   INTEGER NOT NULL,
     quoted_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    created_by  INTEGER NOT NULL,
+    assignee_id INTEGER,
+    due_at      TEXT,
+    priority    TEXT NOT NULL DEFAULT 'normal' CHECK (priority IN ('low', 'normal', 'high')),
+    status      TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'done')),
+    repeat      TEXT NOT NULL DEFAULT 'none' CHECK (repeat IN ('none', 'daily', 'weekly', 'monthly')),
+    notify      TEXT NOT NULL DEFAULT 'both' CHECK (notify IN ('dm', 'channel', 'both')),
+    created_at  TEXT NOT NULL,
+    done_at     TEXT,
+    done_by     INTEGER
+);
+CREATE TABLE IF NOT EXISTS reminders (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id  INTEGER,
+    user_id  INTEGER NOT NULL,
+    kind     TEXT NOT NULL,
+    fire_at  TEXT NOT NULL,
+    text     TEXT,
+    delivery TEXT NOT NULL CHECK (delivery IN ('dm', 'channel', 'both')),
+    sent_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS reminders_due ON reminders (sent_at, fire_at);
+CREATE INDEX IF NOT EXISTS reminders_task ON reminders (task_id);
 """
 
 
