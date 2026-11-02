@@ -110,3 +110,8 @@ def next_due(due: datetime, repeat: str, now: datetime) -> datetime:
     while result <= now:
         result = add_interval(result, repeat)
     return result
+
+
+def tomorrow_morning(now: datetime) -> datetime:
+    """09:00 Athens time on the next calendar day, as UTC."""
+    return _local(now.astimezone(ATHENS).date() + timedelta(days=1), time(9, 0))

@@ -409,7 +409,10 @@ def test_cog_load_starts_and_unload_stops_the_loop(conn):
     async def scenario():
         cog, _, _ = make_cog(conn)
         cog.bot.wait_until_ready = AsyncMock()
+        cog.bot.add_dynamic_items = MagicMock()
+        cog.bot.remove_dynamic_items = MagicMock()
         await cog.cog_load()
+        cog.bot.add_dynamic_items.assert_called_once()
         running = cog.reminder_loop.is_running()
         await cog.cog_unload()
         return running

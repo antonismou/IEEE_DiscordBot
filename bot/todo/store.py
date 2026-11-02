@@ -195,3 +195,9 @@ class TodoRepo:
         return self._c.execute(
             "SELECT COUNT(*) FROM reminders WHERE user_id = ? AND task_id IS NULL AND sent_at IS NULL", (user_id,)
         ).fetchone()[0]
+
+    def count_pending_snoozes(self, task_id: int, user_id: int) -> int:
+        return self._c.execute(
+            "SELECT COUNT(*) FROM reminders WHERE task_id = ? AND user_id = ? AND kind = 'snooze' AND sent_at IS NULL",
+            (task_id, user_id),
+        ).fetchone()[0]

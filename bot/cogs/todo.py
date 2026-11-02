@@ -13,6 +13,7 @@ from bot.checks import is_officer, officer_only
 from bot.db import utcnow
 from bot.roles import notify_officers, resolve_member
 from bot.todo import render
+from bot.todo.buttons import DYNAMIC_ITEMS, build_reminder_view
 from bot.todo.dates import ATHENS, parse_when
 from bot.todo.service import UNASSIGNED, Delivery, complete_and_repeat, run_due, schedule_task
 from bot.validation import clean_text
@@ -106,10 +107,12 @@ class TodoCog(commands.Cog):
     )
 
     async def cog_load(self) -> None:
+        self.bot.add_dynamic_items(*DYNAMIC_ITEMS)  # reminder buttons keep working after a restart
         self.reminder_loop.start()
 
     async def cog_unload(self) -> None:
         self.reminder_loop.cancel()
+        self.bot.remove_dynamic_items(*DYNAMIC_ITEMS)
 
     # --- reminders -------------------------------------------------------------------------------------------
     @tasks.loop(seconds=30)
@@ -135,15 +138,15 @@ class TodoCog(commands.Cog):
             return True
         return member is not None and is_officer(member, self.app.server.officer_role_id)
 
-    async def _dm(self, user_id: int, text: str) -> bool:
+    async def _dm(self, user_id: int, text: str, view) -> bool:
         try:
             user = await self.bot.fetch_user(user_id)
-            await user.send(text, allowed_mentions=discord.AllowedMentions.none())
+            await user.send(text, allowed_mentions=discord.AllowedMentions.none(), view=view)
         except (discord.Forbidden, discord.HTTPException):
             return False
         return True
 
-    async def _post(self, delivery: Delivery, text: str) -> bool:
+    async def _post(self, delivery: Delivery, text: str, view) -> bool:
         channel_id = self.app.channels.get(TODO_REMINDERS)
         if channel_id is None:
             return False
@@ -157,7 +160,7 @@ class TodoCog(commands.Cog):
             mentions = discord.AllowedMentions(users=[discord.Object(id=user_id)], roles=False)
         try:
             channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
-            await channel.send(render.truncate(prefix + text), allowed_mentions=mentions)
+            await channel.send(render.truncate(prefix + text), allowed_mentions=mentions, view=view)
         except (discord.Forbidden, discord.HTTPException):
             log.exception("Could not post a reminder to channel %s", channel_id)
             return False
@@ -167,10 +170,11 @@ class TodoCog(commands.Cog):
         """Send one reminder by DM and/or to the tasks channel, falling back to the channel if a DM fails."""
         reminder = delivery.reminder
         text = render.reminder_text(delivery)
+        view = build_reminder_view(delivery)
         want_dm = reminder.delivery in ("dm", "both") and reminder.user_id != UNASSIGNED
-        dm_ok = await self._dm(reminder.user_id, text) if want_dm else False
+        dm_ok = await self._dm(reminder.user_id, text, view) if want_dm else False
         want_channel = reminder.delivery in ("channel", "both") or (want_dm and not dm_ok)
-        posted = await self._post(delivery, text) if want_channel else False
+        posted = await self._post(delivery, text, view) if want_channel else False
         if not dm_ok and not posted:
             label = f"task #{delivery.task.id}" if delivery.task else "a reminder"
             await notify_officers(self.bot, self.app.channels.get(OFFICER_LOG), f"Could not deliver the reminder for {label}.")
