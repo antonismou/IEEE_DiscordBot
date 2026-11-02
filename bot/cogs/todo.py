@@ -14,7 +14,7 @@ from bot.db import utcnow
 from bot.roles import notify_officers, resolve_member
 from bot.todo import render
 from bot.todo.dates import ATHENS, parse_when
-from bot.todo.service import UNASSIGNED, Delivery, run_due, schedule_task
+from bot.todo.service import UNASSIGNED, Delivery, complete_and_repeat, run_due, schedule_task
 from bot.validation import clean_text
 
 log = logging.getLogger(__name__)
@@ -257,15 +257,15 @@ class TodoCog(commands.Cog):
         found = await self._task_or_refuse(interaction, task)
         if found is None:
             return
-        finished = self.app.todo.complete_task(found.id, interaction.user.id, self._clock())
+        finished, following = complete_and_repeat(self.app.todo, found, interaction.user.id, self._clock())
         if finished is None:
             await interaction.response.send_message(f"Task #{found.id} is already done.", ephemeral=True)
             return
-        self.app.todo.delete_unsent_for_task(found.id)
         self._board_dirty = True
         await audit(self.app, interaction, f"completed task #{found.id}")
-        await self.announce(interaction.client, render.announcement_text("done", finished, interaction.user.id))
-        await interaction.response.send_message(f"Task #{found.id} marked done.", ephemeral=True)
+        await self.announce(interaction.client, render.announcement_text("done", finished, interaction.user.id, following))
+        extra = f" Next one is #{following.id}, due {render.stamp(following.due_at)}." if following else ""
+        await interaction.response.send_message(f"Task #{found.id} marked done.{extra}", ephemeral=True)
 
     @todo.command(name="edit", description="Change a task")
     @app_commands.describe(due="New due date, or `none` to clear it")

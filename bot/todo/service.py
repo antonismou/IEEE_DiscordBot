@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from bot.todo.dates import next_due
 from bot.todo.store import Reminder, Task, TodoRepo
 
 log = logging.getLogger(__name__)
@@ -71,3 +72,21 @@ async def run_due(
         except Exception:
             log.exception("Could not deliver reminder %s", reminder.id)
     return sent
+
+
+def complete_and_repeat(repo: TodoRepo, task: Task, by: int, now: datetime) -> tuple[Task | None, Task | None]:
+    """Finish a task and, if it repeats, create the next one. (None, None) when it was already done, so a double
+    click or a second /todo done changes nothing."""
+    finished = repo.complete_task(task.id, by, now)
+    if finished is None:
+        return None, None
+    repo.delete_unsent_for_task(task.id)
+    if task.repeat == "none" or task.due_at is None:
+        return finished, None
+    following = repo.add_task(
+        title=task.title, description=task.description, created_by=task.created_by, assignee_id=task.assignee_id,
+        due_at=next_due(task.due_at, task.repeat, now), priority=task.priority, repeat=task.repeat,
+        notify=task.notify, now=now,
+    )
+    schedule_task(repo, following, now)
+    return finished, following

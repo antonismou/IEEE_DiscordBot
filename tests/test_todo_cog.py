@@ -415,3 +415,15 @@ def test_cog_load_starts_and_unload_stops_the_loop(conn):
         return running
 
     assert asyncio.run(scenario()) is True
+
+
+def test_done_on_a_repeating_task_creates_the_next_and_says_so(conn):
+    cog, app, _ = make_cog(conn)
+    interaction = interaction_for()
+    bound_channel(app, interaction)
+    add(cog, interaction, "report", due="in 1d", repeat="weekly")
+    done = interaction_for()
+    bound_channel(app, done)
+    run(cog, cog.done, done, "1")
+    assert app.todo.get_task(2).due_at == NOW + timedelta(days=8)
+    assert "Next one is #2" in reply_text(done)

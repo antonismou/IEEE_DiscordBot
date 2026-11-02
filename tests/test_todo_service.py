@@ -4,6 +4,8 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 
 
+import pytest
+
 from bot.todo.service import UNASSIGNED, Delivery, run_due, schedule_task
 from bot.todo.store import TodoRepo
 
@@ -181,3 +183,59 @@ def test_cancel_reminder_only_own_free_standing(conn):
     assert repo.cancel_reminder(tied.id, 1) is False
     assert repo.cancel_reminder(free.id, 1) is True
     assert repo.count_pending_free(1) == 0
+
+
+# --- repeating tasks ---------------------------------------------------------------------------------------
+
+from bot.todo.service import complete_and_repeat  # noqa: E402
+
+
+def repeating(repo, repeat, due):
+    return repo.add_task(
+        title="weekly report", description="d", created_by=1, assignee_id=5, due_at=due, priority="high",
+        repeat=repeat, notify="dm", now=NOW,
+    )
+
+
+@pytest.mark.parametrize(
+    "repeat,days", [("daily", 1), ("weekly", 7)]
+)
+def test_repeat_spawns_the_next_with_fresh_reminders(conn, repeat, days):
+    repo = TodoRepo(conn)
+    due = NOW + timedelta(days=1)
+    task = repeating(repo, repeat, due)
+    schedule_task(repo, task, NOW)
+    finished, nxt = complete_and_repeat(repo, task, 5, NOW)
+    assert finished.status == "done" and nxt.status == "open"
+    assert nxt.due_at == due + timedelta(days=days)
+    assert (nxt.title, nxt.assignee_id, nxt.priority, nxt.repeat, nxt.notify) == ("weekly report", 5, "high", repeat, "dm")
+    assert {r.task_id for r in repo.pending_reminders()} == {nxt.id}
+
+
+def test_month_end_clamps(conn):
+    repo = TodoRepo(conn)
+    jan31 = datetime(2027, 1, 31, 16, 0, tzinfo=timezone.utc)
+    task = repeating(repo, "monthly", jan31)
+    _, nxt = complete_and_repeat(repo, task, 5, datetime(2027, 1, 1, tzinfo=timezone.utc))
+    assert nxt.due_at.astimezone().date().month in (2, 3)  # 28 Feb 18:00 Athens
+    assert nxt.due_at == datetime(2027, 2, 28, 16, 0, tzinfo=timezone.utc)
+
+
+def test_overdue_by_weeks_still_lands_in_the_future(conn):
+    repo = TodoRepo(conn)
+    task = repeating(repo, "weekly", NOW - timedelta(days=30))
+    _, nxt = complete_and_repeat(repo, task, 5, NOW)
+    assert NOW < nxt.due_at <= NOW + timedelta(days=7)
+
+
+def test_non_repeating_and_already_done_spawn_nothing(conn):
+    repo = TodoRepo(conn)
+    plain = repeating(repo, "none", NOW + timedelta(days=1))
+    finished, nxt = complete_and_repeat(repo, plain, 5, NOW)
+    assert finished is not None and nxt is None
+    again = complete_and_repeat(repo, plain, 5, NOW)
+    assert again == (None, None)
+    weekly = repeating(repo, "weekly", NOW + timedelta(days=1))
+    complete_and_repeat(repo, weekly, 5, NOW)
+    assert complete_and_repeat(repo, weekly, 5, NOW) == (None, None)
+    assert repo.count_open() == 1   # exactly one successor despite two attempts
