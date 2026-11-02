@@ -26,6 +26,25 @@ class Task:
     done_by: int | None
 
 
+@dataclass(frozen=True)
+class Reminder:
+    id: int
+    task_id: int | None
+    user_id: int
+    kind: str
+    fire_at: datetime
+    text: str | None
+    delivery: str
+    sent_at: datetime | None
+
+
+def _reminder(row: sqlite3.Row) -> Reminder:
+    return Reminder(
+        id=row["id"], task_id=row["task_id"], user_id=row["user_id"], kind=row["kind"],
+        fire_at=from_iso(row["fire_at"]), text=row["text"], delivery=row["delivery"], sent_at=_opt(row["sent_at"]),
+    )
+
+
 def _opt(value: str | None) -> datetime | None:
     return from_iso(value) if value else None
 
@@ -121,3 +140,58 @@ class TodoRepo:
             changed += self._c.execute("UPDATE tasks SET created_by = 0 WHERE created_by = ?", (user_id,)).rowcount
             changed += self._c.execute("UPDATE tasks SET done_by = 0 WHERE done_by = ?", (user_id,)).rowcount
         return changed
+
+    # --- reminders -------------------------------------------------------------------------------------------
+    def add_reminder(
+        self, *, task_id: int | None, user_id: int, kind: str, fire_at: datetime, text: str | None, delivery: str
+    ) -> Reminder:
+        with self._c:
+            cur = self._c.execute(
+                "INSERT INTO reminders (task_id, user_id, kind, fire_at, text, delivery) VALUES (?, ?, ?, ?, ?, ?)",
+                (task_id, user_id, kind, to_iso(fire_at), text, delivery),
+            )
+        return self.get_reminder(cur.lastrowid)
+
+    def get_reminder(self, reminder_id: int) -> Reminder | None:
+        row = self._c.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        return _reminder(row) if row else None
+
+    def due_reminders(self, now: datetime) -> list[Reminder]:
+        rows = self._c.execute(
+            "SELECT * FROM reminders WHERE sent_at IS NULL AND fire_at <= ? ORDER BY fire_at, id", (to_iso(now),)
+        )
+        return [_reminder(r) for r in rows]
+
+    def mark_sent(self, reminder_id: int, now: datetime) -> bool:
+        """Claim a reminder. True for exactly one caller, so it can never be sent twice."""
+        with self._c:
+            cur = self._c.execute(
+                "UPDATE reminders SET sent_at = ? WHERE id = ? AND sent_at IS NULL", (to_iso(now), reminder_id)
+            )
+        return cur.rowcount > 0
+
+    def delete_unsent_for_task(self, task_id: int, kinds: tuple[str, ...] | None = None) -> None:
+        sql, args = "DELETE FROM reminders WHERE task_id = ? AND sent_at IS NULL", [task_id]
+        if kinds:
+            sql += f" AND kind IN ({', '.join('?' * len(kinds))})"
+            args += kinds
+        with self._c:
+            self._c.execute(sql, args)
+
+    def pending_reminders(self) -> list[Reminder]:
+        rows = self._c.execute("SELECT * FROM reminders WHERE sent_at IS NULL ORDER BY fire_at, id")
+        return [_reminder(r) for r in rows]
+
+    def cancel_reminder(self, reminder_id: int, user_id: int) -> bool:
+        """Cancel one of the caller's own free-standing reminders."""
+        with self._c:
+            cur = self._c.execute(
+                "DELETE FROM reminders WHERE id = ? AND user_id = ? AND task_id IS NULL AND sent_at IS NULL",
+                (reminder_id, user_id),
+            )
+        return cur.rowcount > 0
+
+    def count_pending_free(self, user_id: int) -> int:
+        return self._c.execute(
+            "SELECT COUNT(*) FROM reminders WHERE user_id = ? AND task_id IS NULL AND sent_at IS NULL", (user_id,)
+        ).fetchone()[0]
