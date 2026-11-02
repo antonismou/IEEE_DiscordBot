@@ -5,7 +5,9 @@ import sqlite3
 OFFICER_LOG = "officer-log"  # reserved topic: where the bot reports problems to officers
 AUDIT_LOG = "audit-log"  # reserved topic: one line per officer/admin action
 MEETING_SUMMARIES = "meeting-summaries"  # reserved topic: recorded meetings' summaries and transcripts
-PRIVATE_TOPICS = (OFFICER_LOG, AUDIT_LOG, MEETING_SUMMARIES)  # channels that must not be visible to @everyone
+TODO_REMINDERS = "todo-reminders"  # reserved topic: task announcements and reminders (officers only)
+TODO_BOARD = "todo-board"  # reserved topic: the live board of open tasks (officers only)
+PRIVATE_TOPICS = (OFFICER_LOG, AUDIT_LOG, MEETING_SUMMARIES, TODO_REMINDERS, TODO_BOARD)  # channels that must not be visible to @everyone
 RESERVED_TOPICS = PRIVATE_TOPICS  # topics a feed cannot use
 
 

@@ -25,6 +25,7 @@ import discord  # noqa: E402
 from bot.channels import AUDIT_LOG, ChannelRepo  # noqa: E402
 from bot.members import MemberRepo  # noqa: E402
 from bot.quotes.store import QuoteRepo  # noqa: E402
+from bot.todo.store import TodoRepo  # noqa: E402
 from bot.verification import VerificationService  # noqa: E402
 from tests.fakes import fake_guild, fake_interaction, fake_member, followup_text  # noqa: E402
 
@@ -41,6 +42,7 @@ def make_cog(conn):
         verification=VerificationService(conn, members),
         channels=ChannelRepo(conn),
         quotes=QuoteRepo(conn),
+        todo=TodoRepo(conn),
     )
     return OfficerCog(SimpleNamespace(app=app)), app
 

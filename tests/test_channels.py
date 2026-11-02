@@ -56,7 +56,9 @@ def run_command(cog, command, *args):
 
 def test_topics_come_from_the_feeds_plus_the_reserved_ones(conn):
     cog, _ = make_cog(conn, FEEDS)
-    assert cog.topics() == ["ai-ml", "audit-log", "meeting-summaries", "officer-log", "robotics"]
+    assert cog.topics() == [
+        "ai-ml", "audit-log", "meeting-summaries", "officer-log", "robotics", "todo-board", "todo-reminders",
+    ]
 
 
 def test_set_accepts_the_meeting_summaries_topic(conn):
@@ -130,6 +132,8 @@ def test_private_channels_warn_when_everyone_can_see_them(conn):
     summaries = run("meeting-summaries", True)                 # it carries every meeting's full transcript
     assert "@everyone can see" in summaries and "transcript" in summaries
     assert "Warning" not in run("meeting-summaries", False)
+    assert "every task" in run("todo-reminders", True)         # task titles and reminders
+    assert "every open task" in run("todo-board", True)
 
 
 def test_setting_a_channel_is_written_to_the_audit_log(conn):
