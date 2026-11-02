@@ -56,3 +56,14 @@ def test_roles_panel_is_remembered_and_not_mistaken_for_a_branch(conn):
     assert server.branch_role_ids == {"cs": 11}
     server.set_roles_panel(None)
     assert server.roles_panel is None
+
+
+def test_todo_board_round_trip_and_clear(conn):
+    server = ServerSettings(conn)
+    assert server.todo_board is None
+    server.set_todo_board(10, 20)
+    assert server.todo_board == (10, 20)
+    server.set_todo_board(11, 21)
+    assert server.todo_board == (11, 21)
+    server.set_todo_board(None)
+    assert server.todo_board is None

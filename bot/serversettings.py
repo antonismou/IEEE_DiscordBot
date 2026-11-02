@@ -135,6 +135,26 @@ class ServerSettings:
                 [("roles_panel_channel_id", str(channel_id)), ("roles_panel_message_id", str(message_id))],
             )
 
+    @property
+    def todo_board(self) -> tuple[int, int] | None:
+        """(channel id, message id) of the live task board, if one was posted."""
+        channel_id, message_id = self._get("todo_board_channel_id"), self._get("todo_board_message_id")
+        return (channel_id, message_id) if channel_id and message_id else None
+
+    def set_todo_board(self, channel_id: int | None, message_id: int | None = None) -> None:
+        """Remember where the task board is, or forget it (channel_id None)."""
+        with self._c:
+            if channel_id is None:
+                self._c.execute(
+                    "DELETE FROM server_settings WHERE key IN ('todo_board_channel_id', 'todo_board_message_id')"
+                )
+                return
+            self._c.executemany(
+                "INSERT INTO server_settings (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                [("todo_board_channel_id", str(channel_id)), ("todo_board_message_id", str(message_id))],
+            )
+
     def configure_branches(self, role_ids: dict[str, int]) -> None:
         with self._c:
             self._c.executemany(

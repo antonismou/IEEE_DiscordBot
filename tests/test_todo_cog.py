@@ -496,3 +496,78 @@ def test_reminders_with_nothing_pending(conn):
     run(cog, cog.reminders, interaction)
     kwargs = interaction.response.send_message.await_args.kwargs
     assert kwargs["embed"].description == "No pending reminders."
+
+
+# --- the board ---------------------------------------------------------------------------------------------
+
+from bot.channels import TODO_BOARD  # noqa: E402
+
+
+def board_world(conn, *, edit_error=None, send_error=None):
+    from bot.serversettings import ServerSettings
+
+    cog, app, _ = make_cog(conn)
+    app.server = ServerSettings(conn)
+    channel = MagicMock()
+    message = MagicMock(id=555)
+    message.pin = AsyncMock()
+    channel.send = AsyncMock(return_value=message, side_effect=send_error)
+    partial = MagicMock()
+    partial.edit = AsyncMock(side_effect=edit_error)
+    channel.get_partial_message = MagicMock(return_value=partial)
+    cog.bot.get_channel = lambda cid: channel
+    app.channels.set(TODO_BOARD, 66)
+    return cog, app, channel, partial
+
+
+def test_board_is_posted_once_then_edited_in_place_when_dirty(conn):
+    cog, app, channel, partial = board_world(conn)
+    asyncio.run(cog.refresh_board())
+    channel.send.assert_awaited_once()
+    assert app.server.todo_board == (66, 555)
+    asyncio.run(cog.refresh_board())          # nothing changed: no API calls
+    assert channel.send.await_count == 1 and partial.edit.await_count == 0
+    cog._board_dirty = True
+    asyncio.run(cog.refresh_board())
+    partial.edit.assert_awaited_once()
+    assert channel.send.await_count == 1 and cog._board_dirty is False
+    channel.get_partial_message.assert_called_with(555)
+
+
+def test_board_is_reposted_when_the_message_was_deleted(conn):
+    cog, app, channel, partial = board_world(conn, edit_error=discord.NotFound(MagicMock(status=404), "gone"))
+    app.server.set_todo_board(66, 111)
+    cog._board_dirty = True
+    asyncio.run(cog.refresh_board())
+    channel.send.assert_awaited_once()
+    assert app.server.todo_board == (66, 555)
+
+
+def test_board_follows_a_rebound_channel(conn):
+    cog, app, channel, partial = board_world(conn)
+    app.server.set_todo_board(65, 111)       # old channel
+    asyncio.run(cog.refresh_board())
+    channel.send.assert_awaited_once()
+    partial.edit.assert_not_awaited()
+    assert app.server.todo_board == (66, 555)
+
+
+def test_board_does_nothing_when_unbound(conn):
+    cog, app, channel, partial = board_world(conn)
+    app.channels.clear(TODO_BOARD)
+    cog._board_dirty = True
+    asyncio.run(cog.refresh_board())
+    channel.send.assert_not_awaited()
+
+
+def test_board_failure_keeps_the_flag_and_does_not_raise(conn):
+    cog, app, channel, partial = board_world(conn, send_error=discord.Forbidden(MagicMock(status=403), "no"))
+    cog._board_dirty = True
+    asyncio.run(cog.refresh_board())
+    assert cog._board_dirty is True and app.server.todo_board is None
+
+
+def test_a_task_change_marks_the_board_dirty(conn):
+    cog, app, _ = make_cog(conn)
+    add(cog, interaction_for())
+    assert cog._board_dirty is True

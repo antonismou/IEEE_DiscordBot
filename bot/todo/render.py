@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import timedelta
 
 import discord
 
@@ -102,3 +103,34 @@ def announcement_text(event: str, task, actor_id: int, next_task=None) -> str:
     else:
         raise ValueError(f"Unknown event: {event}")
     return truncate(text)
+
+
+BOARD_LINES = 25
+
+
+def board_embed(tasks, now) -> discord.Embed:
+    """The live board: every open task grouped by how soon it is due, at most BOARD_LINES lines."""
+    week = now + timedelta(days=7)
+    groups = (
+        ("🔴 Overdue", [t for t in tasks if t.due_at and t.due_at < now]),
+        ("🟠 Next 7 days", [t for t in tasks if t.due_at and now <= t.due_at <= week]),
+        ("🟢 Later", [t for t in tasks if t.due_at and t.due_at > week]),
+        ("⚪ No date", [t for t in tasks if not t.due_at]),
+    )
+    lines: list[str] = []
+    shown = 0
+    for heading, members in groups:
+        if not members or shown >= BOARD_LINES:
+            continue
+        lines.append(f"**{heading}**")
+        for task in members:
+            if shown >= BOARD_LINES:
+                break
+            lines.append(task_line(task))
+            shown += 1
+    if len(tasks) > shown:
+        lines.append(f"+{len(tasks) - shown} more")
+    embed = discord.Embed(title="Open tasks", description=truncate("\n".join(lines) or "No open tasks.", 4000))
+    embed.set_footer(text=f"{len(tasks)} open")
+    embed.timestamp = now
+    return embed

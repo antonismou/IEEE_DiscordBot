@@ -81,3 +81,29 @@ def test_announcements():
     assert "deleted" in announcement_text("deleted", task(), 1)
     with pytest.raises(ValueError):
         announcement_text("exploded", task(), 1)
+
+
+def test_board_groups_by_urgency_and_shows_everyone_in_the_right_section():
+    from bot.todo.render import board_embed
+
+    tasks = [
+        task(id=1, title="late", due_at=NOW - timedelta(days=1)),
+        task(id=2, title="soon", due_at=NOW + timedelta(days=2)),
+        task(id=3, title="far", due_at=NOW + timedelta(days=30)),
+        task(id=4, title="whenever", due_at=None),
+    ]
+    text = board_embed(tasks, NOW).description
+    order = [text.index(h) for h in ("Overdue", "Next 7 days", "Later", "No date")]
+    assert order == sorted(order)
+    for title in ("late", "soon", "far", "whenever"):
+        assert title in text
+
+
+def test_board_truncates_and_escapes_and_has_an_empty_state():
+    from bot.todo.render import board_embed
+
+    tasks = [task(id=i, title=f"t{i}") for i in range(40)]
+    embed = board_embed(tasks, NOW)
+    assert "+15 more" in embed.description and len(embed.description) <= 4000
+    assert board_embed([], NOW).description == "No open tasks."
+    assert "@everyone" not in board_embed([task(title="@everyone")], NOW).description.replace("@\u200beveryone", "")

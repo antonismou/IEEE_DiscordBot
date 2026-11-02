@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from bot.audit import audit
-from bot.channels import OFFICER_LOG, TODO_REMINDERS
+from bot.channels import OFFICER_LOG, TODO_BOARD, TODO_REMINDERS
 from bot.checks import is_officer, officer_only
 from bot.db import utcnow
 from bot.roles import notify_officers, resolve_member
@@ -121,6 +121,40 @@ class TodoCog(commands.Cog):
             await run_due(self.app.todo, self._clock(), self.deliver, is_active=self.is_active)
         except Exception:
             log.exception("Reminder pass failed")
+        try:
+            await self.refresh_board()
+        except Exception:
+            log.exception("Board refresh failed")
+
+    async def refresh_board(self) -> None:
+        """Keep the board message in step with the task list: edit it in place, or post it if it is gone."""
+        channel_id = self.app.channels.get(TODO_BOARD)
+        if channel_id is None:
+            return
+        stored = self.app.server.todo_board
+        here = stored is not None and stored[0] == channel_id
+        if here and not self._board_dirty:
+            return
+        embed = render.board_embed(self.app.todo.list_tasks(0, "all", self._clock()), self._clock())
+        try:
+            channel = self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
+            if here:
+                try:
+                    await channel.get_partial_message(stored[1]).edit(embed=embed)
+                    self._board_dirty = False
+                    return
+                except discord.NotFound:
+                    pass  # the board was deleted: post a new one
+            message = await channel.send(embed=embed)
+            self.app.server.set_todo_board(channel_id, message.id)
+            self._board_dirty = False
+            try:
+                await message.pin()
+            except (discord.Forbidden, discord.HTTPException):
+                pass  # pinning is a nicety
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            self._board_dirty = True  # try again on the next pass
+            log.warning("Could not update the task board in channel %s: %s", channel_id, exc)
 
     @reminder_loop.before_loop
     async def _before_reminder_loop(self) -> None:
