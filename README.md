@@ -85,6 +85,7 @@ Administrators can always use the officer commands, even before the officer role
 | `/feed list / add / remove` | officers | manage feeds without restarting |
 | `/record start / stop / status` | officers | record the voice channel you are in (announced in its chat); it also stops at once if the bot is disconnected, and when nobody but bots has been in the call for 45 seconds (a dropped connection can rejoin). The summary and transcript are posted in `meeting-summaries`, with a status message updated while it is processed; a meeting reprocessed later is posted again. A recording stopped with no audio is marked failed and posted as such |
 | `/stats verification` | officers | codes sent vs members verified (24 h / 7 days), to spot emails that don't arrive |
+| `/todo add / list / done / edit / assign / delete / remind / reminders` | officers | the officers' shared task list and reminders (see **To-do and reminders** below) |
 | `/forget-me` | everyone | delete your own stored data |
 | **Quote it** (right-click a message, Apps) | everyone | turn the message into a random animated meme GIF and save it as a quote |
 | `/quoteit message [gif]` | everyone | the same, for a message link or an ID from the current channel; `gif:` picks the Giphy search term |
@@ -95,6 +96,34 @@ it, or when Giphy fails, backgrounds come from `assets/memes/` (add your own GIF
 empty a generated background is used. Each member can make one meme every 15 seconds; bot messages and messages with
 no text are not quoted. Spoilers are never shown in the meme, and `/randomquote` replays a quote only in the channel
 it came from, or if `@everyone` can see that channel.
+
+## To-do and reminders
+
+A shared task list for officers; members cannot see or use any of it.
+
+- `/todo add title [due] [assignee] [priority] [repeat] [notify] [description]` creates a task. `due` takes `in 3h`,
+  `tomorrow 18:00`, `fri`, `2026-11-20 14:00` or `20/11` (Athens time; a date without a time means 18:00).
+- `/todo list [view]` (mine, all, unassigned, overdue, done), `/todo done`, `/todo edit` (`due: none` clears the date),
+  `/todo assign` (leave the officer out to unassign), `/todo delete`. Any officer can change any task.
+- Tasks with a due date remind **2 days, 1 day and 1 hour before, at the due time, and 1 day after** if still open.
+  `notify` picks DM, channel or both (default both). Reminders and announcements (task created, assigned, done,
+  deleted) go to the `todo-reminders` channel; reminder messages have **Done**, **Snooze 1h** and **Snooze until
+  tomorrow** buttons that keep working after a restart.
+- `/todo remind when text` sets a reminder for yourself (DM and channel by default); `/todo reminders` lists pending
+  ones and lets you cancel your own.
+- A task with `repeat` (daily, weekly, monthly) creates the next one when it is completed.
+- `/channel set todo-board #channel` keeps one pinned message up to date with all open tasks, grouped by urgency.
+  `todo-reminders` and `todo-board` show every task title, so make both channels **visible to officers only**
+  (`/channel set` warns if @everyone can see them).
+
+**Hiding the commands from non-officers:** `/todo` is hidden from everyone but administrators by default. Once, in
+**Server Settings -> Integrations -> (this bot) -> /todo**, add the Officer role. Discord does not let a bot do this
+by itself. The commands also refuse non-officers if they ever see them.
+
+`/forget-me` and `/member delete` remove a person's reminders, unassign them from tasks and remove their name as
+creator or completer; the tasks and the messages already posted in channels stay. Reminders are sent at most once:
+if the bot is offline over a reminder time it is sent late when the bot returns (reminders that the due time has
+already overtaken are skipped).
 
 ## Data
 
