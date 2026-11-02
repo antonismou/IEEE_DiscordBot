@@ -14,6 +14,7 @@ from bot.members import MemberRepo
 from bot.pins import PinLimiter
 from bot.quotes.store import QuoteRepo
 from bot.serversettings import ServerSettings
+from bot.todo.store import TodoRepo
 from bot.verification import VerificationService
 
 
@@ -30,6 +31,7 @@ class AppContext:
     server: ServerSettings
     pin_limiter: PinLimiter
     quotes: QuoteRepo
+    todo: TodoRepo
     check_mail: Callable[[], None]
     health: Health
 
@@ -49,6 +51,7 @@ def build_app(settings: Settings) -> AppContext:
         server=ServerSettings(conn),
         pin_limiter=PinLimiter(conn),
         quotes=QuoteRepo(conn),
+        todo=TodoRepo(conn),
         check_mail=make_gmail_checker(settings.gmail_address, settings.gmail_app_password),
         health=Health(),
     )
